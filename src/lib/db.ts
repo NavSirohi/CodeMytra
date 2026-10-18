@@ -7,15 +7,11 @@ const globalForPrisma = globalThis as unknown as {
 };
 
 function createPrismaClient() {
-    const url = process.env.DATABASE_URL;
-    if (!url) {
-        throw new Error("DATABASE_URL is not set");
-    }
-
-
+    const url = process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/codemytra";
     const adapter = new PrismaPg({ connectionString: url });
     return new PrismaClient({ adapter });
 }
+
 
 export const prisma = globalForPrisma.prisma ?? createPrismaClient();
 

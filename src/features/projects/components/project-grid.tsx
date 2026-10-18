@@ -53,10 +53,12 @@ export function ProjectGrid() {
                   <Card
                     className={cn(
                       "overflow-hidden rounded-2xl border-border/60 bg-card/50 py-0 shadow-sm backdrop-blur-sm",
-                      "transition-colors hover:border-border hover:bg-card/80",
+                      "transition-colors hover:border-border hover:bg-card/80"
                     )}
                   >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
+
                       src={getProjectThumbnailUrl(project.id)}
                       alt=""
                       className="aspect-square w-full object-cover"

@@ -2,32 +2,44 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Code, CrownIcon, EyeIcon } from "lucide-react";
+import { Code, CrownIcon, EyeIcon, Download, Rocket } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Fragment } from "@/generated/prisma/client";
 import ProjectHeader from "./project-header";
 import MessageContainer from "./message-container";
 import FragmentWeb from "./fragment-web";
 import { FileExplorer } from "./file-explorer";
+import { GenerationStatusBanner } from "./generation-status-banner";
+import { RevisionHistory } from "./revision-history";
+import { useGetProjectById } from "@/features/projects/hooks/projects";
 
 export type ProjectFragment = Fragment & {
-    files: Record<string, string>;
-  };
+  files: Record<string, string>;
+};
 
 export function ProjectView({ projectId }: { projectId: string }) {
-    const [activeFragment, setActiveFragment] = useState<ProjectFragment | null>(
-      null
-    );
-    const [tabState, setTabState] = useState<"preview" | "code">("preview");
-  
-    return (
-      <div className="h-screen">
+  const [activeFragment, setActiveFragment] = useState<ProjectFragment | null>(
+    null
+  );
+  const [tabState, setTabState] = useState<"preview" | "code">("preview");
+  const { data: project } = useGetProjectById(projectId);
+
+  const handleExport = () => {
+    // Downloads project ZIP from the server-authenticated export endpoint
+    window.open(`/api/projects/${projectId}/export`, "_blank");
+  };
+
+  return (
+    <div className="h-screen flex flex-col">
+      <GenerationStatusBanner projectId={projectId} />
+
+      <div className="flex-1 min-h-0">
         <ResizablePanelGroup orientation="horizontal">
           <ResizablePanel
             defaultSize={28}
@@ -40,11 +52,10 @@ export function ProjectView({ projectId }: { projectId: string }) {
               activeFragment={activeFragment}
               setActiveFragment={setActiveFragment}
             />
-            
           </ResizablePanel>
-  
+
           <ResizableHandle withHandle />
-  
+
           <ResizablePanel defaultSize={72} minSize={45} className="min-w-0">
             <Tabs
               className="flex h-full flex-col"
@@ -69,8 +80,41 @@ export function ProjectView({ projectId }: { projectId: string }) {
                     <span>Code</span>
                   </TabsTrigger>
                 </TabsList>
-  
+
                 <div className="ml-auto flex items-center gap-x-2">
+                  {/* Revision History Drawer */}
+                  <RevisionHistory
+                    projectId={projectId}
+                    currentRevisionId={project?.currentRevisionId}
+                  />
+
+                  {/* Export Project ZIP */}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-1.5 text-xs"
+                    onClick={handleExport}
+                  >
+                    <Download className="size-3.5" />
+                    <span>Export</span>
+                  </Button>
+
+                  {/* Customer Deploy Button (Intentionally Disabled in MVP) */}
+                  <div className="relative group">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled
+                      className="gap-1.5 text-xs opacity-60 cursor-not-allowed"
+                    >
+                      <Rocket className="size-3.5" />
+                      <span>Deploy</span>
+                      <span className="text-[10px] bg-muted px-1.5 py-0.2 rounded border font-mono">
+                        Soon
+                      </span>
+                    </Button>
+                  </div>
+
                   <Button asChild size="sm" variant="outline">
                     <Link href="/">
                       <CrownIcon className="mr-2 size-4" />
@@ -79,7 +123,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   </Button>
                 </div>
               </div>
-  
+
               <TabsContent
                 value="preview"
                 className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden"
@@ -92,7 +136,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   </div>
                 )}
               </TabsContent>
-  
+
               <TabsContent
                 value="code"
                 className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden"
@@ -110,5 +154,6 @@ export function ProjectView({ projectId }: { projectId: string }) {
           </ResizablePanel>
         </ResizablePanelGroup>
       </div>
-    );
-  }
+    </div>
+  );
+}

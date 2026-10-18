@@ -1,15 +1,15 @@
 "use server";
 
 import { getCurrentUser } from "@/features/auth/actions";
-import { inngest } from "@/features/inngest/client";
 import { prisma } from "@/lib/db";
-import { MessageRole, MessageType } from "@/generated/prisma/client";
+import { MessageRole, MessageType, GenerationRunStatus } from "@/generated/prisma/client";
+import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
 
 /**
- * Create a new user message in a project and kick off an agent run.
+ * Create a new user message in a project and kick off a durable agent run.
  *
- * Verifies the caller owns the target project, stores the message, then sends a
- * `code-agent/run` event so the coding agent generates a response.
+ * Verifies the caller owns the target project, links the current base revision,
+ * records the GenerationRun + OutboxEvent in an atomic transaction, then dispatches the run.
  *
  * @param value - The message content typed by the user.
  * @param projectId - The project the message belongs to.
@@ -28,28 +28,53 @@ export const createMessage = async (value: string, projectId: string) => {
       id: projectId,
       userId: user.id,
     },
+    select: {
+      id: true,
+      currentRevisionId: true,
+    },
   });
 
   if (!project) {
     throw new Error("Project not found");
   }
 
-  const newMessage = await prisma.message.create({
-    data: {
-      projectId,
-      content: value,
-      role: MessageRole.USER,
-      type: MessageType.RESULT,
-    },
+  const { newMessage, outboxEvent } = await prisma.$transaction(async (tx) => {
+    const message = await tx.message.create({
+      data: {
+        projectId,
+        content: value,
+        role: MessageRole.USER,
+        type: MessageType.RESULT,
+      },
+    });
+
+    const run = await tx.generationRun.create({
+      data: {
+        projectId,
+        userId: user.id,
+        prompt: value,
+        status: GenerationRunStatus.QUEUED,
+        baseRevisionId: project.currentRevisionId,
+      },
+    });
+
+    const event = await tx.outboxEvent.create({
+      data: {
+        eventName: "code-agent/run",
+        payload: {
+          runId: run.id,
+          projectId,
+          prompt: value,
+          baseRevisionId: project.currentRevisionId,
+        },
+      },
+    });
+
+    return { newMessage: message, outboxEvent: event };
   });
 
-  await inngest.send({
-    name: "code-agent/run",
-    data: {
-      value,
-      projectId,
-    },
-  });
+  // Dispatch via outbox
+  await dispatchOutboxEvent(outboxEvent.id);
 
   return newMessage;
 };
@@ -60,7 +85,7 @@ export const createMessage = async (value: string, projectId: string) => {
  * Ensures the signed-in user owns the project before returning anything.
  *
  * @param projectId - The project whose messages should be returned.
- * @returns The project's messages (with related fragments) ordered by `updatedAt`.
+ * @returns The project's messages (with related fragments) ordered by `createdAt`.
  * @throws If the user is unauthorized or the project is not found.
  */
 export const getMessages = async (projectId: string) => {
@@ -86,7 +111,7 @@ export const getMessages = async (projectId: string) => {
       projectId,
     },
     orderBy: {
-      updatedAt: "asc",
+      createdAt: "asc",
     },
     include: {
       fragments: true,

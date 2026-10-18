@@ -1,17 +1,13 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DATABASE_URL_DIRECT")
+  provider = "postgresql"
 }
 
 model User {
@@ -31,14 +27,20 @@ model User {
 }
 
 model Project {
-  id        String   @id @default(uuid())
-  name      String
-  userId    String
-  user      User     @relation(fields: [userId], references: [id])
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                String            @id @default(uuid())
+  name              String
+  userId            String
+  user              User              @relation(fields: [userId], references: [id])
+  currentRevisionId String?
+  currentRevision   ProjectRevision?  @relation("ProjectCurrentRevision", fields: [currentRevisionId], references: [id], onDelete: SetNull)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
 
-  messages Message[]
+  messages       Message[]
+  revisions      ProjectRevision[] @relation("ProjectRevisions")
+  generationRuns GenerationRun[]
+
+  @@index([userId, createdAt])
 }
 
 enum MessageRole {
@@ -64,6 +66,8 @@ model Message {
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   fragments Fragment?
+
+  @@index([projectId, createdAt])
 }
 
 model Fragment {
@@ -77,4 +81,80 @@ model Fragment {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+enum GenerationRunStatus {
+  QUEUED
+  RUNNING
+  VALIDATING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model GenerationRun {
+  id               String              @id @default(cuid())
+  projectId        String
+  project          Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId           String
+  prompt           String
+  status           GenerationRunStatus @default(QUEUED)
+  baseRevisionId   String?
+  resultRevisionId String?
+  errorCode        String?
+  errorMessage     String?
+  attemptCount     Int                 @default(0)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  revisions ProjectRevision[]
+
+  @@index([projectId, createdAt])
+  @@index([status, createdAt])
+}
+
+model ProjectRevision {
+  id              String         @id @default(cuid())
+  projectId       String
+  project         Project        @relation("ProjectRevisions", fields: [projectId], references: [id], onDelete: Cascade)
+  generationRunId String?
+  generationRun   GenerationRun? @relation(fields: [generationRunId], references: [id], onDelete: SetNull)
+  parentRevisionId String?
+  parentRevision  ProjectRevision? @relation("RevisionHistory", fields: [parentRevisionId], references: [id], onDelete: SetNull)
+  childRevisions  ProjectRevision[] @relation("RevisionHistory")
+  revisionNumber  Int
+  title           String         @default("Initial revision")
+  summary         String?
+  files           Json           // Complete immutable file tree snapshot: { [filePath]: fileContent }
+  manifest        Json?          // File metadata: file count, size, sha hashes
+  storageKey      String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  currentForProjects Project[] @relation("ProjectCurrentRevision")
+
+  @@unique([projectId, revisionNumber])
+  @@index([projectId, createdAt])
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+model OutboxEvent {
+  id          String       @id @default(cuid())
+  eventName   String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?
+  createdAt   DateTime     @default(now())
+  processedAt DateTime?
+
+  @@index([status, createdAt])
 }
