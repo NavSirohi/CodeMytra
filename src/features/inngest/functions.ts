@@ -8,12 +8,15 @@ import { FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
 import { agentOutputText, connectSandbox } from "./utils";
 import { transitionRun } from "@/server/orchestration/state-machine";
 import {
-  createProjectRevision,
   resolveBaseRevision,
   validateRevisionManifest,
   RestorationError,
   FileTreeManifest,
 } from "@/server/orchestration/revisions";
+import {
+  finalizeGenerationSuccess,
+  finalizeGenerationFailure,
+} from "@/server/orchestration/finalization";
 import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
 import { runDesignAgent, saveDesignSpec } from "@/server/agents/designer";
 import { runArchitectureAgent, saveArchitectureSpec } from "@/server/agents/architect";
@@ -287,6 +290,7 @@ export const codeAgentFunction = inngest.createFunction(
       baseFiles,
       previousMessages,
       step,
+      stepPrefix: "initial-coding",
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -365,6 +369,7 @@ Conclude with an updated <task_summary>...</task_summary>.
               { role: "assistant", content: currentSummary },
             ],
             step,
+            stepPrefix: "qa-repair-1",
           });
           currentFiles = repairResult.files;
           currentSummary = repairResult.summary;
@@ -427,58 +432,22 @@ Conclude with an updated <task_summary>...</task_summary>.
           ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
           : (qaReport.repairInstructions || "Validation checks failed");
 
-        await transitionRun(runId, GenerationRunStatus.FAILED, {
+        return await finalizeGenerationFailure({
+          projectId,
+          generationRunId: runId,
           errorCode: "QA_VERIFICATION_FAILED",
           errorMessage: failureReason,
         });
-        await recordRunEvent(runId, "FAILED", "System", "Run marked failed. Prior revision preserved.");
-
-        return prisma.message.create({
-          data: {
-            projectId,
-            content: `Quality Assurance failed: ${failureReason} Your prior working revision is preserved.`,
-            role: MessageRole.ASSISTANT,
-            type: MessageType.ERROR,
-          },
-        });
       }
 
-      // Create durable immutable revision (idempotent with atomic CAS)
-      const revision = await createProjectRevision({
+      return await finalizeGenerationSuccess({
         projectId,
         generationRunId: runId,
-        parentRevisionId: baseRevisionId,
-        expectedCurrentRevisionId: baseRevisionId ?? null,
-        title: fragmentTitle,
+        baseRevisionId,
+        fragmentTitle,
         summary: responseText,
         files: finalFiles || {},
-      });
-
-      // Mark GenerationRun completed
-      await transitionRun(runId, GenerationRunStatus.COMPLETED, {
-        resultRevisionId: revision.id,
-      });
-
-      if (revision.promoted) {
-        await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} promoted to active project head`);
-      } else {
-        await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} saved as historical branch; newer revision is already active`);
-      }
-
-      return prisma.message.create({
-        data: {
-          projectId,
-          content: responseText,
-          role: MessageRole.ASSISTANT,
-          type: MessageType.RESULT,
-          fragments: {
-            create: {
-              sandboxUrl,
-              title: fragmentTitle,
-              files: finalFiles || {},
-            },
-          },
-        },
+        sandboxUrl,
       });
     });
 

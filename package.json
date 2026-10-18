@@ -7,7 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test 'tests/**/*.test.ts'"
+    "test": "tsx --test 'tests/**/*.test.ts'",
+    "test:unit": "tsx --test 'tests/**/*.test.ts'",
+    "test:live-gen": "tsx scripts/live-generation-test.ts",
+    "test:e2e": "tsx scripts/product-e2e-runner.ts",
+    "test:smoke": "tsx scripts/sandbox-smoke-test.ts"
   },
 
   "dependencies": {

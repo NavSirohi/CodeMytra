@@ -71,6 +71,86 @@ export async function generateProjectZip(options: GenerateProjectZipOptions) {
     folder.file(normalized, content);
   }
 
+  // Ensure standalone configuration files are present and valid
+  const hasPackageJson = Object.keys(cleanFiles).some(
+    (f) => path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase() === "package.json"
+  );
+  if (!hasPackageJson) {
+    const defaultPackageJson = JSON.stringify(
+      {
+        name: (project.name || "codemytra-app")
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]/g, "-")
+          .replace(/^-+|-+$/g, "") || "codemytra-app",
+        version: "0.1.0",
+        private: true,
+        scripts: {
+          dev: "next dev",
+          build: "next build",
+          start: "next start",
+        },
+        dependencies: {
+          next: "16.2.9",
+          react: "19.2.4",
+          "react-dom": "19.2.4",
+          "lucide-react": "^1.21.0",
+          clsx: "^2.1.1",
+          "tailwind-merge": "^3.0.1",
+        },
+        devDependencies: {
+          typescript: "^5.7.3",
+          "@types/node": "^22.0.0",
+          "@types/react": "^19.0.0",
+          "@types/react-dom": "^19.0.0",
+          tailwindcss: "^4.0.0",
+        },
+      },
+      null,
+      2
+    );
+    folder.file("package.json", defaultPackageJson);
+  }
+
+  const hasTsConfig = Object.keys(cleanFiles).some(
+    (f) => path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase() === "tsconfig.json"
+  );
+  if (!hasTsConfig) {
+    const defaultTsConfig = JSON.stringify(
+      {
+        compilerOptions: {
+          target: "ES2017",
+          lib: ["dom", "dom.iterable", "esnext"],
+          allowJs: true,
+          skipLibCheck: true,
+          strict: true,
+          noEmit: true,
+          esModuleInterop: true,
+          module: "esnext",
+          moduleResolution: "bundler",
+          resolveJsonModule: true,
+          isolatedModules: true,
+          jsx: "preserve",
+          incremental: true,
+          plugins: [{ name: "next" }],
+          paths: { "@/*": ["./*"] },
+        },
+        include: ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+        exclude: ["node_modules"],
+      },
+      null,
+      2
+    );
+    folder.file("tsconfig.json", defaultTsConfig);
+  }
+
+  const hasNextConfig = Object.keys(cleanFiles).some((f) => {
+    const norm = path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase();
+    return norm === "next.config.ts" || norm === "next.config.mjs" || norm === "next.config.js";
+  });
+  if (!hasNextConfig) {
+    folder.file("next.config.ts", "import type { NextConfig } from 'next';\n\nconst nextConfig: NextConfig = {};\n\nexport default nextConfig;\n");
+  }
+
   // Include default README if user project didn't generate one
   if (!hasReadme) {
     const defaultReadme = `# ${project.name || "CodeMytra Application"} (Revision ${revision.revisionNumber})

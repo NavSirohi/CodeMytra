@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { spawnSync } from "child_process";
 import { Sandbox } from "@e2b/code-interpreter";
 import { runPlannerAgent } from "../src/server/agents/planner";
 import { runDesignAgent } from "../src/server/agents/designer";
@@ -410,35 +411,90 @@ async function main() {
       fs.writeFileSync(targetPath, content);
     }
 
-    const packageJsonPath = path.join(tempExtractDir, "package.json");
-    if (!fs.existsSync(packageJsonPath)) {
-      // If package.json is in parent, create standalone package.json for build
-      fs.writeFileSync(
-        packageJsonPath,
-        JSON.stringify(
-          {
-            name: "exported-app",
-            version: "0.1.0",
-            private: true,
-            scripts: { build: "next build" },
-            dependencies: {
-              react: "^19.0.0",
-              "react-dom": "^19.0.0",
-              next: "^16.0.0",
-            },
-          },
-          null,
-          2
-        )
-      );
+    // Locate the extracted project directory (handling zip root folders)
+    let appDir = tempExtractDir;
+    if (!fs.existsSync(path.join(appDir, "package.json"))) {
+      const entries = fs.readdirSync(tempExtractDir);
+      for (const entry of entries) {
+        const candidate = path.join(tempExtractDir, entry);
+        if (
+          fs.statSync(candidate).isDirectory() &&
+          fs.existsSync(path.join(candidate, "package.json"))
+        ) {
+          appDir = candidate;
+          break;
+        }
+      }
     }
 
     console.log("  - Validating extracted project files on host filesystem...");
-    const extractedPage = path.join(tempExtractDir, "app/page.tsx");
-    if (!fs.existsSync(extractedPage)) {
-      throw new Error("Exported zip extraction failed: app/page.tsx not found in extracted files");
+    const packageJsonPath = path.join(appDir, "package.json");
+    if (!fs.existsSync(packageJsonPath)) {
+      throw new Error("Export verification failed: package.json missing from exported archive (no synthetic fallback permitted)");
     }
-    console.log("  ✓ Verified extracted application structure outside CodeMytra platform.");
+
+    const extractedPage = path.join(appDir, "app/page.tsx");
+    if (!fs.existsSync(extractedPage)) {
+      throw new Error("Export verification failed: app/page.tsx not found in extracted files");
+    }
+
+    // Verify package.json validity
+    const pkgRaw = fs.readFileSync(packageJsonPath, "utf8");
+    let pkg: { scripts?: Record<string, string>; dependencies?: Record<string, string> };
+    try {
+      pkg = JSON.parse(pkgRaw);
+    } catch (parseErr) {
+      throw new Error(`Exported package.json is not valid JSON: ${String(parseErr)}`);
+    }
+
+    if (!pkg.scripts?.build) {
+      throw new Error("Exported package.json is missing mandatory 'build' script");
+    }
+    console.log("  ✓ Verified extracted application structure & valid package.json outside CodeMytra platform.");
+
+    // 4. Standalone dependency installation
+    console.log("  - Executing standalone dependency installation outside platform (npm install)...");
+    const installResult = spawnSync("npm", ["install", "--no-audit", "--prefer-offline"], {
+      cwd: appDir,
+      encoding: "utf8",
+      timeout: 120000,
+      env: { ...process.env, CI: "true" },
+    });
+    if (installResult.status !== 0) {
+      throw new Error(
+        `Standalone npm install failed (exit ${installResult.status}):\n${installResult.stderr || installResult.stdout}`
+      );
+    }
+    console.log("  ✓ Standalone dependencies installed successfully (exit code 0).");
+
+    // 5. Standalone TypeScript verification
+    console.log("  - Executing standalone TypeScript verification (npx tsc --noEmit)...");
+    const tscResult = spawnSync("npx", ["tsc", "--noEmit"], {
+      cwd: appDir,
+      encoding: "utf8",
+      timeout: 60000,
+    });
+    if (tscResult.status !== 0) {
+      throw new Error(
+        `Standalone TypeScript verification failed (exit ${tscResult.status}):\n${tscResult.stderr || tscResult.stdout}`
+      );
+    }
+    console.log("  ✓ Standalone TypeScript verification passed (exit code 0).");
+
+    // 6. Standalone production build
+    console.log("  - Executing standalone production build (npm run build)...");
+    const buildResult = spawnSync("npm", ["run", "build"], {
+      cwd: appDir,
+      encoding: "utf8",
+      timeout: 90000,
+      env: { ...process.env, CI: "true" },
+    });
+    if (buildResult.status !== 0) {
+      throw new Error(
+        `Standalone production build failed (exit ${buildResult.status}):\n${buildResult.stderr || buildResult.stdout}`
+      );
+    }
+    console.log("  ✓ Standalone production build succeeded (exit code 0).");
 
     // -------------------------------------------------------------------------
     // STEP 11: Production Orchestration Failure Simulation

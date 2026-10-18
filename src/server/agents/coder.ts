@@ -1,3 +1,4 @@
+import path from "path";
 import { Sandbox } from "@e2b/code-interpreter";
 import {
   createAgent,
@@ -40,6 +41,46 @@ export interface RunCodingAgentOptions {
   baseFiles?: Record<string, string> | null;
   previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   step?: InngestStepLike;
+  stepPrefix?: string;
+}
+
+export const MAX_COMMAND_OUTPUT_BYTES = 256 * 1024; // 256 KB
+export const MAX_COMMAND_TIMEOUT_MS = 30000; // 30s
+
+export const FORBIDDEN_COMMAND_PATTERNS = [
+  /\.env(\b|\.|$)/i,
+  /\b(id_rsa|id_ecdsa|id_ed25519)\b/i,
+  /\.pem\b/i,
+  /\.key\b/i,
+  /\/etc\/(shadow|gshadow|sudoers)/i,
+  /\/proc\/(\d+|self)\/environ/i,
+  /\bcd\s+(\.\.|\/|~)/i,
+  /\.\.\//,
+  /\b(curl|wget)\b.*(@|--upload-file|--post-file)/i,
+];
+
+export function validateSandboxCommand(command: string): { allowed: boolean; reason?: string } {
+  for (const pattern of FORBIDDEN_COMMAND_PATTERNS) {
+    if (pattern.test(command)) {
+      return {
+        allowed: false,
+        reason: `Command blocked by security policy: contains restricted pattern "${pattern.source}". Direct access to platform secrets, environment files, or escaping project workspace is prohibited.`,
+      };
+    }
+  }
+  return { allowed: true };
+}
+
+export const SENSITIVE_FILE_PATTERNS = [
+  /^\.env(\.|$)/i,
+  /\.(pem|key|secret|token)$/i,
+  /id_rsa/i,
+  /credentials\.json$/i,
+];
+
+export function isSensitiveFilePath(relPath: string): boolean {
+  const base = path.basename(relPath).toLowerCase();
+  return SENSITIVE_FILE_PATTERNS.some((p) => p.test(base));
 }
 
 export interface CodingAgentResult {
@@ -130,11 +171,15 @@ export async function runCodingAgent(
     baseFiles = {},
     previousMessages = [],
     step,
+    stepPrefix = "code-agent",
   } = options;
 
+  let toolCallCounter = 0;
+
   const runStep = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+    const stepId = `${stepPrefix}-${name}-${++toolCallCounter}`;
     if (step && typeof step.run === "function") {
-      return await step.run(name, fn);
+      return (await step.run(stepId, fn)) as T;
     }
     return await fn();
   };
@@ -168,7 +213,7 @@ export async function runCodingAgent(
     system: systemPrompt,
     model: geminiModel,
     tools: [
-      // 1. Terminal Tool (operates inside project workspace)
+      // 1. Terminal Tool (operates inside project workspace with strict security and output limits)
       createTool({
         name: "terminal",
         description: `Run allowed terminal commands inside the project workspace (${PROJECT_WORKSPACE_DIR})`,
@@ -176,30 +221,54 @@ export async function runCodingAgent(
           command: z.string(),
         }),
         handler: async ({ command }) => {
+          // Pre-execution security check
+          const secCheck = validateSandboxCommand(command);
+          if (!secCheck.allowed) {
+            return secCheck.reason || "Command blocked by security policy.";
+          }
+
           return await runStep("terminal", async () => {
-            const buffers = { stdout: "", stderr: "" };
+            let stdout = "";
+            let stderr = "";
             try {
               const sandbox = await Sandbox.connect(sandboxId);
               // Ensure commands execute inside the project workspace
               const wrappedCommand = `cd "${PROJECT_WORKSPACE_DIR}" && ${command}`;
               const result = await sandbox.commands.run(wrappedCommand, {
                 onStdout: (data) => {
-                  buffers.stdout += data;
+                  if (stdout.length < MAX_COMMAND_OUTPUT_BYTES) {
+                    stdout += data;
+                  }
                 },
                 onStderr: (data) => {
-                  buffers.stderr += data;
+                  if (stderr.length < MAX_COMMAND_OUTPUT_BYTES) {
+                    stderr += data;
+                  }
                 },
-                timeoutMs: 30000,
+                timeoutMs: MAX_COMMAND_TIMEOUT_MS,
               });
-              return result.stdout || buffers.stdout || "Command completed with zero output.";
+
+              let finalOut = result.stdout || stdout || "Command completed with zero output.";
+              if (finalOut.length > MAX_COMMAND_OUTPUT_BYTES) {
+                finalOut =
+                  finalOut.slice(0, MAX_COMMAND_OUTPUT_BYTES) +
+                  "\n... [Output truncated to 256 KB to preserve memory]";
+              }
+              return finalOut;
             } catch (error) {
-              return `Command failed: ${error} \n stdout: ${buffers.stdout}\n stderr: ${buffers.stderr}`;
+              let errOut = `Command failed: ${error} \n stdout: ${stdout}\n stderr: ${stderr}`;
+              if (errOut.length > MAX_COMMAND_OUTPUT_BYTES) {
+                errOut =
+                  errOut.slice(0, MAX_COMMAND_OUTPUT_BYTES) +
+                  "\n... [Error output truncated to 256 KB]";
+              }
+              return errOut;
             }
           });
         },
       }),
 
-      // 2. createOrUpdateFiles Tool (enforces project workspace boundary and resource limits)
+      // 2. createOrUpdateFiles Tool (enforces project workspace boundary, secrets protection, and resource limits)
       createTool({
         name: "createOrUpdateFiles",
         description: `Create or update files in the sandbox project workspace (${PROJECT_WORKSPACE_DIR})`,
@@ -220,6 +289,13 @@ export async function runCodingAgent(
               for (const file of files) {
                 // Strict path validation: all files must remain inside project workspace
                 const fullWorkspacePath = resolveWorkspacePath(file.path);
+
+                // Security check: block sensitive platform files
+                if (isSensitiveFilePath(file.path)) {
+                  throw new Error(
+                    `Writing to sensitive file "${file.path}" is forbidden by security policy.`
+                  );
+                }
 
                 // Resource limit check per file (1 MB)
                 const fileBytes = Buffer.byteLength(file.content, "utf8");
@@ -247,7 +323,7 @@ export async function runCodingAgent(
         },
       }),
 
-      // 3. readFiles Tool (reads from project workspace)
+      // 3. readFiles Tool (reads from project workspace with secrets protection)
       createTool({
         name: "readFiles",
         description: `Read files from the sandbox project workspace (${PROJECT_WORKSPACE_DIR})`,
@@ -261,9 +337,23 @@ export async function runCodingAgent(
               const contents: Array<{ path: string; content: string }> = [];
 
               for (const filePath of files) {
+                // Security check: block reading sensitive files
+                if (isSensitiveFilePath(filePath)) {
+                  throw new Error(
+                    `Reading sensitive file "${filePath}" is forbidden by security policy.`
+                  );
+                }
+
                 const fullWorkspacePath = resolveWorkspacePath(filePath);
-                const content = await sandbox.files.read(fullWorkspacePath);
-                contents.push({ path: filePath, content: typeof content === "string" ? content : "" });
+                let content = await sandbox.files.read(fullWorkspacePath);
+                if (typeof content === "string" && content.length > 1024 * 1024) {
+                  content =
+                    content.slice(0, 1024 * 1024) + "\n... [Content truncated at 1 MB]";
+                }
+                contents.push({
+                  path: filePath,
+                  content: typeof content === "string" ? content : "",
+                });
               }
 
               return JSON.stringify(contents);
