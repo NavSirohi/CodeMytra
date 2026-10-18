@@ -27,10 +27,11 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
 
       // Verify query has atomic claiming with SKIP LOCKED and lease tracking
       assert.match(capturedQuery, /UPDATE\s+"OutboxEvent"/i);
-      assert.match(capturedQuery, /SET\s+status\s*=\s*'PROCESSING',\s*attempts\s*=\s*attempts\s*\+\s*1,\s*"claimedAt"\s*=\s*NOW\(\)/i);
+      assert.match(capturedQuery, /SET\s+status\s*=\s*'PROCESSING',\s*attempts\s*=\s*attempts\s*\+\s*1,\s*"claimedAt"\s*=\s*NOW\(\),\s*"claimToken"\s*=/i);
       assert.match(capturedQuery, /FOR UPDATE SKIP LOCKED/i);
       assert.match(capturedQuery, /nextAttemptAt/i);
       assert.match(capturedQuery, /claimedAt/i);
+      assert.match(capturedQuery, /claimToken/i);
 
       // Verify parameters passed: [eventId (null), MAX_OUTBOX_ATTEMPTS, leaseCutoff, batchSize]
       assert.equal(capturedArgs.length, 4);
@@ -67,6 +68,7 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         lastError: null,
         claimedAt: mockClaimedAt,
         nextAttemptAt: null,
+        claimToken: "tok-test-1",
         createdAt: new Date(Date.now() - 400000),
         processedAt: null,
       },
@@ -84,6 +86,7 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         lastError: "Temporary timeout",
         claimedAt: mockClaimedAt,
         nextAttemptAt: null,
+        claimToken: "tok-test-2",
         createdAt: new Date(Date.now() - 200000),
         processedAt: null,
       },
@@ -100,7 +103,7 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
       }
       // Follow-up calls are status updates
       return [{ id: args[0] }];
-    }) as any;
+    }) as unknown as typeof prisma.$queryRawUnsafe;
 
     inngest.send = (async (payload: any) => {
       inngestCalls.push(payload);
@@ -126,9 +129,9 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
       // Verify fencing token in update query
       const updateCalls = queryCalls.filter((c) => c.query.includes("status = 'PROCESSED'"));
       assert.equal(updateCalls.length, 2);
-      assert.match(updateCalls[0].query, /claimedAt/);
+      assert.match(updateCalls[0].query, /claimToken/);
       assert.equal(updateCalls[0].args[0], "evt-1");
-      assert.equal(updateCalls[0].args[1], mockClaimedAt);
+      assert.equal(updateCalls[0].args[1], "tok-test-1");
     } finally {
       prisma.$queryRawUnsafe = originalQueryRaw;
       inngest.send = originalInngestSend;
@@ -155,6 +158,7 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         lastError: null,
         claimedAt: mockClaimedAt,
         nextAttemptAt: null,
+        claimToken: "tok-fail",
         createdAt: new Date(),
         processedAt: null,
       },
@@ -168,7 +172,7 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         return mockEvents;
       }
       return [{ id: args[0] }];
-    }) as any;
+    }) as unknown as typeof prisma.$queryRawUnsafe;
 
     inngest.send = (async () => {
       throw new Error("Inngest endpoint down");
@@ -186,7 +190,7 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
       assert.equal(failUpdate.args[0], "evt-failed");
       assert.ok(failUpdate.args[1] instanceof Date, "nextAttemptAt must be set for retry backoff");
       assert.equal(failUpdate.args[2], "Inngest endpoint down");
-      assert.equal(failUpdate.args[3], mockClaimedAt);
+      assert.equal(failUpdate.args[3], "tok-fail");
     } finally {
       prisma.$queryRawUnsafe = originalQueryRaw;
       inngest.send = originalInngestSend;

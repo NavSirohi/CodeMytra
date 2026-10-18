@@ -99,14 +99,20 @@ export function generateManifest(files: Record<string, string>): FileTreeManifes
   };
 }
 
+export interface ValidateManifestOptions {
+  requireHashes?: boolean;
+}
+
 /**
  * Validates that an in-memory file tree matches its recorded manifest,
  * including path completeness, file counts, and cryptographic content hashes.
+ * Supports an explicit documented compatibility path for legacy revisions without hashes.
  */
 export function validateRevisionManifest(
   files: Record<string, string>,
-  manifest?: FileTreeManifest | null
-): { valid: boolean; error?: string } {
+  manifest?: FileTreeManifest | null,
+  options?: ValidateManifestOptions
+): { valid: boolean; error?: string; isLegacyWithoutHashes?: boolean } {
   if (!manifest) {
     return { valid: true };
   }
@@ -130,7 +136,8 @@ export function validateRevisionManifest(
     }
   }
 
-  if (manifest.hashes && typeof manifest.hashes === "object") {
+  // Handle cryptographic content hashes
+  if (manifest.hashes && typeof manifest.hashes === "object" && Object.keys(manifest.hashes).length > 0) {
     for (const [expectedPath, expectedHash] of Object.entries(manifest.hashes)) {
       if (files[expectedPath] !== undefined) {
         const computedHash = crypto
@@ -145,6 +152,15 @@ export function validateRevisionManifest(
         }
       }
     }
+  } else {
+    // Explicit documented compatibility path for legacy revisions created before M1.5
+    if (options?.requireHashes) {
+      return {
+        valid: false,
+        error: "Revision manifest missing cryptographic SHA-256 hashes (required for M1.5+ revisions)",
+      };
+    }
+    return { valid: true, isLegacyWithoutHashes: true };
   }
 
   return { valid: true };

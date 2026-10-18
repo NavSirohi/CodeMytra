@@ -219,10 +219,12 @@ model OutboxEvent {
   lastError     String?
   claimedAt     DateTime?
   nextAttemptAt DateTime?
+  claimToken    String?
   createdAt     DateTime     @default(now())
   processedAt   DateTime?
 
   @@index([status, createdAt])
   @@index([status, nextAttemptAt])
   @@index([status, claimedAt])
+  @@index([claimToken])
 }

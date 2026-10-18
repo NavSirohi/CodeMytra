@@ -39,17 +39,19 @@ export async function claimOutboxEvents(options: ClaimOptions = {}): Promise<Out
 SET 
   status = 'PROCESSING',
   attempts = attempts + 1,
-  "claimedAt" = NOW()
+  "claimedAt" = NOW(),
+  "claimToken" = gen_random_uuid()::text
 WHERE id IN (
   SELECT id FROM "OutboxEvent"
   WHERE 
     ($1::text IS NULL OR id = $1)
+    AND attempts < $2
     AND (
       -- 1. Ready PENDING events (new or ready for retry)
       (status = 'PENDING' AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= NOW()))
       OR
-      -- 2. Ready FAILED events that have not exceeded MAX_OUTBOX_ATTEMPTS
-      (status = 'FAILED' AND attempts < $2 AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= NOW()))
+      -- 2. Ready FAILED events (retry delay elapsed)
+      (status = 'FAILED' AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= NOW()))
       OR
       -- 3. Stale/abandoned PROCESSING events whose lease has expired
       (status = 'PROCESSING' AND ("claimedAt" IS NULL OR "claimedAt" <= $3))
@@ -74,7 +76,7 @@ RETURNING *;`,
 export async function executeClaimedEvent(
   event: OutboxEvent
 ): Promise<{ success: boolean; error?: string }> {
-  const claimedAt = event.claimedAt;
+  const claimToken = event.claimToken;
 
   try {
     const payload = (
@@ -99,17 +101,18 @@ export async function executeClaimedEvent(
       },
     });
 
-    // Fencing token check: only mark PROCESSED if our lease was not stolen/reclaimed
+    // Fencing token check: only mark PROCESSED if our unique claimToken was not stolen/reclaimed
     await prisma.$queryRawUnsafe(
       `UPDATE "OutboxEvent"
 SET 
   status = 'PROCESSED',
   "processedAt" = NOW(),
   "claimedAt" = NULL,
+  "claimToken" = NULL,
   "lastError" = NULL
-WHERE id = $1 AND status = 'PROCESSING' AND ($2::timestamp IS NULL OR "claimedAt" = $2);`,
+WHERE id = $1 AND status = 'PROCESSING' AND ($2::text IS NULL OR "claimToken" = $2);`,
       event.id,
-      claimedAt
+      claimToken
     );
 
     return { success: true };
@@ -130,12 +133,13 @@ SET
   status = 'FAILED',
   "nextAttemptAt" = $2,
   "claimedAt" = NULL,
+  "claimToken" = NULL,
   "lastError" = $3
-WHERE id = $1 AND status = 'PROCESSING' AND ($4::timestamp IS NULL OR "claimedAt" = $4);`,
+WHERE id = $1 AND status = 'PROCESSING' AND ($4::text IS NULL OR "claimToken" = $4);`,
       event.id,
       nextAttemptAt,
       isExhausted ? `Terminal failure (max ${MAX_OUTBOX_ATTEMPTS} attempts exhausted): ${errorMessage}` : errorMessage,
-      claimedAt
+      claimToken
     );
 
     console.error(`[Outbox] Dispatch failed for event ${event.id}:`, errorMessage);
