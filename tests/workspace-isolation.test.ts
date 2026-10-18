@@ -203,7 +203,7 @@ describe("Task 3: Sandbox Workspace Isolation & Command Security Policy", () => 
     assert.equal(result.failedFile, "file-4.ts");
     assert.equal(result.rolledBack, true);
     assert.match(result.error || "", /Simulated disk write error on fourth file/);
-    assert.match(result.error || "", /All 3 earlier writes in batch were restored to original state/);
+    assert.match(result.error || "", /All 4 affected files were verified and restored to their original pre-write state/);
 
     // 2. File 5 was never written
     assert.ok(!writtenPaths.some((p) => p.includes("file-5.ts")), "File 5 write must never have been attempted");
@@ -222,5 +222,106 @@ describe("Task 3: Sandbox Workspace Isolation & Command Security Policy", () => 
 
     // 4. In-memory state: updatedMap must be undefined on failure so agent state is not updated
     assert.equal(result.updatedMap, undefined, "State updatedMap must not be returned on failure");
+  });
+
+  it("Regression Test: Do not interpret a failed pre-write read as a missing file and abort write batch", async () => {
+    const disk: Record<string, string> = {
+      "/home/user/workspace/existing.ts": "original-secret-or-code",
+    };
+    let writeCalled = false;
+    let removeCalled = false;
+
+    const mockFilesClient: SandboxFilesClient = {
+      exists: async (p: string) => p in disk,
+      read: async () => {
+        throw new Error("Simulated I/O or permissions error during pre-write read");
+      },
+      write: async () => {
+        writeCalled = true;
+      },
+      remove: async () => {
+        removeCalled = true;
+      },
+    };
+
+    const targetFiles = [
+      { path: "existing.ts", content: "new-attempted-content" },
+    ];
+
+    const result = await executeBatchFileWrites(mockFilesClient, targetFiles);
+
+    // Must report failure without treating existing file as missing
+    assert.equal(result.success, false);
+    assert.equal(result.failedFile, "existing.ts");
+    assert.match(result.error || "", /Pre-write read failed for existing file "existing.ts"/);
+    // Write was never attempted
+    assert.equal(writeCalled, false, "Must not attempt write when pre-write read fails");
+    // Remove was never attempted (must not treat existing file as missing)
+    assert.equal(removeCalled, false, "Must not treat file as missing or attempt remove");
+    // Existing content preserved intact
+    assert.equal(disk["/home/user/workspace/existing.ts"], "original-secret-or-code");
+  });
+
+  it("Regression Test: Include failing write target in rollback, verify rollback, and return unrecoveredFilesystem on verification failure", async () => {
+    // Part A: Failing write target is included in rollback and verified
+    const diskA: Record<string, string> = {
+      "/home/user/workspace/existing-target.ts": "original-content-before-write",
+    };
+    const writtenPathsA: string[] = [];
+
+    const mockFilesClientA: SandboxFilesClient = {
+      exists: async (p: string) => p in diskA,
+      read: async (p: string) => diskA[p],
+      write: async (p: string, content: string) => {
+        writtenPathsA.push(p);
+        if (p.includes("existing-target.ts") && content === "partially-written-data") {
+          // Mutate disk partially to simulate a failed write that modified the file before erroring
+          diskA[p] = "corrupted-partial-data";
+          throw new Error("Disk write connection reset during write");
+        }
+        diskA[p] = content;
+      },
+      remove: async (p: string) => {
+        delete diskA[p];
+      },
+    };
+
+    const resultA = await executeBatchFileWrites(mockFilesClientA, [
+      { path: "existing-target.ts", content: "partially-written-data" },
+    ]);
+
+    assert.equal(resultA.success, false);
+    assert.equal(resultA.rolledBack, true);
+    assert.equal(resultA.unrecoveredFilesystem, false);
+    // Verified that failing write target was restored back to original-content-before-write
+    assert.equal(diskA["/home/user/workspace/existing-target.ts"], "original-content-before-write");
+
+    // Part B: When rollback verification cannot be guaranteed, return unrecoveredFilesystem: true
+    let removed = false;
+    const mockFilesClientB: SandboxFilesClient = {
+      exists: async () => {
+        // Pre-write snapshot: file does not exist initially
+        if (!removed) return false;
+        // Post-rollback remove check: file still exists (verification failure)
+        return true;
+      },
+      read: async () => "remnant-data",
+      write: async () => {
+        throw new Error("Write failed");
+      },
+      remove: async () => {
+        removed = true;
+      },
+    };
+
+    const resultB = await executeBatchFileWrites(mockFilesClientB, [
+      { path: "new-file.ts", content: "some-content" },
+    ]);
+
+    assert.equal(resultB.success, false);
+    assert.equal(resultB.unrecoveredFilesystem, true);
+    assert.equal(resultB.rolledBack, false);
+    assert.match(resultB.error || "", /UNRECOVERED_FILESYSTEM_ERROR/);
+    assert.match(resultB.error || "", /Rollback verification failed for "new-file.ts": file still exists after removal/);
   });
 });

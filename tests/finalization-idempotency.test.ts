@@ -855,4 +855,107 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
       prisma.$transaction = originalTx;
     }
   });
+
+  it("Regression Test: Two failed runs in same project maintain distinct message IDs without borrowing across runs", async () => {
+    const originalTx = prisma.$transaction;
+    const projectId = "prj-two-fails";
+    const runId1 = "run-fail-alpha";
+    const runId2 = "run-fail-beta";
+
+    const runs: Record<string, any> = {
+      [runId1]: {
+        id: runId1,
+        projectId,
+        status: GenerationRunStatus.RUNNING,
+      },
+      [runId2]: {
+        id: runId2,
+        projectId,
+        status: GenerationRunStatus.RUNNING,
+      },
+    };
+
+    const messages: any[] = [];
+    const runEvents: any[] = [];
+
+    prisma.$transaction = (async (cb: any) => {
+      const tx = {
+        generationRun: {
+          findUnique: async (args: any) => {
+            return runs[args.where.id] ? { ...runs[args.where.id] } : null;
+          },
+          update: async (args: any) => {
+            if (runs[args.where.id]) {
+              runs[args.where.id] = { ...runs[args.where.id], ...args.data };
+              return runs[args.where.id];
+            }
+            return null;
+          },
+        },
+        runEvent: {
+          create: async (args: any) => {
+            const evt = { id: `evt-${runEvents.length + 1}`, ...args.data };
+            runEvents.push(evt);
+            return evt;
+          },
+        },
+        message: {
+          findUnique: async (args: any) => {
+            return messages.find((m) => m.generationRunId === args.where.generationRunId) || null;
+          },
+          create: async (args: any) => {
+            const msg = { id: `msg-${messages.length + 1}`, ...args.data };
+            messages.push(msg);
+            return msg;
+          },
+        },
+      };
+      return cb(tx);
+    }) as any;
+
+    try {
+      // 1. First run fails and creates message
+      const res1 = await finalizeGenerationFailure({
+        projectId,
+        generationRunId: runId1,
+        errorCode: "QA_FAILED",
+        errorMessage: "First run syntax error",
+      });
+
+      assert.equal(res1.isIdempotentReplay, false);
+      const msg1 = messages.find((m) => m.generationRunId === runId1);
+      assert.ok(msg1);
+      assert.equal(res1.messageId, msg1.id);
+
+      // 2. Second run in same project fails
+      const res2 = await finalizeGenerationFailure({
+        projectId,
+        generationRunId: runId2,
+        errorCode: "BUILD_FAILED",
+        errorMessage: "Second run compilation failure",
+      });
+
+      assert.equal(res2.isIdempotentReplay, false);
+      const msg2 = messages.find((m) => m.generationRunId === runId2);
+      assert.ok(msg2);
+      assert.equal(res2.messageId, msg2.id);
+
+      // 3. CRITICAL: Second run must NOT receive first run's message ID
+      assert.notEqual(res2.messageId, res1.messageId, "Run 2 must not receive Run 1's message ID");
+
+      // 4. Replaying second run returns its OWN message ID, never run 1's
+      const replay2 = await finalizeGenerationFailure({
+        projectId,
+        generationRunId: runId2,
+        errorCode: "BUILD_FAILED",
+        errorMessage: "Second run compilation failure",
+      });
+
+      assert.equal(replay2.isIdempotentReplay, true);
+      assert.equal(replay2.messageId, res2.messageId);
+      assert.notEqual(replay2.messageId, res1.messageId);
+    } finally {
+      prisma.$transaction = originalTx;
+    }
+  });
 });

@@ -293,7 +293,7 @@ export async function finalizeGenerationFailure(
     }
 
     // 3. Repeated failure delivery (idempotent replay):
-    // If run is already FAILED, return existing messageId without duplicate events or messages
+    // If run is already FAILED, return existing messageId associated with this exact generationRunId
     if (currentRun.status === GenerationRunStatus.FAILED) {
       const existingMsg = await tx.message.findUnique({
         where: { generationRunId },
@@ -304,25 +304,14 @@ export async function finalizeGenerationFailure(
           isIdempotentReplay: true,
         };
       }
-      // Explicit documented compatibility/repair path for legacy unlinked records:
-      const legacyMsg = await tx.message.findFirst({
-        where: {
-          projectId,
-          type: MessageType.ERROR,
-        },
-        orderBy: { createdAt: "desc" },
-      });
-      if (legacyMsg) {
-        return {
-          messageId: legacyMsg.id,
-          isIdempotentReplay: true,
-        };
-      }
+      // Documented Safe Repair: If this run has no message linked to its generationRunId,
+      // create a dedicated message strictly bound to this generationRunId rather than
+      // borrowing another run's message from the same project.
       const repairedMessage = await tx.message.create({
         data: {
           projectId,
           generationRunId,
-          content: `Generation run ${generationRunId} failed (${errorCode}): ${errorMessage}.`,
+          content: `Quality Assurance failed: ${errorMessage} Your prior working revision is preserved.`,
           role: MessageRole.ASSISTANT,
           type: MessageType.ERROR,
         },
@@ -344,19 +333,7 @@ export async function finalizeGenerationFailure(
           isIdempotentReplay: true,
         };
       }
-      const legacyMsg = await tx.message.findFirst({
-        where: {
-          projectId,
-          type: MessageType.ERROR,
-        },
-        orderBy: { createdAt: "desc" },
-      });
-      if (legacyMsg) {
-        return {
-          messageId: legacyMsg.id,
-          isIdempotentReplay: true,
-        };
-      }
+      // Documented Safe Repair: Create dedicated cancelled message strictly bound to generationRunId
       const cancelledMessage = await tx.message.create({
         data: {
           projectId,

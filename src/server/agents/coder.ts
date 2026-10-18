@@ -194,12 +194,28 @@ export async function executeBatchFileWrites(
     let originalContent: string | null = null;
     try {
       existed = await filesClient.exists(vFile.fullWorkspacePath);
-      if (existed) {
+    } catch (existsErr) {
+      return {
+        success: false,
+        error: `Pre-write existence check failed for "${vFile.relativePath}": ${existsErr instanceof Error ? existsErr.message : String(existsErr)}. Write batch aborted.`,
+        failedFile: vFile.relativePath,
+        unrecoveredFilesystem: false,
+      };
+    }
+
+    if (existed) {
+      try {
         originalContent = await filesClient.read(vFile.fullWorkspacePath);
+      } catch (readErr) {
+        // Do NOT interpret a failed pre-write read as a missing file.
+        // Abort immediately before any writes occur to guarantee zero filesystem mutation.
+        return {
+          success: false,
+          error: `Pre-write read failed for existing file "${vFile.relativePath}": ${readErr instanceof Error ? readErr.message : String(readErr)}. Write batch aborted to protect existing file.`,
+          failedFile: vFile.relativePath,
+          unrecoveredFilesystem: false,
+        };
       }
-    } catch {
-      existed = false;
-      originalContent = null;
     }
 
     preWriteStates.push({
@@ -224,19 +240,43 @@ export async function executeBatchFileWrites(
       await filesClient.write(item.fullWorkspacePath, item.content);
       successfullyWritten.push(item);
     } catch (writeErr) {
-      // A write failed! Execute rollback on all files modified earlier in this batch
+      // A write failed!
+      // Must include the failing write target `item` in rollback because the write may have partially changed its contents
+      const rollbackTargets = [item, ...[...successfullyWritten].reverse()];
       const rollbackErrors: string[] = [];
 
-      for (const rollbackItem of [...successfullyWritten].reverse()) {
+      for (const target of rollbackTargets) {
         try {
-          if (rollbackItem.existed && rollbackItem.originalContent !== null) {
-            await filesClient.write(rollbackItem.fullWorkspacePath, rollbackItem.originalContent);
+          if (target.existed && target.originalContent !== null) {
+            await filesClient.write(target.fullWorkspacePath, target.originalContent);
+            // Verify rollback completed: file must exist and content must match originalContent
+            const existsAfter = await filesClient.exists(target.fullWorkspacePath);
+            if (!existsAfter) {
+              rollbackErrors.push(
+                `Rollback verification failed for "${target.relativePath}": file missing after restoration write.`
+              );
+              continue;
+            }
+            const contentAfter = await filesClient.read(target.fullWorkspacePath);
+            if (contentAfter !== target.originalContent) {
+              rollbackErrors.push(
+                `Rollback verification failed for "${target.relativePath}": restored content does not match original.`
+              );
+            }
           } else {
-            await filesClient.remove(rollbackItem.fullWorkspacePath);
+            // Target was not pre-existing: remove any partial/created file
+            await filesClient.remove(target.fullWorkspacePath);
+            // Verify rollback completed: file must no longer exist
+            const existsAfter = await filesClient.exists(target.fullWorkspacePath);
+            if (existsAfter) {
+              rollbackErrors.push(
+                `Rollback verification failed for "${target.relativePath}": file still exists after removal.`
+              );
+            }
           }
         } catch (rbErr) {
           rollbackErrors.push(
-            `Failed restoring "${rollbackItem.relativePath}": ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`
+            `Failed restoring "${target.relativePath}": ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`
           );
         }
       }
@@ -244,17 +284,19 @@ export async function executeBatchFileWrites(
       if (rollbackErrors.length > 0) {
         return {
           success: false,
-          error: `UNRECOVERED_FILESYSTEM_ERROR: Write failed on "${item.relativePath}" and rollback encountered errors:\n${rollbackErrors.join("\n")}`,
+          error: `UNRECOVERED_FILESYSTEM_ERROR: Write failed on "${item.relativePath}" and rollback could not be verified:\n${rollbackErrors.join("\n")}`,
           failedFile: item.relativePath,
           unrecoveredFilesystem: true,
+          rolledBack: false,
         };
       }
 
       return {
         success: false,
-        error: `Write failed on "${item.relativePath}": ${writeErr instanceof Error ? writeErr.message : String(writeErr)}. All ${successfullyWritten.length} earlier writes in batch were restored to original state.`,
+        error: `Write failed on "${item.relativePath}": ${writeErr instanceof Error ? writeErr.message : String(writeErr)}. All ${rollbackTargets.length} affected files were verified and restored to their original pre-write state.`,
         failedFile: item.relativePath,
         rolledBack: true,
+        unrecoveredFilesystem: false,
       };
     }
   }
@@ -493,6 +535,13 @@ export async function runCodingAgent(
           const stepResult = await runStep("createOrUpdateFiles", async () => {
             return await executeBatchFileWrites(sandbox.files, files);
           });
+
+          // Stop generation when rollback cannot be guaranteed
+          if (stepResult.unrecoveredFilesystem) {
+            throw new CodingAgentError(
+              `UNRECOVERED_FILESYSTEM_ERROR: File rollback could not be guaranteed after failure on "${stepResult.failedFile}". Generation stopped to prevent corruption. Details: ${stepResult.error}`
+            );
+          }
 
           // Only mutate network state if the entire batch write succeeded
           if (stepResult.success && stepResult.updatedMap && network?.state?.data) {
