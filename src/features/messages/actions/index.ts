@@ -23,6 +23,37 @@ export const createMessage = async (value: string, projectId: string) => {
     throw new Error("Unauthorized");
   }
 
+  // 1. Server-side prompt validation
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.length < 3) {
+    throw new Error("Prompt must be at least 3 characters long");
+  }
+  if (trimmed.length > 4000) {
+    throw new Error("Prompt exceeds maximum length of 4000 characters");
+  }
+
+  // 2. Concurrency Control: Check for active generation in progress
+  const activeRun = await prisma.generationRun.findFirst({
+    where: {
+      projectId,
+      status: {
+        in: [
+          GenerationRunStatus.QUEUED,
+          GenerationRunStatus.PLANNING,
+          GenerationRunStatus.AWAITING_APPROVAL,
+          GenerationRunStatus.DESIGNING,
+          GenerationRunStatus.ARCHITECTING,
+          GenerationRunStatus.RUNNING,
+          GenerationRunStatus.VALIDATING,
+        ],
+      },
+    },
+  });
+
+  if (activeRun) {
+    throw new Error("A generation run is already in progress for this project. Please wait for it to complete.");
+  }
+
   const project = await prisma.project.findUnique({
     where: {
       id: projectId,
@@ -42,7 +73,7 @@ export const createMessage = async (value: string, projectId: string) => {
     const message = await tx.message.create({
       data: {
         projectId,
-        content: value,
+        content: trimmed,
         role: MessageRole.USER,
         type: MessageType.RESULT,
       },
@@ -52,7 +83,7 @@ export const createMessage = async (value: string, projectId: string) => {
       data: {
         projectId,
         userId: user.id,
-        prompt: value,
+        prompt: trimmed,
         status: GenerationRunStatus.QUEUED,
         baseRevisionId: project.currentRevisionId,
       },
@@ -64,7 +95,7 @@ export const createMessage = async (value: string, projectId: string) => {
         payload: {
           runId: run.id,
           projectId,
-          prompt: value,
+          prompt: trimmed,
           baseRevisionId: project.currentRevisionId,
         },
       },

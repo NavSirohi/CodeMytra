@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { format } from "date-fns";
-import { History, RotateCcw, Check, FileCode, Loader2 } from "lucide-react";
+import { History, RotateCcw, Check, FileCode, Loader2, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 interface RevisionHistoryProps {
   projectId: string;
   currentRevisionId?: string | null;
-  onSelectRevision?: (revisionId: string) => void;
+  onSelectRevision?: (revision: { id: string; title: string; files: Record<string, string> }) => void;
 }
 
 export function RevisionHistory({
@@ -35,7 +35,14 @@ export function RevisionHistory({
 
   const handleRestore = async (revisionId: string, revisionNumber: number) => {
     if (confirm(`Restore project to Revision V${revisionNumber}? A new revision will be created without modifying your earlier history.`)) {
-      await restoreMutation.mutateAsync(revisionId);
+      const restored = await restoreMutation.mutateAsync(revisionId);
+      if (restored && onSelectRevision) {
+        onSelectRevision({
+          id: restored.id,
+          title: restored.title,
+          files: (restored.files as Record<string, string>) || {},
+        });
+      }
       setOpen(false);
     }
   };
@@ -127,13 +134,27 @@ export function RevisionHistory({
                         size="xs"
                         variant="ghost"
                         onClick={() => {
-                          onSelectRevision(rev.id);
+                          onSelectRevision({
+                            id: rev.id,
+                            title: rev.title,
+                            files: (rev.files as Record<string, string>) || {},
+                          });
                           setOpen(false);
                         }}
                       >
                         View
                       </Button>
                     )}
+
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      className="gap-1 text-[11px]"
+                      onClick={() => window.open(`/api/projects/${projectId}/export?revisionId=${rev.id}`, "_blank")}
+                    >
+                      <Download className="size-3" />
+                      <span>Export</span>
+                    </Button>
 
                     {!isCurrent && (
                       <Button

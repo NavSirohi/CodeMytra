@@ -37,6 +37,19 @@ export function ProjectView({ projectId }: { projectId: string }) {
     window.open(`/api/projects/${projectId}/export`, "_blank");
   };
 
+  const handleSelectRevision = (rev: { id: string; title: string; files: Record<string, string> }) => {
+    setActiveFragment({
+      id: rev.id,
+      messageId: "historical",
+      sandboxUrl: "",
+      title: rev.title,
+      files: rev.files,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    setTabState("code");
+  };
+
   return (
     <div className="h-screen flex flex-col">
       <GenerationStatusBanner projectId={projectId} />
@@ -92,6 +105,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   <RevisionHistory
                     projectId={projectId}
                     currentRevisionId={project?.currentRevisionId}
+                    onSelectRevision={handleSelectRevision}
                   />
 
                   {/* Export Project ZIP */}

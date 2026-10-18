@@ -17,13 +17,24 @@ export interface CreateRevisionParams {
   files: Record<string, string>;
 }
 
+export const MAX_FILES_PER_REVISION = 100;
+export const MAX_SINGLE_FILE_SIZE_BYTES = 1024 * 1024; // 1 MB
+export const MAX_TOTAL_REVISION_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
+
 /**
- * Filter and validate file paths to prevent directory traversal or storing sensitive files.
+ * Filter and validate file paths and sizes to prevent directory traversal,
+ * oversized payloads, or storing sensitive files.
  */
 export function sanitizeProjectFiles(files: Record<string, string>): Record<string, string> {
   const sanitized: Record<string, string> = {};
+  let totalBytes = 0;
 
-  for (const [rawPath, content] of Object.entries(files)) {
+  const entries = Object.entries(files);
+  if (entries.length > MAX_FILES_PER_REVISION) {
+    throw new Error(`Revision exceeds maximum file limit of ${MAX_FILES_PER_REVISION} files (received ${entries.length})`);
+  }
+
+  for (const [rawPath, content] of entries) {
     // Normalize path
     const normalized = path.normalize(rawPath).replace(/^(\.\/|\/)/, "");
 
@@ -44,6 +55,16 @@ export function sanitizeProjectFiles(files: Record<string, string>): Record<stri
       normalized.endsWith(".key")
     ) {
       continue;
+    }
+
+    const fileSizeBytes = Buffer.byteLength(content, "utf8");
+    if (fileSizeBytes > MAX_SINGLE_FILE_SIZE_BYTES) {
+      throw new Error(`File ${normalized} exceeds single file size limit of 1MB (${fileSizeBytes} bytes)`);
+    }
+
+    totalBytes += fileSizeBytes;
+    if (totalBytes > MAX_TOTAL_REVISION_SIZE_BYTES) {
+      throw new Error(`Total revision size exceeds maximum limit of 20MB`);
     }
 
     sanitized[normalized] = content;
@@ -68,57 +89,141 @@ export function generateManifest(files: Record<string, string>): FileTreeManifes
 }
 
 /**
+ * Validates that an in-memory file tree matches its recorded manifest.
+ */
+export function validateRevisionManifest(
+  files: Record<string, string>,
+  manifest?: FileTreeManifest | null
+): { valid: boolean; error?: string } {
+  if (!manifest) {
+    return { valid: true };
+  }
+
+  const fileKeys = Object.keys(files);
+  if (manifest.fileCount !== undefined && fileKeys.length !== manifest.fileCount) {
+    return {
+      valid: false,
+      error: `Manifest fileCount mismatch: expected ${manifest.fileCount}, found ${fileKeys.length}`,
+    };
+  }
+
+  if (manifest.paths && Array.isArray(manifest.paths)) {
+    for (const expectedPath of manifest.paths) {
+      if (files[expectedPath] === undefined) {
+        return {
+          valid: false,
+          error: `Missing required file from manifest: ${expectedPath}`,
+        };
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
+export class RestorationError extends Error {
+  constructor(message: string, public readonly details?: unknown) {
+    super(message);
+    this.name = "RestorationError";
+  }
+}
+
+/**
  * Persists an immutable project revision.
- * Assigns monotonically increasing revisionNumber per project.
+ * Idempotent: returns existing revision if generationRunId has already produced one.
+ * Concurrency-safe: atomically assigns monotonically increasing revisionNumber.
  */
 export async function createProjectRevision(params: CreateRevisionParams) {
   const { projectId, generationRunId, parentRevisionId, title, summary } = params;
 
+  // Idempotency check: if this generation run already generated a revision, return it
+  if (generationRunId) {
+    const existing = await prisma.projectRevision.findFirst({
+      where: {
+        projectId,
+        generationRunId,
+      },
+    });
+    if (existing) {
+      return existing;
+    }
+  }
+
   const sanitizedFiles = sanitizeProjectFiles(params.files);
   const manifest = generateManifest(sanitizedFiles);
 
-  return prisma.$transaction(async (tx) => {
-    // Get highest revision number
-    const lastRev = await tx.projectRevision.findFirst({
-      where: { projectId },
-      orderBy: { revisionNumber: "desc" },
-      select: { revisionNumber: true, id: true },
-    });
+  // Retries for concurrency on unique [projectId, revisionNumber]
+  const MAX_RETRIES = 3;
+  let lastError: unknown;
 
-    const nextRevisionNumber = (lastRev?.revisionNumber ?? 0) + 1;
-    const resolvedParentId = parentRevisionId ?? lastRev?.id ?? null;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        // Double check idempotency inside transaction
+        if (generationRunId) {
+          const existingInside = await tx.projectRevision.findFirst({
+            where: { projectId, generationRunId },
+          });
+          if (existingInside) return existingInside;
+        }
 
-    const revision = await tx.projectRevision.create({
-      data: {
-        projectId,
-        generationRunId,
-        parentRevisionId: resolvedParentId,
-        revisionNumber: nextRevisionNumber,
-        title: title || `Revision ${nextRevisionNumber}`,
-        summary: summary || null,
-        files: sanitizedFiles,
-        manifest: manifest as unknown as Prisma.InputJsonObject,
-      },
-    });
+        // Get highest revision number
+        const lastRev = await tx.projectRevision.findFirst({
+          where: { projectId },
+          orderBy: { revisionNumber: "desc" },
+          select: { revisionNumber: true, id: true },
+        });
 
-    // Update project pointer to current revision
-    await tx.project.update({
-      where: { id: projectId },
-      data: { currentRevisionId: revision.id },
-    });
+        const nextRevisionNumber = (lastRev?.revisionNumber ?? 0) + 1;
+        const resolvedParentId = parentRevisionId ?? lastRev?.id ?? null;
 
-    return revision;
-  });
+        const revision = await tx.projectRevision.create({
+          data: {
+            projectId,
+            generationRunId,
+            parentRevisionId: resolvedParentId,
+            revisionNumber: nextRevisionNumber,
+            title: title || `Revision ${nextRevisionNumber}`,
+            summary: summary || null,
+            files: sanitizedFiles,
+            manifest: manifest as unknown as Prisma.InputJsonObject,
+          },
+        });
+
+        // Update project pointer to current revision
+        await tx.project.update({
+          where: { id: projectId },
+          data: { currentRevisionId: revision.id },
+        });
+
+        return revision;
+      });
+    } catch (err: unknown) {
+      lastError = err;
+      // If error is unique constraint violation, retry loop
+      const isUniqueError = err && typeof err === "object" && "code" in err && (err as { code: string }).code === "P2002";
+      if (!isUniqueError) {
+        throw err;
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 /**
  * Retrieves the base revision to start a new generation from.
+ * Strict project boundary enforcement: verifies requested revision belongs to projectId.
  */
 export async function resolveBaseRevision(projectId: string, specificRevisionId?: string | null) {
   if (specificRevisionId) {
-    return prisma.projectRevision.findUnique({
-      where: { id: specificRevisionId },
+    const revision = await prisma.projectRevision.findFirst({
+      where: { id: specificRevisionId, projectId },
     });
+    if (!revision) {
+      throw new Error(`Base revision ${specificRevisionId} does not belong to project ${projectId} or was not found`);
+    }
+    return revision;
   }
 
   // Check project's currentRevision
@@ -128,9 +233,10 @@ export async function resolveBaseRevision(projectId: string, specificRevisionId?
   });
 
   if (project?.currentRevisionId) {
-    return prisma.projectRevision.findUnique({
-      where: { id: project.currentRevisionId },
+    const current = await prisma.projectRevision.findFirst({
+      where: { id: project.currentRevisionId, projectId },
     });
+    if (current) return current;
   }
 
   // Fallback to highest revisionNumber
@@ -158,12 +264,12 @@ export async function restoreHistoricalRevision(
     throw new Error("Project not found or unauthorized");
   }
 
-  const targetRevision = await prisma.projectRevision.findUnique({
+  const targetRevision = await prisma.projectRevision.findFirst({
     where: { id: targetRevisionId, projectId },
   });
 
   if (!targetRevision) {
-    throw new Error("Target revision not found");
+    throw new Error("Target revision not found or does not belong to this project");
   }
 
   const files = (targetRevision.files as Record<string, string>) || {};

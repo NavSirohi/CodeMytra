@@ -9,6 +9,8 @@ export interface GenerationEventPayload {
   baseRevisionId: string | null;
 }
 
+export const MAX_OUTBOX_ATTEMPTS = 5;
+
 /**
  * Dispatches an outbox event to Inngest reliably with error tracking and idempotency.
  */
@@ -19,6 +21,17 @@ export async function dispatchOutboxEvent(eventId: string) {
 
   if (!event || event.status === OutboxStatus.PROCESSED) {
     return { dispatched: false, reason: "Already processed or missing" };
+  }
+
+  if (event.attempts >= MAX_OUTBOX_ATTEMPTS) {
+    await prisma.outboxEvent.update({
+      where: { id: eventId },
+      data: {
+        status: OutboxStatus.FAILED,
+        lastError: `Max outbox dispatch attempts (${MAX_OUTBOX_ATTEMPTS}) exceeded`,
+      },
+    });
+    return { dispatched: false, reason: "Max attempts exceeded" };
   }
 
   // Mark processing
@@ -68,4 +81,43 @@ export async function dispatchOutboxEvent(eventId: string) {
     console.error(`[Outbox] Failed to dispatch event ${eventId}:`, errorMessage);
     return { dispatched: false, error: errorMessage };
   }
+}
+
+/**
+ * Finds and recovers stale or failed outbox events that have not exceeded MAX_OUTBOX_ATTEMPTS.
+ */
+export async function recoverStaleOutboxEvents(maxAgeMs: number = 60000) {
+  const cutoff = new Date(Date.now() - maxAgeMs);
+
+  const staleEvents = await prisma.outboxEvent.findMany({
+    where: {
+      OR: [
+        { status: OutboxStatus.PENDING },
+        {
+          status: OutboxStatus.PROCESSING,
+          createdAt: { lt: cutoff },
+        },
+        {
+          status: OutboxStatus.FAILED,
+          attempts: { lt: MAX_OUTBOX_ATTEMPTS },
+        },
+      ],
+    },
+    take: 20,
+    orderBy: { createdAt: "asc" },
+  });
+
+  let recovered = 0;
+  let failed = 0;
+
+  for (const event of staleEvents) {
+    const result = await dispatchOutboxEvent(event.id);
+    if (result.dispatched) {
+      recovered++;
+    } else {
+      failed++;
+    }
+  }
+
+  return { total: staleEvents.length, recovered, failed };
 }

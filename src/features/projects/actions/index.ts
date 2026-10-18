@@ -16,6 +16,18 @@ export const createProject = async (value: string) => {
     };
   }
 
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.length < 3) {
+    return {
+      error: "Prompt must be at least 3 characters long",
+    };
+  }
+  if (trimmed.length > 4000) {
+    return {
+      error: "Prompt exceeds maximum length of 4000 characters",
+    };
+  }
+
   try {
     const { project, outboxEvent } = await prisma.$transaction(async (tx) => {
       const newProject = await tx.project.create({
@@ -24,7 +36,7 @@ export const createProject = async (value: string) => {
           userId: user.id,
           messages: {
             create: {
-              content: value,
+              content: trimmed,
               role: MessageRole.USER,
               type: MessageType.RESULT,
             },
@@ -36,7 +48,7 @@ export const createProject = async (value: string) => {
         data: {
           projectId: newProject.id,
           userId: user.id,
-          prompt: value,
+          prompt: trimmed,
           status: GenerationRunStatus.QUEUED,
           baseRevisionId: null,
         },
@@ -48,7 +60,7 @@ export const createProject = async (value: string) => {
           payload: {
             runId: run.id,
             projectId: newProject.id,
-            prompt: value,
+            prompt: trimmed,
             baseRevisionId: null,
           },
         },
@@ -164,6 +176,7 @@ export const getProjectRevisions = async (projectId: string) => {
       generationRunId: true,
       parentRevisionId: true,
       manifest: true,
+      files: true,
     },
   });
 };

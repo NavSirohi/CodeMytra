@@ -1,5 +1,5 @@
 import { getGeminiModel } from "@/server/providers/gemini";
-import { PRD, PRDSchema } from "@/server/agent-contracts/schemas";
+import { PRD, PRDSchema, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
 import { prisma } from "@/lib/db";
 import { SpecStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
@@ -29,20 +29,56 @@ You MUST respond with valid JSON matching this schema:
 Do NOT wrap in markdown backticks or include any conversational filler. Only return raw JSON.
 `;
 
-export async function runPlannerAgent(prompt: string): Promise<PRD> {
+export interface PlannerContext {
+  existingPRD?: PRD | null;
+  existingDesignSpec?: DesignSpec | null;
+  existingArchitectureSpec?: ArchitectureSpec | null;
+  existingFiles?: Record<string, string> | null;
+}
+
+export class PlannerError extends Error {
+  constructor(message: string, public readonly rawOutput?: string) {
+    super(message);
+    this.name = "PlannerError";
+  }
+}
+
+export async function runPlannerAgent(prompt: string, context?: PlannerContext): Promise<PRD> {
   const model = getGeminiModel({
     model: "gemini-2.5-pro",
     temperature: 0.2,
   });
 
+  const isFollowUp = Boolean(context?.existingPRD || (context?.existingFiles && Object.keys(context.existingFiles).length > 0));
+
+  let systemPrompt = PLANNER_PROMPT;
+  let userPrompt = `User Application Request:\n"${prompt}"`;
+
+  if (isFollowUp) {
+    const fileList = context?.existingFiles
+      ? Object.keys(context.existingFiles).slice(0, 30).join(", ")
+      : "None";
+
+    systemPrompt += `
+\n=== FOLLOW-UP / INCREMENTAL MODIFICATION RULES ===
+You are modifying an existing, previously generated application.
+1. PRESERVE EXISTING FEATURES: Keep existing pages, data entities, and core capabilities intact unless explicitly instructed to remove or replace them.
+2. INTEGRATE DELTA: Incorporate the user's new request as an additive or targeted modification to the PRD.
+3. PRESERVE IDENTITY: Keep the existing project name and core audience aligned with the previous baseline.
+4. RETURN COMPLETE PRD: Return the unified, comprehensive PRD reflecting both existing and new requirements.
+`;
+
+    userPrompt = `User Modification Request:\n"${prompt}"\n\n=== EXISTING BASELINE PRD ===\n${JSON.stringify(context?.existingPRD || {}, null, 2)}\n\n=== EXISTING PROJECT FILES ===\n${fileList}`;
+  }
+
   const agent = createAgent({
     name: "planner-agent",
     description: "Generates structured application PRDs",
-    system: PLANNER_PROMPT,
+    system: systemPrompt,
     model,
   });
 
-  const result = await agent.run(`User Application Request:\n"${prompt}"`);
+  const result = await agent.run(userPrompt);
   const text = agentOutputText(result.output, "").trim();
   const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 
@@ -51,41 +87,17 @@ export async function runPlannerAgent(prompt: string): Promise<PRD> {
     return PRDSchema.parse(rawJson);
   } catch (error) {
     console.error("[Planner] Failed to parse PRD output:", error, "Raw response:", text);
-    // Fallback safe PRD to avoid blocking generation
-    return {
-      projectName: "Generated Application",
-      summary: prompt,
-      targetAudience: "General Users",
-      coreFeatures: [
-        {
-          name: "Main Feature Set",
-          description: prompt,
-          priority: "MUST",
-        },
-      ],
-      pages: [
-        {
-          route: "/",
-          title: "Home",
-          purpose: "Primary application dashboard and entry point",
-          keyComponents: ["Header", "MainSection", "Footer"],
-        },
-      ],
-      dataEntities: [],
-      userFlows: [
-        {
-          name: "Primary Journey",
-          steps: ["Open application", "Interact with core features"],
-        },
-      ],
-    };
+    throw new PlannerError(
+      `Planner agent failed to generate a valid Product Requirements Document (PRD): ${error instanceof Error ? error.message : String(error)}`,
+      text
+    );
   }
 }
 
 /**
  * Persists or updates the project PRD in the database.
  */
-export async function saveProjectPRD(projectId: string, prd: PRD) {
+export async function saveProjectPRD(projectId: string, prd: PRD, status: SpecStatus = SpecStatus.DRAFT) {
   const prdJson = prd as unknown as Prisma.InputJsonObject;
 
   return prisma.projectSpecification.upsert({
@@ -93,11 +105,11 @@ export async function saveProjectPRD(projectId: string, prd: PRD) {
     create: {
       projectId,
       prd: prdJson,
-      status: SpecStatus.AWAITING_APPROVAL,
+      status,
     },
     update: {
       prd: prdJson,
-      status: SpecStatus.AWAITING_APPROVAL,
+      status,
     },
   });
 }

@@ -8,11 +8,18 @@ import { FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
 import z from "zod";
 import { agentOutputText, connectSandbox, lastAssistantTextMessageContent } from "./utils";
 import { transitionRun } from "@/server/orchestration/state-machine";
-import { createProjectRevision, resolveBaseRevision } from "@/server/orchestration/revisions";
+import {
+  createProjectRevision,
+  resolveBaseRevision,
+  validateRevisionManifest,
+  RestorationError,
+  FileTreeManifest,
+} from "@/server/orchestration/revisions";
 import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
 import { runDesignAgent, saveDesignSpec } from "@/server/agents/designer";
 import { runArchitectureAgent, saveArchitectureSpec } from "@/server/agents/architect";
 import { runQAInspector } from "@/server/agents/qa";
+import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
 
 export interface CodeAgentState {
   sandboxId: string;
@@ -58,33 +65,96 @@ async function recordRunEvent(
 }
 
 export const codeAgentFunction = inngest.createFunction(
-  { id: "code-agent", triggers: { event: "code-agent/run" } },
+  {
+    id: "code-agent",
+    triggers: { event: "code-agent/run" },
+    retries: 2,
+    onFailure: async ({ event, error }) => {
+      const data = event.data?.event?.data as { runId?: string; projectId?: string } | undefined;
+      const failedRunId = data?.runId;
+      const failedProjectId = data?.projectId;
+
+      if (failedRunId) {
+        try {
+          await transitionRun(failedRunId, GenerationRunStatus.FAILED, {
+            errorCode: "WORKFLOW_EXECUTION_FAILED",
+            errorMessage: error.message || "Generation workflow failed or exhausted retries",
+          });
+          await recordRunEvent(
+            failedRunId,
+            "FAILED",
+            "System",
+            `Workflow terminated: ${error.message || "Exhausted retries"}`
+          );
+        } catch (e) {
+          console.error("[Inngest onFailure] Error marking run failed:", e);
+        }
+      }
+
+      if (failedProjectId) {
+        try {
+          await prisma.message.create({
+            data: {
+              projectId: failedProjectId,
+              content: `Generation failed: ${error.message || "An unexpected error occurred during execution."} Your previous working revision is safely preserved.`,
+              role: MessageRole.ASSISTANT,
+              type: MessageType.ERROR,
+            },
+          });
+        } catch (e) {
+          console.error("[Inngest onFailure] Error creating message:", e);
+        }
+      }
+    },
+  },
   async ({ event, step }) => {
     const projectId = event.data.projectId as string;
-    const runId = (event.data.runId as string) || undefined;
+    const runId = event.data.runId as string;
     const promptValue = event.data.value as string;
     const baseRevisionId = (event.data.baseRevisionId as string) || undefined;
+
+    // Enforce required persisted runId
+    if (!runId) {
+      throw new Error("Missing required persisted runId for generation execution");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 0: RESOLVE BASE FILES & EXISTING CONTEXT
+    // ─────────────────────────────────────────────────────────────────────────
+    const { baseFiles, baseRev } = await step.run("resolve-base-files", async () => {
+      const rev = await resolveBaseRevision(projectId, baseRevisionId);
+      return {
+        baseFiles: (rev?.files as Record<string, string>) || {},
+        baseRev: rev,
+      };
+    });
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 1: REQUIREMENTS & PLANNING (Planner Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
     const prd = await step.run("planner-agent", async () => {
-      if (runId) {
-        await transitionRun(runId, GenerationRunStatus.PLANNING);
-        await recordRunEvent(runId, "PLANNING", "Planner Agent", "Analyzing requirements and drafting product specification");
-      }
+      await transitionRun(runId, GenerationRunStatus.PLANNING);
+      await recordRunEvent(runId, "PLANNING", "Planner Agent", "Analyzing requirements and drafting product specification");
 
-      const generatedPRD = await runPlannerAgent(promptValue);
+      const existingSpec = await prisma.projectSpecification.findUnique({
+        where: { projectId },
+      });
+
+      const generatedPRD = await runPlannerAgent(promptValue, {
+        existingPRD: (existingSpec?.prd as unknown as PRD) || null,
+        existingDesignSpec: (existingSpec?.designSpec as unknown as DesignSpec) || null,
+        existingArchitectureSpec: (existingSpec?.architectureSpec as unknown as ArchitectureSpec) || null,
+        existingFiles: baseFiles,
+      });
+
       await saveProjectPRD(projectId, generatedPRD);
 
-      if (runId) {
-        await recordRunEvent(
-          runId,
-          "PLANNING",
-          "Planner Agent",
-          `Generated PRD for ${generatedPRD.projectName} with ${generatedPRD.pages.length} pages`
-        );
-      }
+      await recordRunEvent(
+        runId,
+        "PLANNING",
+        "Planner Agent",
+        `Generated PRD for ${generatedPRD.projectName} with ${generatedPRD.pages.length} pages`
+      );
 
       return generatedPRD;
     });
@@ -93,22 +163,18 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 2: DESIGN SPECIFICATION (Design Agent with Gemini 2.5 Flash)
     // ─────────────────────────────────────────────────────────────────────────
     const designSpec = await step.run("designer-agent", async () => {
-      if (runId) {
-        await transitionRun(runId, GenerationRunStatus.DESIGNING);
-        await recordRunEvent(runId, "DESIGNING", "Design Agent", "Creating accessible color palette, typography, and component styling");
-      }
+      await transitionRun(runId, GenerationRunStatus.DESIGNING);
+      await recordRunEvent(runId, "DESIGNING", "Design Agent", "Creating accessible color palette, typography, and component styling");
 
       const spec = await runDesignAgent(prd);
       await saveDesignSpec(projectId, spec);
 
-      if (runId) {
-        await recordRunEvent(
-          runId,
-          "DESIGNING",
-          "Design Agent",
-          `Selected ${spec.aestheticTheme} theme with primary color ${spec.colorPalette.primary}`
-        );
-      }
+      await recordRunEvent(
+        runId,
+        "DESIGNING",
+        "Design Agent",
+        `Selected ${spec.aestheticTheme} theme with primary color ${spec.colorPalette.primary}`
+      );
 
       return spec;
     });
@@ -117,22 +183,18 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 3: ARCHITECTURE & CONTRACTS (Architecture Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
     const archSpec = await step.run("architect-agent", async () => {
-      if (runId) {
-        await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
-        await recordRunEvent(runId, "ARCHITECTING", "Architecture Agent", "Establishing route contracts and file ownership boundaries");
-      }
+      await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
+      await recordRunEvent(runId, "ARCHITECTING", "Architecture Agent", "Establishing route contracts and file ownership boundaries");
 
       const spec = await runArchitectureAgent(prd, designSpec);
       await saveArchitectureSpec(projectId, spec);
 
-      if (runId) {
-        await recordRunEvent(
-          runId,
-          "ARCHITECTING",
-          "Architecture Agent",
-          `Configured ${spec.routeEndpoints.length} route endpoints with Next.js full-stack architecture`
-        );
-      }
+      await recordRunEvent(
+        runId,
+        "ARCHITECTING",
+        "Architecture Agent",
+        `Configured ${spec.routeEndpoints.length} route endpoints with Next.js full-stack architecture`
+      );
 
       return spec;
     });
@@ -140,31 +202,44 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 4: FILESYSTEM RESTORATION & SANDBOX INITIALIZATION
     // ─────────────────────────────────────────────────────────────────────────
-    if (runId) {
-      await step.run("mark-run-running", async () => {
-        await transitionRun(runId, GenerationRunStatus.RUNNING);
-        await recordRunEvent(runId, "RUNNING", "Integration Agent", "Restoring previous project filesystem and spinning up execution sandbox");
-      });
-    }
-
-    const baseFiles = await step.run("resolve-base-files", async () => {
-      const baseRev = await resolveBaseRevision(projectId, baseRevisionId);
-      return (baseRev?.files as Record<string, string>) || {};
+    await step.run("mark-run-running", async () => {
+      await transitionRun(runId, GenerationRunStatus.RUNNING);
+      await recordRunEvent(runId, "RUNNING", "Integration Agent", "Restoring previous project filesystem and spinning up execution sandbox");
     });
 
     const sandboxId = await step.run("get-sandbox-id-and-restore", async () => {
+      // 1. Validate manifest before restoring
+      if (baseRev?.manifest) {
+        const manifestValidation = validateRevisionManifest(
+          baseFiles,
+          baseRev.manifest as unknown as FileTreeManifest
+        );
+        if (!manifestValidation.valid) {
+          throw new RestorationError(`Base revision manifest invalid: ${manifestValidation.error}`);
+        }
+      }
+
       const sandbox = await Sandbox.create({
         template: getE2BTemplateId(),
       });
 
-      // Restore files from base revision
+      // 2. Restore files from base revision
       const fileEntries = Object.entries(baseFiles);
       if (fileEntries.length > 0) {
         for (const [filePath, content] of fileEntries) {
           try {
             await sandbox.files.write(filePath, content);
           } catch (writeError) {
-            console.error(`Failed to restore ${filePath}:`, writeError);
+            throw new RestorationError(`Failed to restore file ${filePath} into sandbox: ${String(writeError)}`);
+          }
+        }
+
+        // 3. Verify restoration completeness
+        for (const [filePath] of fileEntries) {
+          try {
+            await sandbox.files.read(filePath);
+          } catch {
+            throw new RestorationError(`Completeness check failed: Restored file ${filePath} could not be read`);
           }
         }
       }
@@ -382,27 +457,72 @@ ${archSpec.routeEndpoints.map((r) => `- [${r.type}] ${r.path}: ${r.purpose}`).jo
     const responseText = agentOutputText(responseOutput, "Here is your built application.");
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 7: QUALITY ASSURANCE & VERIFICATION (QA Agent)
+    // STAGE 7: QUALITY ASSURANCE, VERIFICATION & BOUNDED REPAIR
     // ─────────────────────────────────────────────────────────────────────────
-    const qaReport = await step.run("qa-agent", async () => {
-      if (runId) {
-        await transitionRun(runId, GenerationRunStatus.VALIDATING);
-        await recordRunEvent(runId, "VALIDATING", "QA Agent", "Running multi-point verification checks on generated code");
-      }
+    const qaResult = await step.run("qa-agent", async () => {
+      await transitionRun(runId, GenerationRunStatus.VALIDATING);
+      await recordRunEvent(runId, "VALIDATING", "QA Agent", "Running comprehensive sandbox verification pipeline");
 
-      const report = await runQAInspector({ files: files || {}, summary });
+      let currentFiles = { ...(files || {}) };
+      let currentSummary = summary;
 
-      if (runId) {
+      // Pass 1: Run comprehensive verification checks
+      let report = await runQAInspector({
+        files: currentFiles,
+        summary: currentSummary,
+        sandboxId,
+        runSandboxCommands: true,
+      });
+
+      // Bounded self-repair (1 repair iteration)
+      if (!report.passed && report.repairNeeded) {
         await recordRunEvent(
           runId,
           "VALIDATING",
           "QA Agent",
-          `Verification complete with quality score ${report.score}% (${report.passed ? "PASSED" : "FAILED"})`
+          `Initial verification failed (${report.score}%). Initiating bounded self-repair.`
         );
+
+        const repairPrompt = `
+Your previous code implementation failed quality and build verification checks:
+${report.repairInstructions}
+
+Please inspect and fix the errors in the sandbox files using createOrUpdateFiles or terminal.
+Ensure all TypeScript and Next.js compiler errors are resolved.
+Conclude with an updated <task_summary>...</task_summary>.
+`;
+        try {
+          const repairResult = await network.run(repairPrompt, { state });
+          if (repairResult.state.data.files) {
+            currentFiles = repairResult.state.data.files;
+          }
+          if (repairResult.state.data.summary) {
+            currentSummary = repairResult.state.data.summary;
+          }
+
+          // Re-verify after repair attempt
+          report = await runQAInspector({
+            files: currentFiles,
+            summary: currentSummary,
+            sandboxId,
+            runSandboxCommands: true,
+          });
+        } catch (repairErr) {
+          console.error("[QA Repair] Repair loop execution failed:", repairErr);
+        }
       }
 
-      return report;
+      await recordRunEvent(
+        runId,
+        "VALIDATING",
+        "QA Agent",
+        `Verification complete with quality score ${report.score}% (${report.passed ? "PASSED" : "FAILED"})`
+      );
+
+      return { report, finalFiles: currentFiles, finalSummary: currentSummary };
     });
+
+    const { report: qaReport, finalFiles, finalSummary } = qaResult;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 8: PERSISTENCE & PREVIEW
@@ -414,13 +534,11 @@ ${archSpec.routeEndpoints.map((r) => `- [${r.type}] ${r.path}: ${r.purpose}`).jo
 
     await step.run("save-result", async () => {
       if (!qaReport.passed) {
-        if (runId) {
-          await transitionRun(runId, GenerationRunStatus.FAILED, {
-            errorCode: "QA_VERIFICATION_FAILED",
-            errorMessage: qaReport.repairInstructions || "Validation checks failed",
-          });
-          await recordRunEvent(runId, "FAILED", "System", "Run marked failed. Prior revision preserved.");
-        }
+        await transitionRun(runId, GenerationRunStatus.FAILED, {
+          errorCode: "QA_VERIFICATION_FAILED",
+          errorMessage: qaReport.repairInstructions || "Validation checks failed",
+        });
+        await recordRunEvent(runId, "FAILED", "System", "Run marked failed. Prior revision preserved.");
 
         return prisma.message.create({
           data: {
@@ -432,23 +550,21 @@ ${archSpec.routeEndpoints.map((r) => `- [${r.type}] ${r.path}: ${r.purpose}`).jo
         });
       }
 
-      // Create durable immutable revision
+      // Create durable immutable revision (idempotent)
       const revision = await createProjectRevision({
         projectId,
         generationRunId: runId,
         parentRevisionId: baseRevisionId,
         title: fragmentTitle,
         summary: responseText,
-        files: files || {},
+        files: finalFiles || {},
       });
 
       // Mark GenerationRun completed
-      if (runId) {
-        await transitionRun(runId, GenerationRunStatus.COMPLETED, {
-          resultRevisionId: revision.id,
-        });
-        await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} permanently persisted`);
-      }
+      await transitionRun(runId, GenerationRunStatus.COMPLETED, {
+        resultRevisionId: revision.id,
+      });
+      await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} permanently persisted`);
 
       return prisma.message.create({
         data: {
@@ -460,7 +576,7 @@ ${archSpec.routeEndpoints.map((r) => `- [${r.type}] ${r.path}: ${r.purpose}`).jo
             create: {
               sandboxUrl,
               title: fragmentTitle,
-              files: files || {},
+              files: finalFiles || {},
             },
           },
         },
@@ -470,8 +586,8 @@ ${archSpec.routeEndpoints.map((r) => `- [${r.type}] ${r.path}: ${r.purpose}`).jo
     return {
       url: sandboxUrl,
       title: fragmentTitle,
-      files,
-      summary,
+      files: finalFiles,
+      summary: finalSummary,
     };
   }
 );
