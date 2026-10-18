@@ -3,7 +3,8 @@ import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
 import { MessageRole, MessageType } from "@/generated/prisma/enums";
 
-import { createAgent, createNetwork, createState, createTool, gemini } from "@inngest/agent-kit"
+import { createAgent, createNetwork, createState, createTool } from "@inngest/agent-kit"
+import { getGeminiModel } from "@/server/providers/gemini";
 import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
 import z from "zod"
 import { agentOutputText, captureTaskSummary, connectSandbox, lastAssistantTextMessageContent } from "./utils";
@@ -14,26 +15,28 @@ export interface CodeAgentState {
   files: Record<string, string>;
 }
 
-
-export const processTask = inngest.createFunction(
-  { id: "process-task", triggers: { event: "app/task.created" } },
-  async ({ event, step }) => {
-    const result = await step.run("handle-task", async () => {
-      return { processed: true, id: event.data.id };
-    });
-
-    await step.sleep("pause", "1s");
-
-    return { message: `Task ${event.data.id} complete`, result };
+/**
+ * The E2B sandbox template to use for code execution.
+ * Set E2B_TEMPLATE_ID in your environment to override.
+ * NEVER hardcode a template ID or API key in this file.
+ */
+function getE2BTemplateId(): string {
+  const id = process.env.E2B_TEMPLATE_ID;
+  if (!id) {
+    throw new Error(
+      "E2B_TEMPLATE_ID is not set. Add it to your .env file. " +
+      "Create your own E2B account at https://e2b.dev"
+    );
   }
-);
+  return id;
+}
 
 export const codeAgentFunction = inngest.createFunction(
   { id: "code-agent", triggers: { event: "code-agent/run" } },
   async ({ event, step }) => {
     const sandboxId = await step.run("get-sandbox-id", async () => {
       const sandbox = await Sandbox.create({
-        template: "ugwj9f6y2wocdpps7omf"
+        template: getE2BTemplateId()
       });
 
       return sandbox.sandboxId;
@@ -64,25 +67,16 @@ export const codeAgentFunction = inngest.createFunction(
       { messages: previousMessages }
     );
 
-    const geminiModel = gemini({
-      model: "gemini-2.5-flash",
+    const geminiModel = getGeminiModel({
       step,
-      apiKey: process.env.GEMINI_API_KEY!,
-      defaultParameters: {
-        generationConfig: {
-          temperature: 0,
-          maxOutputTokens: 8192,
-          thinkingConfig: { thinkingBudget: 0 },
-        }
-      }
-    } as Parameters<typeof gemini>[0]
-    )
+      model: "gemini-2.5-flash",
+    });
 
     const codeAgent = createAgent({
       name: "code-agent",
       description: "An expert coding agent",
       system: PROMPT,
-      model: gemini({ model: "gemini-2.5-flash" }),
+      model: geminiModel,
       tools: [
         // 1. Terminal
         createTool({
@@ -172,8 +166,7 @@ export const codeAgentFunction = inngest.createFunction(
               try {
                 const sanbox = await Sandbox.connect(sandboxId);
 
-                const contents:any = [];
-                console.log(contents)
+                const contents: Array<{ path: string; content: string }> = [];
 
                 for (const file of files) {
                   const content = await sanbox.files.read(file);
@@ -190,7 +183,6 @@ export const codeAgentFunction = inngest.createFunction(
 
       lifecycle: {
         onResponse: async ({ result, network }) => {
-          console.log(result);
           const lastAssistantMessageText =
             lastAssistantTextMessageContent(result);
 
@@ -222,7 +214,6 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     const result = await network.run(event.data.value, { state });
-    console.log(result)
     const { summary, files } = result.state.data;
 
     const makeTextAgent = (name: string, system: string) => createAgent({ name, system, model: geminiModel });
@@ -237,8 +228,6 @@ export const codeAgentFunction = inngest.createFunction(
 
     const fragmentTitle = agentOutputText(fragmentTitleOutput, "Untitled");
     const responseText = agentOutputText(responseOutput, "Here you go");
-
-    console.log(files)
 
     const isError =
       !result.state.data.summary ||

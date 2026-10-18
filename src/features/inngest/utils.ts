@@ -68,13 +68,16 @@ export async function connectSandbox(sandboxId: string) {
 }
 
 
-export function lastAssistantTextMessageContent(result){
+export function lastAssistantTextMessageContent(result: AgentResult): string | undefined {
   const lastAssistantTextMessageIndex = result.output.findLastIndex(
       (message) => message.role === "assistant"
   )
 
-  const message = result.output[lastAssistantTextMessageIndex] 
+  const message = result.output[lastAssistantTextMessageIndex]
 
-
-  return message?.content ? typeof message.content === "string" ? message.content : message.content.map((c)=>c.text).join("") : undefined
+  return message?.content
+    ? typeof message.content === "string"
+      ? message.content
+      : (message.content as Array<{ text?: string }>).map((c) => c.text ?? "").join("")
+    : undefined
 }

@@ -1,29 +1,31 @@
 import { cn } from "@/lib/utils";
 
 /**
- * Props for {@link Chai0Logo}.
+ * Props for {@link CodeMytraLogo}.
  *
  * @property className - Extra classes applied to the wrapper.
- * @property showWordmark - Whether to render the "chai0" text next to the mark.
+ * @property showWordmark - Whether to render the "CodeMytra" text next to the mark.
  */
-type Chai0LogoProps = {
+type CodeMytraLogoProps = {
   className?: string;
   showWordmark?: boolean;
 };
 
 /**
- * The standalone chai0 glyph (SVG mark) without the wordmark.
+ * The standalone CodeMytra glyph (SVG mark) without the wordmark.
  *
  * Inherits color via `currentColor` so it adapts to the surrounding text color.
+ * Originally from the teacher's Chai0 project; retained and rebranded for CodeMytra.
  *
  * @param className - Extra classes applied to the `<svg>` element.
  */
-function Chai0Mark({ className }: { className?: string }) {
+function CodeMytraMark({ className }: { className?: string }) {
   return (
     <svg
       viewBox="0 0 44 48"
       fill="none"
       aria-hidden
+      aria-label="CodeMytra"
       className={cn("shrink-0", className)}
     >
       <rect
@@ -45,22 +47,28 @@ function Chai0Mark({ className }: { className?: string }) {
 }
 
 /**
- * The chai0 brand logo: the glyph mark plus an optional "chai0" wordmark.
+ * The CodeMytra brand logo: the glyph mark plus an optional "CodeMytra" wordmark.
  *
- * @param props - See {@link Chai0LogoProps}.
+ * @param props - See {@link CodeMytraLogoProps}.
  */
-export function Chai0Logo({
+export function CodeMytraLogo({
   className,
   showWordmark = true,
-}: Chai0LogoProps) {
+}: CodeMytraLogoProps) {
   return (
     <span className={cn("inline-flex items-center gap-2.5 text-foreground", className)}>
-      <Chai0Mark className="h-7 w-auto" />
+      <CodeMytraMark className="h-7 w-auto" />
       {showWordmark ? (
-        <span className="text-base font-semibold tracking-tight">chai0</span>
+        <span className="text-base font-semibold tracking-tight">CodeMytra</span>
       ) : null}
     </span>
   );
 }
 
-export { Chai0Mark };
+// Backward-compatible exports so existing imports keep working during the rename transition.
+// Remove these aliases once all references are updated.
+export { CodeMytraMark };
+/** @deprecated Use `CodeMytraMark` instead */
+export const Chai0Mark = CodeMytraMark;
+/** @deprecated Use `CodeMytraLogo` instead */
+export const Chai0Logo = CodeMytraLogo;
