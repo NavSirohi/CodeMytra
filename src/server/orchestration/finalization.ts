@@ -81,16 +81,27 @@ export async function finalizeGenerationSuccess(
     }
 
     // 2. Idempotency Check: if run is already completed with a revision, return idempotently
-    if (currentRun.status === GenerationRunStatus.COMPLETED && currentRun.revisions.length > 0) {
+    if (currentRun.status === GenerationRunStatus.COMPLETED) {
+      if (currentRun.revisions.length === 0) {
+        throw new Error(
+          `Database integrity violation: GenerationRun "${generationRunId}" is marked COMPLETED but has no associated revision`
+        );
+      }
       const existingRev = currentRun.revisions[0];
       const existingMsg = await tx.message.findUnique({
         where: { generationRunId },
       });
 
+      if (!existingMsg) {
+        throw new Error(
+          `Database integrity violation: Completed GenerationRun "${generationRunId}" has no associated result message`
+        );
+      }
+
       return {
         revision: existingRev,
         promoted: false,
-        messageId: existingMsg?.id || "existing-message",
+        messageId: existingMsg.id,
         isIdempotentReplay: true,
       };
     }
@@ -104,6 +115,13 @@ export async function finalizeGenerationSuccess(
     if (currentRun.status === GenerationRunStatus.FAILED) {
       throw new Error(
         `GenerationRun "${generationRunId}" is already FAILED and cannot be finalized as COMPLETED`
+      );
+    }
+
+    // Enforce valid finalization state: must be in VALIDATING state (after QA verification)
+    if (currentRun.status !== GenerationRunStatus.VALIDATING) {
+      throw new Error(
+        `Invalid state transition: Cannot finalize generation as COMPLETED from status "${currentRun.status}". Generation must be in VALIDATING state.`
       );
     }
 
@@ -263,8 +281,13 @@ export async function finalizeGenerationFailure(
       const existingMsg = await tx.message.findUnique({
         where: { generationRunId },
       });
+      if (!existingMsg) {
+        throw new Error(
+          `Database integrity violation: Completed GenerationRun "${generationRunId}" has no associated result message`
+        );
+      }
       return {
-        messageId: existingMsg?.id || "existing-message",
+        messageId: existingMsg.id,
         isIdempotentReplay: true,
       };
     }
@@ -275,8 +298,37 @@ export async function finalizeGenerationFailure(
       const existingMsg = await tx.message.findUnique({
         where: { generationRunId },
       });
+      if (existingMsg) {
+        return {
+          messageId: existingMsg.id,
+          isIdempotentReplay: true,
+        };
+      }
+      // Explicit documented compatibility/repair path for legacy unlinked records:
+      const legacyMsg = await tx.message.findFirst({
+        where: {
+          projectId,
+          type: MessageType.ERROR,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (legacyMsg) {
+        return {
+          messageId: legacyMsg.id,
+          isIdempotentReplay: true,
+        };
+      }
+      const repairedMessage = await tx.message.create({
+        data: {
+          projectId,
+          generationRunId,
+          content: `Generation run ${generationRunId} failed (${errorCode}): ${errorMessage}.`,
+          role: MessageRole.ASSISTANT,
+          type: MessageType.ERROR,
+        },
+      });
       return {
-        messageId: existingMsg?.id || "existing-message",
+        messageId: repairedMessage.id,
         isIdempotentReplay: true,
       };
     }
@@ -286,8 +338,36 @@ export async function finalizeGenerationFailure(
       const existingMsg = await tx.message.findUnique({
         where: { generationRunId },
       });
+      if (existingMsg) {
+        return {
+          messageId: existingMsg.id,
+          isIdempotentReplay: true,
+        };
+      }
+      const legacyMsg = await tx.message.findFirst({
+        where: {
+          projectId,
+          type: MessageType.ERROR,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (legacyMsg) {
+        return {
+          messageId: legacyMsg.id,
+          isIdempotentReplay: true,
+        };
+      }
+      const cancelledMessage = await tx.message.create({
+        data: {
+          projectId,
+          generationRunId,
+          content: `Generation run ${generationRunId} was cancelled.`,
+          role: MessageRole.ASSISTANT,
+          type: MessageType.ERROR,
+        },
+      });
       return {
-        messageId: existingMsg?.id || "existing-message",
+        messageId: cancelledMessage.id,
         isIdempotentReplay: true,
       };
     }

@@ -275,7 +275,7 @@ async function main() {
         projectId: testProjectId,
         userId: testUserId,
         prompt: initialPrompt,
-        status: GenerationRunStatus.RUNNING,
+        status: GenerationRunStatus.VALIDATING,
         baseRevisionId: null,
       },
     });
@@ -355,7 +355,7 @@ async function main() {
         projectId: testProjectId,
         userId: testUserId,
         prompt: followUpPrompt,
-        status: GenerationRunStatus.RUNNING,
+        status: GenerationRunStatus.VALIDATING,
         baseRevisionId: rev1.id,
       },
     });

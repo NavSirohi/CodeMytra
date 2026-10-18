@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/db";
 import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
-import { MessageRole, MessageType, GenerationRunStatus, Prisma } from "@/generated/prisma/client";
+import { MessageRole, GenerationRunStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { getGeminiModel } from "@/server/providers/gemini";
 import { FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
@@ -82,39 +82,32 @@ export const codeAgentFunction = inngest.createFunction(
     retries: 2,
     onFailure: async ({ event, error }) => {
       const data = event.data?.event?.data as { runId?: string; projectId?: string } | undefined;
-      const failedRunId = data?.runId;
-      const failedProjectId = data?.projectId;
+      const runId = data?.runId;
+      const projectId = data?.projectId;
 
-      if (failedRunId) {
-        try {
-          await transitionRun(failedRunId, GenerationRunStatus.FAILED, {
-            errorCode: "WORKFLOW_EXECUTION_FAILED",
-            errorMessage: error.message || "Generation workflow failed or exhausted retries",
-          });
-          await recordRunEvent(
-            failedRunId,
-            "FAILED",
-            "System",
-            `Workflow terminated: ${error.message || "Exhausted retries"}`
-          );
-        } catch (e) {
-          console.error("[Inngest onFailure] Error marking run failed:", e);
-        }
+      if (typeof runId !== "string" || typeof projectId !== "string") {
+        console.error("[Generation] Missing run or project identity in failure handler");
+        return;
       }
 
-      if (failedProjectId) {
-        try {
-          await prisma.message.create({
-            data: {
-              projectId: failedProjectId,
-              content: `Generation failed: ${error.message || "An unexpected error occurred during execution."} Your previous working revision is safely preserved.`,
-              role: MessageRole.ASSISTANT,
-              type: MessageType.ERROR,
-            },
-          });
-        } catch (e) {
-          console.error("[Inngest onFailure] Error creating message:", e);
-        }
+      try {
+        const safeErrorMessage =
+          typeof error?.message === "string" && error.message.trim().length > 0
+            ? error.message.slice(0, 500)
+            : "Generation failed after workflow retries.";
+
+        await finalizeGenerationFailure({
+          generationRunId: runId,
+          projectId,
+          errorCode: "WORKFLOW_EXECUTION_FAILED",
+          errorMessage: safeErrorMessage,
+        });
+      } catch (err) {
+        console.error(
+          "[Generation] Failure finalization failed:",
+          err instanceof Error ? err.message : String(err)
+        );
+        throw err;
       }
     },
   },

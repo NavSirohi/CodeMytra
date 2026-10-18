@@ -1,6 +1,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PGlite } from "@electric-sql/pglite";
+import { prisma } from "../src/lib/db";
+import {
+  finalizeGenerationSuccess,
+  finalizeGenerationFailure,
+} from "../src/server/orchestration/finalization";
+import {
+  GenerationRunStatus,
+  MessageRole,
+  MessageType,
+} from "../src/generated/prisma/client";
 
 describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
   async function setupTestDb() {
@@ -586,6 +596,263 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
       assert.equal(isMismatch, true, "Must detect project ownership mismatch");
     } finally {
       await db.close();
+    }
+  });
+
+  it("Regression Test 1: Duplicate Inngest failure -> One failure result and one associated error message", async () => {
+    const originalTx = prisma.$transaction;
+    const runId = "run-dup-fail-test";
+    const projectId = "prj-dup-fail";
+
+    let runState: any = {
+      id: runId,
+      projectId,
+      status: GenerationRunStatus.RUNNING,
+    };
+    const messages: any[] = [];
+    const runEvents: any[] = [];
+
+    prisma.$transaction = (async (cb: any) => {
+      const tx = {
+        generationRun: {
+          findUnique: async (args: any) => {
+            if (args.where.id === runId) return { ...runState };
+            return null;
+          },
+          update: async (args: any) => {
+            runState = { ...runState, ...args.data };
+            return runState;
+          },
+        },
+        runEvent: {
+          create: async (args: any) => {
+            const evt = { id: `evt-${runEvents.length + 1}`, ...args.data };
+            runEvents.push(evt);
+            return evt;
+          },
+        },
+        message: {
+          findUnique: async (args: any) => {
+            return messages.find((m) => m.generationRunId === args.where.generationRunId) || null;
+          },
+          findFirst: async () => null,
+          create: async (args: any) => {
+            const msg = { id: `msg-${messages.length + 1}`, ...args.data };
+            messages.push(msg);
+            return msg;
+          },
+        },
+      };
+      return cb(tx);
+    }) as any;
+
+    try {
+      // First Inngest failure dispatch
+      const res1 = await finalizeGenerationFailure({
+        projectId,
+        generationRunId: runId,
+        errorCode: "WORKFLOW_EXECUTION_FAILED",
+        errorMessage: "Process terminated unexpectedly",
+      });
+
+      assert.equal(res1.isIdempotentReplay, false);
+      assert.equal(messages.length, 1);
+      assert.equal(runEvents.length, 1);
+      assert.equal(runState.status, GenerationRunStatus.FAILED);
+
+      // Duplicate Inngest failure dispatch (retry or duplicate worker delivery)
+      const res2 = await finalizeGenerationFailure({
+        projectId,
+        generationRunId: runId,
+        errorCode: "WORKFLOW_EXECUTION_FAILED",
+        errorMessage: "Process terminated unexpectedly",
+      });
+
+      assert.equal(res2.isIdempotentReplay, true);
+      assert.equal(res2.messageId, res1.messageId);
+      // Strictly one failure result and one associated error message
+      assert.equal(messages.length, 1, "Must not create duplicate error messages on duplicate Inngest failure");
+      assert.equal(runEvents.length, 1, "Must not create duplicate failure events on duplicate Inngest failure");
+      assert.equal(runState.status, GenerationRunStatus.FAILED);
+    } finally {
+      prisma.$transaction = originalTx;
+    }
+  });
+
+  it("Regression Test 2: Completed run receives late failure -> Remains COMPLETED; active revision unchanged", async () => {
+    const originalTx = prisma.$transaction;
+    const runId = "run-late-fail-test";
+    const projectId = "prj-late-fail";
+
+    let projectState: any = {
+      id: projectId,
+      currentRevisionId: "rev-v1",
+    };
+    let runState: any = {
+      id: runId,
+      projectId,
+      status: GenerationRunStatus.COMPLETED,
+      resultRevisionId: "rev-v1",
+    };
+    const messages: any[] = [
+      {
+        id: "msg-success-v1",
+        projectId,
+        generationRunId: runId,
+        content: "Success summary",
+        role: MessageRole.ASSISTANT,
+        type: MessageType.RESULT,
+      },
+    ];
+    const runEvents: any[] = [];
+
+    prisma.$transaction = (async (cb: any) => {
+      const tx = {
+        generationRun: {
+          findUnique: async (args: any) => {
+            if (args.where.id === runId) return { ...runState };
+            return null;
+          },
+          update: async (args: any) => {
+            runState = { ...runState, ...args.data };
+            return runState;
+          },
+        },
+        project: {
+          findUnique: async (args: any) => {
+            if (args.where.id === projectId) return { ...projectState };
+            return null;
+          },
+          update: async (args: any) => {
+            projectState = { ...projectState, ...args.data };
+            return projectState;
+          },
+        },
+        message: {
+          findUnique: async (args: any) => {
+            return messages.find((m) => m.generationRunId === args.where.generationRunId) || null;
+          },
+          create: async (args: any) => {
+            const msg = { id: `msg-${messages.length + 1}`, ...args.data };
+            messages.push(msg);
+            return msg;
+          },
+        },
+        runEvent: {
+          create: async (args: any) => {
+            const evt = { id: `evt-${runEvents.length + 1}`, ...args.data };
+            runEvents.push(evt);
+            return evt;
+          },
+        },
+      };
+      return cb(tx);
+    }) as any;
+
+    try {
+      // Late-arriving failure callback (e.g. timeout handler triggered after run already completed)
+      const res = await finalizeGenerationFailure({
+        projectId,
+        generationRunId: runId,
+        errorCode: "TIMEOUT_OR_FAILURE",
+        errorMessage: "Late failure arrived after completion",
+      });
+
+      assert.equal(res.isIdempotentReplay, true);
+      assert.equal(res.messageId, "msg-success-v1");
+      // Status strictly remains COMPLETED
+      assert.equal(runState.status, GenerationRunStatus.COMPLETED, "Run must remain COMPLETED");
+      // Active revision unchanged
+      assert.equal(projectState.currentRevisionId, "rev-v1", "Active project revision must remain unchanged");
+      // No error message created
+      assert.equal(messages.length, 1);
+      assert.equal(runEvents.length, 0);
+    } finally {
+      prisma.$transaction = originalTx;
+    }
+  });
+
+  it("Regression Test 3: Missing message during completed-run replay -> Explicit integrity error; no fabricated ID", async () => {
+    const originalTx = prisma.$transaction;
+    const runId = "run-corrupt-msg-test";
+    const projectId = "prj-corrupt";
+
+    const runState: any = {
+      id: runId,
+      projectId,
+      status: GenerationRunStatus.COMPLETED,
+      revisions: [
+        {
+          id: "rev-v1",
+          projectId,
+          generationRunId: runId,
+          revisionNumber: 1,
+          title: "Rev 1",
+          summary: "Summary",
+          files: {},
+        },
+      ],
+    };
+
+    prisma.$transaction = (async (cb: any) => {
+      const tx = {
+        generationRun: {
+          findUnique: async (args: any) => {
+            if (args.where.id === runId) return { ...runState };
+            return null;
+          },
+        },
+        message: {
+          findUnique: async () => null, // Intentionally missing message to test database corruption
+        },
+      };
+      return cb(tx);
+    }) as any;
+
+    try {
+      // Attempting replay of completed run without associated result message must throw Database integrity violation
+      await assert.rejects(
+        async () => {
+          await finalizeGenerationSuccess({
+            projectId,
+            generationRunId: runId,
+            fragmentTitle: "Rev 1",
+            summary: "Summary",
+            files: {},
+            sandboxUrl: "https://sandbox.test",
+          });
+        },
+        (err: any) => {
+          assert.match(
+            err.message,
+            /Database integrity violation: Completed GenerationRun "run-corrupt-msg-test" has no associated result message/
+          );
+          // Verify no fabricated ID was returned or tolerated
+          assert.ok(!err.message.includes("existing-message"));
+          return true;
+        }
+      );
+
+      // Same check for finalizeGenerationFailure
+      await assert.rejects(
+        async () => {
+          await finalizeGenerationFailure({
+            projectId,
+            generationRunId: runId,
+            errorCode: "SOME_CODE",
+            errorMessage: "Some error",
+          });
+        },
+        (err: any) => {
+          assert.match(
+            err.message,
+            /Database integrity violation: Completed GenerationRun "run-corrupt-msg-test" has no associated result message/
+          );
+          return true;
+        }
+      );
+    } finally {
+      prisma.$transaction = originalTx;
     }
   });
 });

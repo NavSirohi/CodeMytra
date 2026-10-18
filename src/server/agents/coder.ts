@@ -92,6 +92,187 @@ export function isSensitiveFilePath(relPath: string): boolean {
   return SENSITIVE_FILE_PATTERNS.some((p) => p.test(base));
 }
 
+export interface BatchFileWriteTarget {
+  path: string;
+  content: string;
+}
+
+export interface SandboxFilesClient {
+  exists: (path: string) => Promise<boolean>;
+  read: (path: string) => Promise<string>;
+  write: (path: string, data: string) => Promise<unknown>;
+  remove: (path: string) => Promise<unknown>;
+}
+
+export interface BatchFileWriteResult {
+  success: boolean;
+  filesWritten?: string[];
+  count?: number;
+  error?: string;
+  failedFile?: string;
+  rolledBack?: boolean;
+  unrecoveredFilesystem?: boolean;
+  updatedMap?: Record<string, string>;
+}
+
+/**
+ * Executes a batch file write against sandbox files with pre-validation,
+ * pre-write state snapshotting, sequential writes, and automated rollback upon write failure.
+ */
+export async function executeBatchFileWrites(
+  filesClient: SandboxFilesClient,
+  files: BatchFileWriteTarget[]
+): Promise<BatchFileWriteResult> {
+  // STEP 1: Pre-validation of incoming paths, duplicates, and file sizes
+  const seenNormalizedPaths = new Set<string>();
+  const validatedFiles: Array<{
+    relativePath: string;
+    fullWorkspacePath: string;
+    content: string;
+  }> = [];
+
+  for (const file of files) {
+    const normalizedRel = path.normalize(file.path).replace(/^(\.\/|\/)/, "");
+    if (seenNormalizedPaths.has(normalizedRel)) {
+      return {
+        success: false,
+        error: `Duplicate file path "${file.path}" in batch is forbidden. Each path must be unique.`,
+        failedFile: file.path,
+      };
+    }
+    seenNormalizedPaths.add(normalizedRel);
+
+    // Path boundary validation
+    let fullWorkspacePath: string;
+    try {
+      fullWorkspacePath = resolveWorkspacePath(file.path);
+    } catch {
+      return {
+        success: false,
+        error: `Path traversal forbidden: file "${file.path}" resolves outside project workspace.`,
+        failedFile: file.path,
+      };
+    }
+
+    // Sensitive file policy check
+    if (isSensitiveFilePath(file.path)) {
+      return {
+        success: false,
+        error: `Writing to sensitive file "${file.path}" is forbidden by security policy.`,
+        failedFile: file.path,
+      };
+    }
+
+    // Resource limit check per file (1 MB)
+    const fileBytes = Buffer.byteLength(file.content || "", "utf8");
+    if (fileBytes > 1024 * 1024) {
+      return {
+        success: false,
+        error: `File "${file.path}" exceeds maximum size limit of 1 MB (${fileBytes} bytes).`,
+        failedFile: file.path,
+      };
+    }
+
+    validatedFiles.push({
+      relativePath: file.path,
+      fullWorkspacePath,
+      content: file.content,
+    });
+  }
+
+  // STEP 2: Capture pre-write state of every target file before any writes
+  const preWriteStates: Array<{
+    relativePath: string;
+    fullWorkspacePath: string;
+    content: string;
+    existed: boolean;
+    originalContent: string | null;
+  }> = [];
+
+  for (const vFile of validatedFiles) {
+    let existed = false;
+    let originalContent: string | null = null;
+    try {
+      existed = await filesClient.exists(vFile.fullWorkspacePath);
+      if (existed) {
+        originalContent = await filesClient.read(vFile.fullWorkspacePath);
+      }
+    } catch {
+      existed = false;
+      originalContent = null;
+    }
+
+    preWriteStates.push({
+      relativePath: vFile.relativePath,
+      fullWorkspacePath: vFile.fullWorkspacePath,
+      content: vFile.content,
+      existed,
+      originalContent,
+    });
+  }
+
+  // STEP 3: Sequentially write files and track successful writes
+  const successfullyWritten: Array<{
+    relativePath: string;
+    fullWorkspacePath: string;
+    existed: boolean;
+    originalContent: string | null;
+  }> = [];
+
+  for (const item of preWriteStates) {
+    try {
+      await filesClient.write(item.fullWorkspacePath, item.content);
+      successfullyWritten.push(item);
+    } catch (writeErr) {
+      // A write failed! Execute rollback on all files modified earlier in this batch
+      const rollbackErrors: string[] = [];
+
+      for (const rollbackItem of [...successfullyWritten].reverse()) {
+        try {
+          if (rollbackItem.existed && rollbackItem.originalContent !== null) {
+            await filesClient.write(rollbackItem.fullWorkspacePath, rollbackItem.originalContent);
+          } else {
+            await filesClient.remove(rollbackItem.fullWorkspacePath);
+          }
+        } catch (rbErr) {
+          rollbackErrors.push(
+            `Failed restoring "${rollbackItem.relativePath}": ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`
+          );
+        }
+      }
+
+      if (rollbackErrors.length > 0) {
+        return {
+          success: false,
+          error: `UNRECOVERED_FILESYSTEM_ERROR: Write failed on "${item.relativePath}" and rollback encountered errors:\n${rollbackErrors.join("\n")}`,
+          failedFile: item.relativePath,
+          unrecoveredFilesystem: true,
+        };
+      }
+
+      return {
+        success: false,
+        error: `Write failed on "${item.relativePath}": ${writeErr instanceof Error ? writeErr.message : String(writeErr)}. All ${successfullyWritten.length} earlier writes in batch were restored to original state.`,
+        failedFile: item.relativePath,
+        rolledBack: true,
+      };
+    }
+  }
+
+  // STEP 4: All writes succeeded without error
+  const updatedMap = validatedFiles.reduce((acc, f) => {
+    acc[f.relativePath] = f.content;
+    return acc;
+  }, {} as Record<string, string>);
+
+  return {
+    success: true,
+    filesWritten: validatedFiles.map((f) => f.relativePath),
+    count: validatedFiles.length,
+    updatedMap,
+  };
+}
+
 export interface CodingAgentResult {
   files: Record<string, string>;
   summary: string;
@@ -299,77 +480,18 @@ export async function runCodingAgent(
           ).min(1).max(50),
         }),
         handler: async ({ files }, { network }) => {
+          let sandbox: Sandbox;
+          try {
+            sandbox = await Sandbox.connect(sandboxId);
+          } catch (connErr) {
+            return JSON.stringify({
+              success: false,
+              error: `Sandbox connection failed: ${connErr instanceof Error ? connErr.message : String(connErr)}`,
+            });
+          }
+
           const stepResult = await runStep("createOrUpdateFiles", async () => {
-            // STEP 1: Pre-validation of entire batch BEFORE any sandbox writes or state mutations
-            const validatedFiles: Array<{
-              relativePath: string;
-              fullWorkspacePath: string;
-              content: string;
-            }> = [];
-
-            for (const file of files) {
-              // Path boundary validation
-              let fullWorkspacePath: string;
-              try {
-                fullWorkspacePath = resolveWorkspacePath(file.path);
-              } catch {
-                return {
-                  success: false,
-                  error: `Path traversal forbidden: file "${file.path}" resolves outside project workspace.`,
-                  failedFile: file.path,
-                };
-              }
-
-              // Sensitive file policy check
-              if (isSensitiveFilePath(file.path)) {
-                return {
-                  success: false,
-                  error: `Writing to sensitive file "${file.path}" is forbidden by security policy.`,
-                  failedFile: file.path,
-                };
-              }
-
-              // Resource limit check per file (1 MB)
-              const fileBytes = Buffer.byteLength(file.content || "", "utf8");
-              if (fileBytes > 1024 * 1024) {
-                return {
-                  success: false,
-                  error: `File "${file.path}" exceeds maximum size limit of 1 MB (${fileBytes} bytes).`,
-                  failedFile: file.path,
-                };
-              }
-
-              validatedFiles.push({
-                relativePath: file.path,
-                fullWorkspacePath,
-                content: file.content,
-              });
-            }
-
-            // STEP 2: All files passed validation. Execute sandbox writes atomically across the batch.
-            try {
-              const sandbox = await Sandbox.connect(sandboxId);
-              for (const vFile of validatedFiles) {
-                await sandbox.files.write(vFile.fullWorkspacePath, vFile.content);
-              }
-
-              const updatedMap = validatedFiles.reduce((acc, f) => {
-                acc[f.relativePath] = f.content;
-                return acc;
-              }, {} as Record<string, string>);
-
-              return {
-                success: true,
-                filesWritten: validatedFiles.map((f) => f.relativePath),
-                count: validatedFiles.length,
-                updatedMap,
-              };
-            } catch (writeErr) {
-              return {
-                success: false,
-                error: `Sandbox write error: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`,
-              };
-            }
+            return await executeBatchFileWrites(sandbox.files, files);
           });
 
           // Only mutate network state if the entire batch write succeeded
@@ -386,6 +508,8 @@ export async function runCodingAgent(
             count: stepResult.count,
             error: stepResult.error,
             failedFile: stepResult.failedFile,
+            rolledBack: stepResult.rolledBack,
+            unrecoveredFilesystem: stepResult.unrecoveredFilesystem,
           });
         },
       }),

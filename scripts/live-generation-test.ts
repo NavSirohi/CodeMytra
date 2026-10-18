@@ -157,6 +157,11 @@ async function main() {
       throw new Error(`QA Verification failed for initial generation: ${qaReport1.repairInstructions}`);
     }
 
+    await prisma.generationRun.update({
+      where: { id: run1Id },
+      data: { status: GenerationRunStatus.VALIDATING },
+    });
+
     const snapshot1 = await captureSandboxSnapshot(sandbox.sandboxId);
     const finalization1 = await finalizeGenerationSuccess({
       projectId: testProjectId,
@@ -219,6 +224,11 @@ async function main() {
     if (!qaReport2.passed) {
       throw new Error(`QA Verification failed for modification: ${qaReport2.repairInstructions}`);
     }
+
+    await prisma.generationRun.update({
+      where: { id: run2Id },
+      data: { status: GenerationRunStatus.VALIDATING },
+    });
 
     const snapshot2 = await captureSandboxSnapshot(sandbox.sandboxId);
     const finalization2 = await finalizeGenerationSuccess({
