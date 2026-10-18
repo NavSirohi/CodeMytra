@@ -2,14 +2,40 @@ import { prisma } from "@/lib/db";
 import { GenerationRunStatus } from "@/generated/prisma/client";
 
 /**
- * Valid state transitions for a GenerationRun.
+ * Valid state transitions for a GenerationRun in the Multi-Agent architecture.
  * Terminal states (COMPLETED, FAILED, CANCELLED) have no allowed transitions.
  */
 export const ALLOWED_STATUS_TRANSITIONS: Record<GenerationRunStatus, readonly GenerationRunStatus[]> = {
   [GenerationRunStatus.QUEUED]: [
+    GenerationRunStatus.PLANNING,
     GenerationRunStatus.RUNNING,
     GenerationRunStatus.CANCELLED,
     GenerationRunStatus.FAILED,
+  ],
+  [GenerationRunStatus.PLANNING]: [
+    GenerationRunStatus.AWAITING_APPROVAL,
+    GenerationRunStatus.DESIGNING,
+    GenerationRunStatus.RUNNING,
+    GenerationRunStatus.FAILED,
+    GenerationRunStatus.CANCELLED,
+  ],
+  [GenerationRunStatus.AWAITING_APPROVAL]: [
+    GenerationRunStatus.DESIGNING,
+    GenerationRunStatus.ARCHITECTING,
+    GenerationRunStatus.RUNNING,
+    GenerationRunStatus.CANCELLED,
+    GenerationRunStatus.FAILED,
+  ],
+  [GenerationRunStatus.DESIGNING]: [
+    GenerationRunStatus.ARCHITECTING,
+    GenerationRunStatus.RUNNING,
+    GenerationRunStatus.FAILED,
+    GenerationRunStatus.CANCELLED,
+  ],
+  [GenerationRunStatus.ARCHITECTING]: [
+    GenerationRunStatus.RUNNING,
+    GenerationRunStatus.FAILED,
+    GenerationRunStatus.CANCELLED,
   ],
   [GenerationRunStatus.RUNNING]: [
     GenerationRunStatus.VALIDATING,
@@ -80,7 +106,7 @@ export async function transitionRun(
     status: targetStatus,
   };
 
-  if (targetStatus === GenerationRunStatus.RUNNING) {
+  if (targetStatus === GenerationRunStatus.RUNNING || targetStatus === GenerationRunStatus.PLANNING) {
     updateData.startedAt = now;
   } else if (isTerminalStatus(targetStatus)) {
     updateData.completedAt = now;

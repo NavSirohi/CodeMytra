@@ -6,6 +6,7 @@ import {
   getProjectRevisions,
   restoreProjectRevision,
   getActiveGenerationRun,
+  getProjectSpecification,
 } from "../actions";
 
 export type ActionError = {
@@ -86,11 +87,25 @@ export const useGetActiveGenerationRun = (projectId: string) => {
     enabled: Boolean(projectId),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      // Poll every 3 seconds while a generation is in progress
-      if (status === "QUEUED" || status === "RUNNING" || status === "VALIDATING") {
-        return 3000;
-      }
-      return false;
+      // Poll every 2.5 seconds while a generation is in progress
+      const isActive =
+        status === "QUEUED" ||
+        status === "PLANNING" ||
+        status === "DESIGNING" ||
+        status === "ARCHITECTING" ||
+        status === "RUNNING" ||
+        status === "VALIDATING";
+
+      return isActive ? 2500 : false;
     },
+
+  });
+};
+
+export const useGetProjectSpecification = (projectId: string) => {
+  return useQuery({
+    queryKey: ["project-specification", projectId],
+    queryFn: async () => getProjectSpecification(projectId),
+    enabled: Boolean(projectId),
   });
 };

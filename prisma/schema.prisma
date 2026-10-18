@@ -39,6 +39,7 @@ model Project {
   messages       Message[]
   revisions      ProjectRevision[] @relation("ProjectRevisions")
   generationRuns GenerationRun[]
+  specification  ProjectSpecification?
 
   @@index([userId, createdAt])
 }
@@ -85,6 +86,10 @@ model Fragment {
 
 enum GenerationRunStatus {
   QUEUED
+  PLANNING
+  AWAITING_APPROVAL
+  DESIGNING
+  ARCHITECTING
   RUNNING
   VALIDATING
   COMPLETED
@@ -110,6 +115,8 @@ model GenerationRun {
   updatedAt        DateTime            @updatedAt
 
   revisions ProjectRevision[]
+  tasks     AgentTask[]
+  events    RunEvent[]
 
   @@index([projectId, createdAt])
   @@index([status, createdAt])
@@ -137,6 +144,63 @@ model ProjectRevision {
 
   @@unique([projectId, revisionNumber])
   @@index([projectId, createdAt])
+}
+
+enum SpecStatus {
+  DRAFT
+  AWAITING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+model ProjectSpecification {
+  id               String     @id @default(cuid())
+  projectId        String     @unique
+  project          Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  prd              Json?      // ProductRequirementsDocument
+  designSpec       Json?      // DesignSpecification
+  architectureSpec Json?      // ArchitectureSpecification
+  status           SpecStatus @default(DRAFT)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  @@index([projectId, status])
+}
+
+enum TaskStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model AgentTask {
+  id         String        @id @default(cuid())
+  runId      String
+  run        GenerationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  role       String        // planner | designer | architect | frontend | backend | database | integration | qa
+  status     TaskStatus    @default(PENDING)
+  attempt    Int           @default(0)
+  startedAt  DateTime?
+  finishedAt DateTime?
+  output     Json?
+  errorMsg   String?
+  createdAt  DateTime      @default(now())
+
+  @@index([runId, role])
+}
+
+model RunEvent {
+  id        String        @id @default(cuid())
+  runId     String
+  run       GenerationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stage     String
+  agentRole String?
+  message   String
+  payload   Json?
+  createdAt DateTime      @default(now())
+
+  @@index([runId, createdAt])
 }
 
 enum OutboxStatus {

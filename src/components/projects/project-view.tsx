@@ -16,7 +16,9 @@ import MessageContainer from "./message-container";
 import FragmentWeb from "./fragment-web";
 import { FileExplorer } from "./file-explorer";
 import { GenerationStatusBanner } from "./generation-status-banner";
+import { AgentTimeline } from "./agent-timeline";
 import { RevisionHistory } from "./revision-history";
+import { PRDViewer } from "./prd-viewer";
 import { useGetProjectById } from "@/features/projects/hooks/projects";
 
 export type ProjectFragment = Fragment & {
@@ -38,6 +40,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
   return (
     <div className="h-screen flex flex-col">
       <GenerationStatusBanner projectId={projectId} />
+      <AgentTimeline projectId={projectId} />
 
       <div className="flex-1 min-h-0">
         <ResizablePanelGroup orientation="horizontal">
@@ -82,6 +85,9 @@ export function ProjectView({ projectId }: { projectId: string }) {
                 </TabsList>
 
                 <div className="ml-auto flex items-center gap-x-2">
+                  {/* PRD & Multi-Agent Specifications Viewer */}
+                  <PRDViewer projectId={projectId} />
+
                   {/* Revision History Drawer */}
                   <RevisionHistory
                     projectId={projectId}

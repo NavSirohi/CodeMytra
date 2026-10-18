@@ -199,5 +199,34 @@ export const getActiveGenerationRun = async (projectId: string) => {
     orderBy: {
       createdAt: "desc",
     },
+    include: {
+      events: {
+        orderBy: { createdAt: "asc" },
+      },
+    },
   });
 };
+
+/**
+ * Retrieve the current PRD, DesignSpec, and ArchitectureSpec for a project.
+ */
+export const getProjectSpecification = async (projectId: string) => {
+  const user = await getCurrentUser();
+
+  if (!user) {
+    throw new Error("Unauthorized");
+  }
+
+  const project = await prisma.project.findUnique({
+    where: { id: projectId, userId: user.id },
+  });
+
+  if (!project) {
+    throw new Error("Project not found or unauthorized");
+  }
+
+  return prisma.projectSpecification.findUnique({
+    where: { projectId },
+  });
+};
+
