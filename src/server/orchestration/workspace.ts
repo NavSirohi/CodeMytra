@@ -70,3 +70,17 @@ export async function initializeSandboxWorkspace(sandbox: Sandbox): Promise<void
     );
   }
 }
+
+/**
+ * Writes project files (such as base foundation files or restored revision files)
+ * into the authoritative E2B sandbox project workspace.
+ */
+export async function writeWorkspaceFiles(
+  sandbox: Sandbox,
+  files: Record<string, string>
+): Promise<void> {
+  for (const [filePath, content] of Object.entries(files)) {
+    const targetPath = resolveWorkspacePath(filePath);
+    await sandbox.files.write(targetPath, content);
+  }
+}

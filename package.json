@@ -13,16 +13,17 @@
     "test:e2e": "tsx scripts/product-e2e-runner.ts",
     "test:smoke": "tsx scripts/sandbox-smoke-test.ts"
   },
-
   "dependencies": {
     "@base-ui/react": "^1.6.0",
     "@clerk/nextjs": "^7.5.9",
     "@e2b/code-interpreter": "^2.6.1",
     "@inngest/agent-kit": "^0.13.2",
+    "@prisma/adapter-better-sqlite3": "^7.10.1",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@shadcn/react": "^0.1.0",
     "@tanstack/react-query": "^5.101.1",
+    "better-sqlite3": "^13.0.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
@@ -54,6 +55,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/jszip": "^3.4.0",
     "@types/node": "^20",
     "@types/prismjs": "^1.26.6",

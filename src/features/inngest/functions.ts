@@ -29,6 +29,7 @@ import {
   initializeSandboxWorkspace,
   resolveWorkspacePath,
 } from "@/server/orchestration/workspace";
+import { getBaseProjectFiles } from "@/server/templates/foundation";
 
 export interface CodeAgentState {
   sandboxId: string;
@@ -230,25 +231,38 @@ export const codeAgentFunction = inngest.createFunction(
       // Initialize authoritative project workspace inside sandbox
       await initializeSandboxWorkspace(sandbox);
 
-      // 2. Restore files from base revision into authoritative project workspace
-      const fileEntries = Object.entries(baseFiles);
+      // 2. Initial vs Follow-up Generation File Preparation
+      const isInitialGeneration = Object.keys(baseFiles).length === 0;
+      let workspaceInitialFiles: Record<string, string> = baseFiles;
+
+      if (isInitialGeneration) {
+        // Initial generation: generate clean capability-driven foundation
+        workspaceInitialFiles = getBaseProjectFiles({
+          projectName: prd.projectName,
+          capabilities: archSpec.capabilities,
+          requiresDatabase: archSpec.requiresDatabase,
+          models: archSpec.databaseModels,
+        });
+      }
+
+      const fileEntries = Object.entries(workspaceInitialFiles);
       if (fileEntries.length > 0) {
         for (const [filePath, content] of fileEntries) {
           try {
             const targetPath = resolveWorkspacePath(filePath);
             await sandbox.files.write(targetPath, content);
           } catch (writeError) {
-            throw new RestorationError(`Failed to restore file ${filePath} into sandbox workspace: ${String(writeError)}`);
+            throw new RestorationError(`Failed to restore/write file ${filePath} into sandbox workspace: ${String(writeError)}`);
           }
         }
 
-        // 3. Verify restoration completeness
+        // 3. Verify completeness
         for (const [filePath] of fileEntries) {
           try {
             const targetPath = resolveWorkspacePath(filePath);
             await sandbox.files.read(targetPath);
           } catch {
-            throw new RestorationError(`Completeness check failed: Restored file ${filePath} could not be read from workspace`);
+            throw new RestorationError(`Completeness check failed: File ${filePath} could not be read from workspace`);
           }
         }
       }
@@ -275,13 +289,22 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 5: IMPLEMENTATION (Authoritative Coding Agent Engine)
     // ─────────────────────────────────────────────────────────────────────────
+    const effectiveBaseFiles = Object.keys(baseFiles).length === 0
+      ? getBaseProjectFiles({
+          projectName: prd.projectName,
+          capabilities: archSpec.capabilities,
+          requiresDatabase: archSpec.requiresDatabase,
+          models: archSpec.databaseModels,
+        })
+      : baseFiles;
+
     const { summary, files } = await runCodingAgent({
       sandboxId,
       prompt: promptValue,
       prd,
       designSpec,
       architectureSpec: archSpec,
-      baseFiles,
+      baseFiles: effectiveBaseFiles,
       previousMessages,
       step,
       stepPrefix: "initial-coding",
@@ -331,6 +354,8 @@ export const codeAgentFunction = inngest.createFunction(
         summary: currentSummary,
         sandboxId,
         runSandboxCommands: true,
+        archSpec,
+        capabilities: prd.capabilities,
       });
 
       // Bounded self-repair (1 repair iteration)
@@ -374,6 +399,8 @@ Conclude with an updated <task_summary>...</task_summary>.
             summary: currentSummary,
             sandboxId,
             runSandboxCommands: true,
+            archSpec,
+            capabilities: prd.capabilities,
           });
         } catch (repairErr) {
           console.error("[QA Repair] Repair loop execution failed:", repairErr);

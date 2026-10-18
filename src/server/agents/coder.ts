@@ -336,6 +336,8 @@ export function buildContextEnhancedPrompt(
   designSpec: DesignSpec,
   archSpec: ArchitectureSpec
 ): string {
+  const requiresDb = archSpec.requiresDatabase;
+
   return `
 You are the Lead Full-Stack Code Implementation Agent for CodeMytra.
 Build a complete, working, interactive Next.js application adhering strictly to the approved specifications.
@@ -345,12 +347,14 @@ All source files must reside in the project workspace (${PROJECT_WORKSPACE_DIR})
 Project: ${prd.projectName}
 Summary: ${prd.summary}
 Target Audience: ${prd.targetAudience}
+Capabilities: ${archSpec.capabilities?.join(", ") || prd.capabilities?.join(", ") || "pages-navigation"}
+Requires Persistence: ${requiresDb ? "YES (isolated SQLite database)" : "NO (static / client state)"}
 
 Pages to implement:
 ${prd.pages.map((p) => `- ${p.route} (${p.title}): ${p.purpose} [Components: ${p.keyComponents?.join(", ") || "Main"}]`).join("\n")}
 
 Data Entities:
-${prd.dataEntities?.length ? prd.dataEntities.map((e) => `- ${e.name}: fields=[${e.fields.join(", ")}], relationships=[${e.relationships?.join(", ") || "none"}]`).join("\n") : "None specified"}
+${prd.dataEntities?.length ? prd.dataEntities.map((e) => `- ${e.name} (persistent: ${e.isPersistent ? "YES" : "NO"}): fields=[${e.fields.join(", ")}], relationships=[${e.relationships?.join(", ") || "none"}]`).join("\n") : "None specified"}
 
 User Flows:
 ${prd.userFlows?.length ? prd.userFlows.map((f) => `- ${f.name}: ${f.steps.join(" -> ")}`).join("\n") : "Standard user journey"}
@@ -363,26 +367,39 @@ Layout: ${designSpec.layoutStyle}
 
 === ARCHITECTURE SPECIFICATION ===
 Routes & Endpoints:
-${archSpec.routeEndpoints.map((r) => `- [${r.type.toUpperCase()}] ${r.path}: ${r.purpose}`).join("\n")}
+${archSpec.routeEndpoints.map((r) => `- [${r.type.toUpperCase()}] ${r.path}: ${r.purpose}${r.methods ? ` (Methods: ${r.methods.join(", ")})` : ""}`).join("\n")}
 
-Database Models:
-${archSpec.databaseModels?.length ? archSpec.databaseModels.map((m) => `- ${m.modelName} (${m.fields.join(", ")})`).join("\n") : "In-memory / client state"}
+${requiresDb ? `Database Models:
+${archSpec.databaseModels?.length ? archSpec.databaseModels.map((m) => `- ${m.modelName} (${m.fields.join(", ")})${m.relations?.length ? ` [Relations: ${m.relations.join(", ")}]` : ""}`).join("\n") : "- Default entities"}
+` : "Database Models: None required (static application)"}
+
+Backend Operations & Validation:
+${archSpec.backendOperations?.length ? archSpec.backendOperations.map((o) => `- ${o.name}: ${o.description} [Validation: ${o.validationRules.join("; ") || "Input required"}]`).join("\n") : "Standard Next.js route handlers"}
+
+Business Constraints:
+${archSpec.businessConstraints?.length ? archSpec.businessConstraints.map((c) => `- ${c}`).join("\n") : "Enforce data integrity and standard validation rules"}
 
 File Boundaries:
 - Frontend: ${archSpec.fileOwnership.frontend.join(", ")}
-- Backend: ${archSpec.fileOwnership.backend.join(", ")}
-- Database: ${archSpec.fileOwnership.database.join(", ")}
+- Backend: ${archSpec.fileOwnership.backend.length > 0 ? archSpec.fileOwnership.backend.join(", ") : "None required for static app"}
+- Database: ${requiresDb ? archSpec.fileOwnership.database.join(", ") : "None required for static app"}
 
 === FULL-STACK IMPLEMENTATION RULES ===
 1. Use the "createOrUpdateFiles" tool to write clean, complete, working React/Next.js components.
 2. Put the primary landing content and user interface in app/page.tsx (use "use client"; for interactive state).
-3. For applications requiring backend data operations:
-   - Provide route handlers in app/api/**/route.ts (or server actions).
-   - If managing data entities, provide a robust data layer with initial realistic seed data so the app is instantly usable upon preview.
-4. Use Tailwind CSS with clean, accessible classes matching the design token colors.
-5. Do NOT import non-existent external npm packages.
-6. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
-7. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
+3. If requiresDb is TRUE:
+   - Provide "prisma/schema.prisma" with provider = "sqlite" and url = "file:./dev.db".
+   - Provide "lib/db.ts" exporting an isolated SQLite PrismaClient instance.
+   - Implement route handlers in app/api/**/route.ts with server-side validation.
+   - Return appropriate HTTP status codes: 200/201 on success, 400 on validation errors, 404 on missing records, 409 on business conflicts (e.g., overlapping bookings or insufficient inventory).
+   - Provide initial realistic seed data so preview works immediately.
+4. If requiresDb is FALSE (static application):
+   - Keep the app lean and clean. Do NOT generate unnecessary prisma schema, broken sqlite config, or backend database files.
+   - Use client-side React state for interactive features (e.g. contact forms, interactive calculators, search filtering over static data).
+5. Use Tailwind CSS with clean, accessible classes matching the design token colors.
+6. Do NOT import non-existent external npm packages.
+7. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
+8. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
 `;
 }
 

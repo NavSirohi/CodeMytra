@@ -1,6 +1,23 @@
 import { z } from "zod";
 
 /**
+ * Reusable Full-Stack Application Capability Definitions (Milestone M2)
+ */
+export const ApplicationCapabilityEnum = z.enum([
+  "pages-navigation",      // Routes, layouts and navigation
+  "data-persistence",     // Models, relationships and database/file storage
+  "crud-operations",      // Create, read, update, delete operations
+  "authentication",       // Login, registration and sessions when required
+  "authorization",        // Access control and role-based permissions
+  "forms-validation",     // Inputs, client/server validation, and feedback
+  "file-handling",        // File uploads and asset workflows
+  "search-filtering",     // Querying, filtering, sorting, pagination
+  "business-rules",       // Domain-specific business logic & constraints
+  "external-integrations",// Supported APIs with explicit credentials and limitations
+]);
+export type ApplicationCapability = z.infer<typeof ApplicationCapabilityEnum>;
+
+/**
  * Product Requirements Document (PRD) Schema
  * Emitted by the Planning / Requirements Agent
  */
@@ -8,6 +25,8 @@ export const PRDSchema = z.object({
   projectName: z.string(),
   summary: z.string(),
   targetAudience: z.string(),
+  capabilities: z.array(ApplicationCapabilityEnum).default(["pages-navigation"]),
+  unsupportedRequirements: z.array(z.string()).default([]),
   coreFeatures: z.array(
     z.object({
       name: z.string(),
@@ -28,6 +47,7 @@ export const PRDSchema = z.object({
       name: z.string(),
       fields: z.array(z.string()),
       relationships: z.array(z.string()).default([]),
+      isPersistent: z.boolean().default(false),
     })
   ).default([]),
   userFlows: z.array(
@@ -75,17 +95,57 @@ export type DesignSpec = z.infer<typeof DesignSpecSchema>;
  */
 export const ArchitectureSpecSchema = z.object({
   appType: z.literal("nextjs-fullstack").default("nextjs-fullstack"),
+  capabilities: z.array(ApplicationCapabilityEnum).default(["pages-navigation"]),
+  requiresDatabase: z.boolean().default(false),
   routeEndpoints: z.array(
     z.object({
       path: z.string(),
       type: z.enum(["page", "api", "action"]),
       purpose: z.string(),
+      methods: z.array(z.string()).optional(),
     })
   ),
+  uiComponents: z.array(
+    z.object({
+      name: z.string(),
+      purpose: z.string(),
+      route: z.string().optional(),
+    })
+  ).default([]),
   databaseModels: z.array(
     z.object({
       modelName: z.string(),
       fields: z.array(z.string()),
+      relations: z.array(z.string()).default([]),
+    })
+  ).default([]),
+  backendOperations: z.array(
+    z.object({
+      name: z.string(),
+      description: z.string(),
+      validationRules: z.array(z.string()).default([]),
+      authRequired: z.boolean().default(false),
+    })
+  ).default([]),
+  businessConstraints: z.array(z.string()).default([]),
+  authRequirements: z.object({
+    enabled: z.boolean().default(false),
+    strategy: z.string().default("none"),
+  }).default({
+    enabled: false,
+    strategy: "none",
+  }),
+  externalIntegrations: z.array(
+    z.object({
+      name: z.string(),
+      purpose: z.string(),
+      limitations: z.string().default("none"),
+    })
+  ).default([]),
+  userJourneys: z.array(
+    z.object({
+      name: z.string(),
+      steps: z.array(z.string()),
     })
   ).default([]),
   fileOwnership: z.record(z.string(), z.array(z.string())).default({
@@ -108,6 +168,8 @@ export const QACheckCategoryEnum = z.enum([
   "typescript-validation",
   "production-build",
   "runtime-health",
+  "database-validation",
+  "api-validation",
 ]);
 export type QACheckCategory = z.infer<typeof QACheckCategoryEnum>;
 

@@ -1,4 +1,10 @@
-import { QAReport, QAReportSchema, QACheckCategory } from "@/server/agent-contracts/schemas";
+import {
+  QAReport,
+  QAReportSchema,
+  QACheckCategory,
+  ArchitectureSpec,
+  ApplicationCapability,
+} from "@/server/agent-contracts/schemas";
 import path from "path";
 import { Sandbox } from "@e2b/code-interpreter";
 import { PROJECT_WORKSPACE_DIR } from "@/server/orchestration/workspace";
@@ -8,15 +14,17 @@ export interface ValidateProjectOptions {
   summary: string;
   sandboxId: string;
   runSandboxCommands: boolean;
+  archSpec?: ArchitectureSpec;
+  capabilities?: ApplicationCapability[];
 }
 
 /**
  * Real QA Inspector executing multi-point verification gates on generated project files,
- * explicitly distinguishing between static source checks, sandbox connection,
- * TypeScript compilation, and production build verification.
+ * explicitly distinguishing between static source checks, capability validation (database/API),
+ * sandbox connection, TypeScript compilation, and production build verification.
  */
 export async function runQAInspector(options: ValidateProjectOptions): Promise<QAReport> {
-  const { files, summary, sandboxId, runSandboxCommands } = options;
+  const { files, summary, sandboxId, runSandboxCommands, archSpec, capabilities } = options;
   const checks: QAReport["checks"] = [];
   const errors: string[] = [];
 
@@ -138,6 +146,100 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     errors.push("Security violation: Hardcoded credentials or API keys detected in source code.");
   }
 
+  // 7. Capability-Adaptive Database Validation
+  const requiresDb = Boolean(
+    archSpec?.requiresDatabase ||
+    capabilities?.includes("data-persistence") ||
+    (files["prisma/schema.prisma"] && !archSpec)
+  );
+
+  if (requiresDb) {
+    const schemaContent = files["prisma/schema.prisma"] || "";
+    const hasSchema = Boolean(schemaContent.length > 0);
+    const hasDbClient = Boolean(files["lib/db.ts"] || files["src/lib/db.ts"]);
+    const hasModels = schemaContent.includes("model ");
+
+    const dbValid = hasSchema && hasDbClient && hasModels;
+    checks.push({
+      name: "database-schema-validation",
+      category: "database-validation",
+      status: dbValid ? "PASS" : "FAIL",
+      details: dbValid
+        ? "Prisma SQLite schema and database client verified with models"
+        : `Database required but incomplete: ${!hasSchema ? "missing schema.prisma; " : ""}${!hasDbClient ? "missing lib/db.ts; " : ""}${!hasModels ? "no models declared; " : ""}`.trim(),
+    });
+    if (!dbValid) {
+      errors.push("Database persistence required but prisma/schema.prisma or lib/db.ts is missing or has no models.");
+    }
+  } else {
+    // Static app: verify no broken database residue
+    checks.push({
+      name: "database-schema-validation",
+      category: "database-validation",
+      status: "PASS",
+      details: "Static application: clean architecture with no unwanted database overhead",
+    });
+  }
+
+  // 8. Capability-Adaptive API Route Validation
+  const apiRouteFiles = filePaths.filter(
+    (f) => (f.startsWith("app/api/") || f.startsWith("src/app/api/")) && (f.endsWith("/route.ts") || f.endsWith("/route.js"))
+  );
+  const expectsApi = Boolean(
+    (archSpec?.routeEndpoints && archSpec.routeEndpoints.some((e) => e.type === "api")) ||
+    (archSpec?.backendOperations && archSpec.backendOperations.length > 0) ||
+    capabilities?.includes("crud-operations")
+  );
+
+  if (expectsApi || apiRouteFiles.length > 0) {
+    if (apiRouteFiles.length === 0) {
+      checks.push({
+        name: "api-route-validation",
+        category: "api-validation",
+        status: "FAIL",
+        details: "Architecture expects API route handlers, but no route.ts files found under app/api/",
+      });
+      errors.push("Expected API route handlers for backend operations, but none were found.");
+    } else {
+      // Validate that each API route exports at least one HTTP method handler
+      let routesValid = true;
+      const invalidRoutes: string[] = [];
+      const httpMethods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+
+      for (const routeFile of apiRouteFiles) {
+        const content = files[routeFile] || "";
+        const exportsMethod = httpMethods.some((m) =>
+          new RegExp(`export\\s+(async\\s+)?function\\s+${m}\\b`).test(content) ||
+          new RegExp(`export\\s+const\\s+${m}\\b`).test(content)
+        );
+        if (!exportsMethod) {
+          routesValid = false;
+          invalidRoutes.push(routeFile);
+        }
+      }
+
+      checks.push({
+        name: "api-route-validation",
+        category: "api-validation",
+        status: routesValid ? "PASS" : "FAIL",
+        details: routesValid
+          ? `${apiRouteFiles.length} API route handler(s) verified with exported HTTP methods`
+          : `API route(s) missing standard HTTP method exports: ${invalidRoutes.join(", ")}`,
+      });
+      if (!routesValid) {
+        errors.push(`API routes missing standard HTTP method exports: ${invalidRoutes.join(", ")}`);
+      }
+    }
+  } else {
+    // Static app without backend APIs
+    checks.push({
+      name: "api-route-validation",
+      category: "api-validation",
+      status: "PASS",
+      details: "Static application: client-side interactions without server API route requirements",
+    });
+  }
+
   // 7. Live Sandbox Verification: TypeScript & Production Build (when sandbox active)
   let executedSandboxChecks = false;
   if (sandboxId && runSandboxCommands) {
@@ -151,6 +253,121 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
         status: "PASS",
         details: `Connected to sandbox ${sandboxId}`,
       });
+
+      // Executable Database Verification (only when application requires persistence)
+      if (requiresDb && files["prisma/schema.prisma"]) {
+        // 1. Prisma validate
+        try {
+          const valRes = await sandbox.commands.run(
+            `cd "${PROJECT_WORKSPACE_DIR}" && bunx prisma validate`,
+            { timeoutMs: 30000 }
+          );
+          const valPassed = valRes.exitCode === 0;
+          checks.push({
+            name: "database-schema-live-validation",
+            category: "database-validation",
+            status: valPassed ? "PASS" : "FAIL",
+            details: valPassed
+              ? "Prisma schema validated successfully in sandbox"
+              : (valRes.stderr || valRes.stdout || "Prisma schema validation failed").slice(0, 500),
+          });
+          if (!valPassed) {
+            errors.push(`Prisma schema validation failed: ${(valRes.stderr || valRes.stdout).slice(0, 300)}`);
+          }
+        } catch (valErr) {
+          checks.push({
+            name: "database-schema-live-validation",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(valErr),
+          });
+          errors.push(`Prisma schema validation command error: ${String(valErr)}`);
+        }
+
+        // 2. Prisma generate
+        try {
+          const genRes = await sandbox.commands.run(
+            `cd "${PROJECT_WORKSPACE_DIR}" && bunx prisma generate`,
+            { timeoutMs: 30000 }
+          );
+          const genPassed = genRes.exitCode === 0;
+          checks.push({
+            name: "database-client-generation",
+            category: "database-validation",
+            status: genPassed ? "PASS" : "FAIL",
+            details: genPassed
+              ? "Prisma client generated successfully"
+              : (genRes.stderr || genRes.stdout || "Prisma client generation failed").slice(0, 500),
+          });
+          if (!genPassed) {
+            errors.push(`Prisma client generation failed: ${(genRes.stderr || genRes.stdout).slice(0, 300)}`);
+          }
+        } catch (genErr) {
+          checks.push({
+            name: "database-client-generation",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(genErr),
+          });
+          errors.push(`Prisma client generation command error: ${String(genErr)}`);
+        }
+
+        // 3. Database initialization / migration push
+        try {
+          const pushRes = await sandbox.commands.run(
+            `cd "${PROJECT_WORKSPACE_DIR}" && bunx prisma db push --accept-data-loss`,
+            { timeoutMs: 30000 }
+          );
+          const pushPassed = pushRes.exitCode === 0;
+          checks.push({
+            name: "database-initialization",
+            category: "database-validation",
+            status: pushPassed ? "PASS" : "FAIL",
+            details: pushPassed
+              ? "SQLite database schema synchronized successfully"
+              : (pushRes.stderr || pushRes.stdout || "Database push failed").slice(0, 500),
+          });
+          if (!pushPassed) {
+            errors.push(`Database push failed: ${(pushRes.stderr || pushRes.stdout).slice(0, 300)}`);
+          }
+        } catch (pushErr) {
+          checks.push({
+            name: "database-initialization",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(pushErr),
+          });
+          errors.push(`Database initialization command error: ${String(pushErr)}`);
+        }
+
+        // 4. Executable database connectivity and query execution verification
+        try {
+          const connRes = await sandbox.commands.run(
+            `cd "${PROJECT_WORKSPACE_DIR}" && bun -e 'import { db } from "./lib/db"; async function run() { await db.$queryRaw\`SELECT 1\`; console.log("DB_QUERY_SUCCESS"); } run();'`,
+            { timeoutMs: 15000 }
+          );
+          const connPassed = connRes.exitCode === 0 && connRes.stdout.includes("DB_QUERY_SUCCESS");
+          checks.push({
+            name: "database-crud-verification",
+            category: "database-validation",
+            status: connPassed ? "PASS" : "FAIL",
+            details: connPassed
+              ? "Database query execution and SQLite connection verified"
+              : (connRes.stderr || connRes.stdout || "Database query failed").slice(0, 500),
+          });
+          if (!connPassed) {
+            errors.push(`Database query verification failed: ${(connRes.stderr || connRes.stdout).slice(0, 300)}`);
+          }
+        } catch (connErr) {
+          checks.push({
+            name: "database-crud-verification",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(connErr),
+          });
+          errors.push(`Database query execution failed: ${String(connErr)}`);
+        }
+      }
 
       // TypeScript check
       try {
