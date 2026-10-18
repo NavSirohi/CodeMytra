@@ -45,7 +45,18 @@ export default function FragmentWeb({ data }: { data: ProjectFragment }) {
           </Button>
         </Hint>
         <Hint
-          text={copied ? "Copied" : "Click to copy"}
+          text="Ephemeral development sandbox hosted on E2B. Sandboxes expire after inactivity and are not permanent production deployments. Use 'Export' to host permanently."
+          side="bottom"
+          align="start"
+        >
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-medium cursor-help shrink-0">
+            <span className="size-1.5 rounded-full bg-amber-500 animate-pulse" />
+            <span>Sandbox Preview (Temporary)</span>
+          </div>
+        </Hint>
+
+        <Hint
+          text={copied ? "Copied" : "Click to copy temporary sandbox URL"}
           side="bottom"
           align="start"
         >
@@ -54,7 +65,7 @@ export default function FragmentWeb({ data }: { data: ProjectFragment }) {
             variant="outline"
             onClick={onCopy}
             disabled={!data.sandboxUrl || copied}
-            className="flex-1 justify-start text-start font-normal"
+            className="flex-1 justify-start text-start font-normal text-xs"
           >
             <span className="truncate">{data.sandboxUrl}</span>
           </Button>

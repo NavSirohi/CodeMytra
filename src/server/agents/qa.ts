@@ -5,8 +5,8 @@ import { Sandbox } from "@e2b/code-interpreter";
 export interface ValidateProjectOptions {
   files: Record<string, string>;
   summary: string;
-  sandboxId?: string;
-  runSandboxCommands?: boolean;
+  sandboxId: string;
+  runSandboxCommands: boolean;
 }
 
 /**
@@ -14,7 +14,7 @@ export interface ValidateProjectOptions {
  * including actual Sandbox TypeScript validation and production build execution.
  */
 export async function runQAInspector(options: ValidateProjectOptions): Promise<QAReport> {
-  const { files, summary, sandboxId, runSandboxCommands = false } = options;
+  const { files, summary, sandboxId, runSandboxCommands } = options;
   const checks: QAReport["checks"] = [];
   const errors: string[] = [];
 
@@ -131,9 +131,11 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   }
 
   // 7. Live Sandbox Verification: TypeScript & Production Build (when sandbox active)
+  let executedSandboxChecks = false;
   if (sandboxId && runSandboxCommands) {
     try {
       const sandbox = await Sandbox.connect(sandboxId);
+      executedSandboxChecks = true;
 
       // TypeScript check
       try {
@@ -203,6 +205,8 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   const passedCount = checks.filter((c) => c.status === "PASS").length;
   const score = Math.round((passedCount / checks.length) * 100);
 
+  const verificationMode = executedSandboxChecks ? "sandbox-verified" : "static-only";
+
   const report: QAReport = {
     passed,
     score,
@@ -211,6 +215,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     repairInstructions: !passed
       ? `Validation failed with the following issues:\n${errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
       : undefined,
+    verificationMode,
   };
 
   return QAReportSchema.parse(report);

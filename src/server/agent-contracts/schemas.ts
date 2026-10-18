@@ -114,6 +114,7 @@ export const QAReportSchema = z.object({
   checks: z.array(QACheckSchema),
   repairNeeded: z.boolean(),
   repairInstructions: z.string().optional(),
+  verificationMode: z.enum(["sandbox-verified", "static-only"]).default("static-only"),
 });
 
 export type QAReport = z.infer<typeof QAReportSchema>;

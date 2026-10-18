@@ -64,6 +64,49 @@ async function recordRunEvent(
   }
 }
 
+/**
+ * Reads all project source files from the E2B sandbox filesystem.
+ * Excludes node_modules, .next, .cache, and other non-source directories.
+ */
+async function readSandboxFiles(sandboxId: string): Promise<Record<string, string>> {
+  const sandbox = await Sandbox.connect(sandboxId);
+  const files: Record<string, string> = {};
+
+  // Read the file listing from sandbox
+  const result = await sandbox.commands.run(
+    `find /home/user -type f \\( -name "*.tsx" -o -name "*.ts" -o -name "*.js" -o -name "*.jsx" -o -name "*.json" -o -name "*.css" -o -name "*.html" -o -name "*.md" -o -name "*.prisma" -o -name "*.sql" -o -name "*.yaml" -o -name "*.yml" -o -name "*.env.example" \\) ! -path "*/node_modules/*" ! -path "*/.next/*" ! -path "*/.cache/*" ! -path "*/.git/*" ! -path "*/dist/*"`,
+    { timeoutMs: 15000 }
+  );
+
+  if (result.exitCode !== 0) {
+    console.error("[readSandboxFiles] find command failed:", result.stderr);
+    return files;
+  }
+
+  const filePaths = result.stdout.trim().split("\n").filter(Boolean);
+  const basePath = "/home/user/";
+
+  for (const fullPath of filePaths) {
+    const relativePath = fullPath.startsWith(basePath)
+      ? fullPath.slice(basePath.length)
+      : fullPath;
+
+    // Skip paths that are still absolute or contain traversal
+    if (relativePath.startsWith("/") || relativePath.includes("..")) continue;
+
+    try {
+      const content = await sandbox.files.read(fullPath);
+      if (typeof content === "string" && content.length > 0 && content.length < 1024 * 1024) {
+        files[relativePath] = content;
+      }
+    } catch {
+      // Skip unreadable files
+    }
+  }
+
+  return files;
+}
+
 export const codeAgentFunction = inngest.createFunction(
   {
     id: "code-agent",
@@ -539,7 +582,20 @@ Conclude with an updated <task_summary>...</task_summary>.
         `Verification complete with quality score ${report.score}% (${report.passed ? "PASSED" : "FAILED"})`
       );
 
-      return { report, finalFiles: currentFiles, finalSummary: currentSummary };
+      // Read actual sandbox filesystem to capture any QA repair changes
+      let actualFiles = currentFiles;
+      if (report.passed) {
+        try {
+          const sandboxFiles = await readSandboxFiles(sandboxId);
+          if (Object.keys(sandboxFiles).length > 0) {
+            actualFiles = sandboxFiles;
+          }
+        } catch (readErr) {
+          console.error("[QA] Failed to read sandbox files, using in-memory state:", readErr);
+        }
+      }
+
+      return { report, finalFiles: actualFiles, finalSummary: currentSummary };
     });
 
     const { report: qaReport, finalFiles, finalSummary } = qaResult;
@@ -553,17 +609,21 @@ Conclude with an updated <task_summary>...</task_summary>.
     });
 
     await step.run("save-result", async () => {
-      if (!qaReport.passed) {
+      if (!qaReport.passed || qaReport.verificationMode === "static-only") {
+        const failureReason = qaReport.verificationMode === "static-only"
+          ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
+          : (qaReport.repairInstructions || "Validation checks failed");
+
         await transitionRun(runId, GenerationRunStatus.FAILED, {
           errorCode: "QA_VERIFICATION_FAILED",
-          errorMessage: qaReport.repairInstructions || "Validation checks failed",
+          errorMessage: failureReason,
         });
         await recordRunEvent(runId, "FAILED", "System", "Run marked failed. Prior revision preserved.");
 
         return prisma.message.create({
           data: {
             projectId,
-            content: `Quality Assurance failed: ${qaReport.repairInstructions || "The generated code did not satisfy verification criteria."} Your prior working revision is preserved.`,
+            content: `Quality Assurance failed: ${failureReason} Your prior working revision is preserved.`,
             role: MessageRole.ASSISTANT,
             type: MessageType.ERROR,
           },
@@ -575,6 +635,7 @@ Conclude with an updated <task_summary>...</task_summary>.
         projectId,
         generationRunId: runId,
         parentRevisionId: baseRevisionId,
+        expectedCurrentRevisionId: baseRevisionId ?? null,
         title: fragmentTitle,
         summary: responseText,
         files: finalFiles || {},

@@ -12,6 +12,7 @@ export interface CreateRevisionParams {
   projectId: string;
   generationRunId?: string;
   parentRevisionId?: string | null;
+  expectedCurrentRevisionId?: string | null;
   title?: string;
   summary?: string;
   files: Record<string, string>;
@@ -189,6 +190,20 @@ export async function createProjectRevision(params: CreateRevisionParams) {
             manifest: manifest as unknown as Prisma.InputJsonObject,
           },
         });
+
+        // Safe finalization: only promote if project hasn't moved ahead
+        if (params.expectedCurrentRevisionId !== undefined) {
+          const currentProject = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { currentRevisionId: true },
+          });
+
+          if (currentProject?.currentRevisionId !== params.expectedCurrentRevisionId) {
+            // Another generation already promoted a newer revision.
+            // Still create the revision record, but don't update the project pointer.
+            return revision;
+          }
+        }
 
         // Update project pointer to current revision
         await tx.project.update({

@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { Code, CrownIcon, EyeIcon, Download, Rocket } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Hint } from "@/components/ui/hint";
 import {
   ResizableHandle,
   ResizablePanel,
@@ -120,20 +121,26 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   </Button>
 
                   {/* Customer Deploy Button (Intentionally Disabled in MVP) */}
-                  <div className="relative group">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled
-                      className="gap-1.5 text-xs opacity-60 cursor-not-allowed"
-                    >
-                      <Rocket className="size-3.5" />
-                      <span>Deploy</span>
-                      <span className="text-[10px] bg-muted px-1.5 py-0.2 rounded border font-mono">
-                        Soon
-                      </span>
-                    </Button>
-                  </div>
+                  <Hint
+                    text="Permanent cloud deployment coming soon. In this MVP, apps run in temporary E2B sandboxes for preview and can be exported as full-stack code."
+                    side="bottom"
+                    align="end"
+                  >
+                    <div className="relative group">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled
+                        className="gap-1.5 text-xs opacity-60 cursor-not-allowed"
+                      >
+                        <Rocket className="size-3.5" />
+                        <span>Deploy</span>
+                        <span className="text-[10px] bg-muted px-1.5 py-0.2 rounded border font-mono">
+                          Soon
+                        </span>
+                      </Button>
+                    </div>
+                  </Hint>
 
                   <Button asChild size="sm" variant="outline">
                     <Link href="/">

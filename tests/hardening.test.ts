@@ -5,9 +5,11 @@ import {
   validateRevisionManifest,
   RestorationError,
   MAX_FILES_PER_REVISION,
+  createProjectRevision,
 } from "../src/server/orchestration/revisions";
 import { runQAInspector } from "../src/server/agents/qa";
 import { PlannerError } from "../src/server/agents/planner";
+import { prisma } from "../src/lib/db";
 
 describe("M1.5 Hardening: Resource Limits, Manifest & Restoration Integrity", () => {
   it("enforces maximum file limit per revision", () => {
@@ -86,10 +88,13 @@ describe("M1.5 Hardening: Real QA Verification Gates & Failure Diagnostics", () 
         "components/header.tsx": "export function Header() {}",
       },
       summary: "Created header component for the application.",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
     assert.equal(report.passed, false);
     assert.equal(report.repairNeeded, true);
+    assert.equal(report.verificationMode, "static-only");
     assert.match(report.repairInstructions || "", /entry point file/i);
 
     const entryCheck = report.checks.find((c) => c.name === "entrypoint-exists");
@@ -102,9 +107,12 @@ describe("M1.5 Hardening: Real QA Verification Gates & Failure Diagnostics", () 
         "app/page.tsx": "const key = 'sk_live_1234567890abcdef'; export default function Page() {}",
       },
       summary: "Implemented page with secret.",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
     assert.equal(report.passed, false);
+    assert.equal(report.verificationMode, "static-only");
     const secCheck = report.checks.find((c) => c.name === "security-secrets-check");
     assert.equal(secCheck?.status, "FAIL");
     assert.match(report.repairInstructions || "", /Hardcoded credentials/i);
@@ -116,15 +124,18 @@ describe("M1.5 Hardening: Real QA Verification Gates & Failure Diagnostics", () 
         "app/page.tsx": "import { NonExistent } from './non-existent'; export default function Page() {}",
       },
       summary: "Implemented page with missing import component.",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
     assert.equal(report.passed, false);
+    assert.equal(report.verificationMode, "static-only");
     const importCheck = report.checks.find((c) => c.name === "import-integrity");
     assert.equal(importCheck?.status, "FAIL");
     assert.match(report.repairInstructions || "", /Dangling relative imports/i);
   });
 
-  it("QA inspector passes on healthy, complete project files", async () => {
+  it("QA inspector passes on healthy, complete project files in static-only mode", async () => {
     const report = await runQAInspector({
       files: {
         "package.json": JSON.stringify({ name: "bakery-app", dependencies: { next: "16.0.0" } }),
@@ -132,11 +143,90 @@ describe("M1.5 Hardening: Real QA Verification Gates & Failure Diagnostics", () 
         "app/page.tsx": "import { Header } from './header'; export default function Page() { return <Header />; }",
       },
       summary: "Successfully generated authentic bakery homepage with Header and interactive menu.",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
     assert.equal(report.passed, true);
     assert.equal(report.score, 100);
     assert.equal(report.repairNeeded, false);
+    assert.equal(report.verificationMode, "static-only");
+  });
+});
+
+describe("M1.5 Hardening: Safe Revision Finalization", () => {
+  it("promotes currentRevisionId when expectedCurrentRevisionId matches", async () => {
+    let projectUpdated = false;
+    const originalTransaction = prisma.$transaction;
+
+    try {
+      (prisma as unknown as { $transaction: (cb: (tx: unknown) => Promise<unknown>) => Promise<unknown> }).$transaction = async (cb) => {
+        const mockTx = {
+          projectRevision: {
+            findFirst: async () => null,
+            create: async ({ data }: { data: Record<string, unknown> }) => ({
+              id: "rev-new-123",
+              ...data,
+            }),
+          },
+          project: {
+            findUnique: async () => ({ currentRevisionId: "rev-parent-1" }),
+            update: async () => {
+              projectUpdated = true;
+            },
+          },
+        };
+        return cb(mockTx);
+      };
+
+      const result = await createProjectRevision({
+        projectId: "proj-1",
+        expectedCurrentRevisionId: "rev-parent-1",
+        files: { "app/page.tsx": "export default function Page() {}" },
+      });
+
+      assert.equal(result.id, "rev-new-123");
+      assert.equal(projectUpdated, true, "Project pointer should be promoted when expectedCurrentRevisionId matches");
+    } finally {
+      prisma.$transaction = originalTransaction;
+    }
+  });
+
+  it("prevents pointer overwrite when expectedCurrentRevisionId does not match (race guard)", async () => {
+    let projectUpdated = false;
+    const originalTransaction = prisma.$transaction;
+
+    try {
+      (prisma as unknown as { $transaction: (cb: (tx: unknown) => Promise<unknown>) => Promise<unknown> }).$transaction = async (cb) => {
+        const mockTx = {
+          projectRevision: {
+            findFirst: async () => null,
+            create: async ({ data }: { data: Record<string, unknown> }) => ({
+              id: "rev-stale-456",
+              ...data,
+            }),
+          },
+          project: {
+            findUnique: async () => ({ currentRevisionId: "rev-newer-ahead" }),
+            update: async () => {
+              projectUpdated = true;
+            },
+          },
+        };
+        return cb(mockTx);
+      };
+
+      const result = await createProjectRevision({
+        projectId: "proj-1",
+        expectedCurrentRevisionId: "rev-older-base",
+        files: { "app/page.tsx": "export default function Page() {}" },
+      });
+
+      assert.equal(result.id, "rev-stale-456");
+      assert.equal(projectUpdated, false, "Project pointer must NOT be overwritten when project has moved ahead");
+    } finally {
+      prisma.$transaction = originalTransaction;
+    }
   });
 });
 

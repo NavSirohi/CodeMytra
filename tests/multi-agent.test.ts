@@ -91,11 +91,14 @@ describe("Multi-Agent Contracts & State Flow", () => {
     const report = await runQAInspector({
       files,
       summary: "Completed bakery homepage with modern styled header.",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
     assert.equal(report.passed, true);
     assert.ok(report.score >= 80);
     assert.equal(report.repairNeeded, false);
+    assert.equal(report.verificationMode, "static-only");
     assert.ok(QAReportSchema.parse(report));
   });
 
@@ -107,10 +110,13 @@ describe("Multi-Agent Contracts & State Flow", () => {
     const report = await runQAInspector({
       files: badFiles,
       summary: "Random component",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
     assert.equal(report.passed, false);
     assert.equal(report.repairNeeded, true);
+    assert.equal(report.verificationMode, "static-only");
   });
 
   it("validates end-to-end multi-agent state progression", () => {
