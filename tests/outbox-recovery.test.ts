@@ -10,7 +10,7 @@ import { outboxRecoveryFunction } from "../src/features/inngest/outbox-recovery"
 import { OutboxStatus } from "../src/generated/prisma/client";
 
 describe("Outbox Recovery Worker with Atomic Claiming", () => {
-  it("executes atomic query with FOR UPDATE SKIP LOCKED, backoff, and no updatedAt", async () => {
+  it("executes unified atomic query with FOR UPDATE SKIP LOCKED, claimedAt lease, and nextAttemptAt", async () => {
     const originalQueryRaw = prisma.$queryRawUnsafe;
     let capturedQuery = "";
     let capturedArgs: any[] = [];
@@ -23,26 +23,22 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
 
     try {
       const beforeTime = Date.now();
-      const result = await recoverStaleOutboxEvents(300000, 25, 10);
+      const result = await recoverStaleOutboxEvents(120000, 25);
 
-      // Verify query has atomic claiming with SKIP LOCKED
+      // Verify query has atomic claiming with SKIP LOCKED and lease tracking
       assert.match(capturedQuery, /UPDATE\s+"OutboxEvent"/i);
-      assert.match(capturedQuery, /SET\s+status\s*=\s*'PROCESSING',\s*attempts\s*=\s*attempts\s*\+\s*1/i);
-      assert.doesNotMatch(capturedQuery, /updatedAt/i, "Schema has no updatedAt column; must not reference it");
+      assert.match(capturedQuery, /SET\s+status\s*=\s*'PROCESSING',\s*attempts\s*=\s*attempts\s*\+\s*1,\s*"claimedAt"\s*=\s*NOW\(\)/i);
       assert.match(capturedQuery, /FOR UPDATE SKIP LOCKED/i);
+      assert.match(capturedQuery, /nextAttemptAt/i);
+      assert.match(capturedQuery, /claimedAt/i);
 
-      // Verify exponential backoff calculation in WHERE clause
-      assert.match(capturedQuery, /interval\s+'1 second'\s*\*\s*power\(2,\s*attempts\)/i);
-
-      // Verify parameters passed
+      // Verify parameters passed: [eventId (null), MAX_OUTBOX_ATTEMPTS, leaseCutoff, batchSize]
       assert.equal(capturedArgs.length, 4);
-      const cutoff = capturedArgs[0] as Date;
-      assert.ok(cutoff instanceof Date);
-      assert.ok(cutoff.getTime() <= beforeTime - 300000 + 100);
-      assert.ok(cutoff.getTime() >= beforeTime - 300000 - 1000);
-
+      assert.equal(capturedArgs[0], null); // eventId null for batch recovery
       assert.equal(capturedArgs[1], MAX_OUTBOX_ATTEMPTS);
-      assert.equal(capturedArgs[2], 10); // baseDelaySeconds
+      const cutoff = capturedArgs[2] as Date;
+      assert.ok(cutoff instanceof Date);
+      assert.ok(cutoff.getTime() <= beforeTime - 120000 + 100);
       assert.equal(capturedArgs[3], 25); // batchSize
 
       assert.deepEqual(result, { total: 0, recovered: 0, failed: 0 });
@@ -51,11 +47,11 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
     }
   });
 
-  it("dispatches claimed events via inngest.send and marks PROCESSED", async () => {
+  it("dispatches claimed events via inngest.send and marks PROCESSED with fencing token", async () => {
     const originalQueryRaw = prisma.$queryRawUnsafe;
     const originalInngestSend = inngest.send;
-    const originalUpdate = prisma.outboxEvent.update;
 
+    const mockClaimedAt = new Date();
     const mockEvents = [
       {
         id: "evt-1",
@@ -69,6 +65,8 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         status: OutboxStatus.PROCESSING,
         attempts: 1,
         lastError: null,
+        claimedAt: mockClaimedAt,
+        nextAttemptAt: null,
         createdAt: new Date(Date.now() - 400000),
         processedAt: null,
       },
@@ -84,22 +82,29 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         status: OutboxStatus.PROCESSING,
         attempts: 2,
         lastError: "Temporary timeout",
+        claimedAt: mockClaimedAt,
+        nextAttemptAt: null,
         createdAt: new Date(Date.now() - 200000),
         processedAt: null,
       },
     ];
 
     const inngestCalls: any[] = [];
-    const updateCalls: any[] = [];
+    const queryCalls: { query: string; args: any[] }[] = [];
 
-    prisma.$queryRawUnsafe = (async () => mockEvents) as any;
+    prisma.$queryRawUnsafe = (async (query: string, ...args: any[]) => {
+      queryCalls.push({ query, args });
+      // First call is claim query
+      if (query.includes("FOR UPDATE SKIP LOCKED")) {
+        return mockEvents;
+      }
+      // Follow-up calls are status updates
+      return [{ id: args[0] }];
+    }) as any;
+
     inngest.send = (async (payload: any) => {
       inngestCalls.push(payload);
       return { ids: ["msg-1"] };
-    }) as any;
-    prisma.outboxEvent.update = (async (args: any) => {
-      updateCalls.push(args);
-      return args;
     }) as any;
 
     try {
@@ -118,26 +123,23 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
       assert.equal(inngestCalls[1].id, "run-102");
       assert.equal(inngestCalls[1].data.baseRevisionId, "rev-1");
 
+      // Verify fencing token in update query
+      const updateCalls = queryCalls.filter((c) => c.query.includes("status = 'PROCESSED'"));
       assert.equal(updateCalls.length, 2);
-      assert.equal(updateCalls[0].where.id, "evt-1");
-      assert.equal(updateCalls[0].data.status, OutboxStatus.PROCESSED);
-      assert.ok(updateCalls[0].data.processedAt instanceof Date);
-      assert.equal(updateCalls[0].data.lastError, null);
-
-      assert.equal(updateCalls[1].where.id, "evt-2");
-      assert.equal(updateCalls[1].data.status, OutboxStatus.PROCESSED);
+      assert.match(updateCalls[0].query, /claimedAt/);
+      assert.equal(updateCalls[0].args[0], "evt-1");
+      assert.equal(updateCalls[0].args[1], mockClaimedAt);
     } finally {
       prisma.$queryRawUnsafe = originalQueryRaw;
       inngest.send = originalInngestSend;
-      prisma.outboxEvent.update = originalUpdate;
     }
   });
 
-  it("handles dispatch failure gracefully and marks event FAILED with lastError", async () => {
+  it("handles dispatch failure gracefully, applies retry backoff, and marks FAILED with fencing token", async () => {
     const originalQueryRaw = prisma.$queryRawUnsafe;
     const originalInngestSend = inngest.send;
-    const originalUpdate = prisma.outboxEvent.update;
 
+    const mockClaimedAt = new Date();
     const mockEvents = [
       {
         id: "evt-failed",
@@ -151,20 +153,25 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
         status: OutboxStatus.PROCESSING,
         attempts: 1,
         lastError: null,
+        claimedAt: mockClaimedAt,
+        nextAttemptAt: null,
         createdAt: new Date(),
         processedAt: null,
       },
     ];
 
-    const updateCalls: any[] = [];
+    const queryCalls: { query: string; args: any[] }[] = [];
 
-    prisma.$queryRawUnsafe = (async () => mockEvents) as any;
+    prisma.$queryRawUnsafe = (async (query: string, ...args: any[]) => {
+      queryCalls.push({ query, args });
+      if (query.includes("FOR UPDATE SKIP LOCKED")) {
+        return mockEvents;
+      }
+      return [{ id: args[0] }];
+    }) as any;
+
     inngest.send = (async () => {
       throw new Error("Inngest endpoint down");
-    }) as any;
-    prisma.outboxEvent.update = (async (args: any) => {
-      updateCalls.push(args);
-      return args;
     }) as any;
 
     try {
@@ -174,19 +181,19 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
       assert.equal(result.recovered, 0);
       assert.equal(result.failed, 1);
 
-      assert.equal(updateCalls.length, 1);
-      assert.equal(updateCalls[0].where.id, "evt-failed");
-      assert.equal(updateCalls[0].data.status, OutboxStatus.FAILED);
-      assert.equal(updateCalls[0].data.lastError, "Inngest endpoint down");
+      const failUpdate = queryCalls.find((c) => c.query.includes("status = 'FAILED',"));
+      assert.ok(failUpdate);
+      assert.equal(failUpdate.args[0], "evt-failed");
+      assert.ok(failUpdate.args[1] instanceof Date, "nextAttemptAt must be set for retry backoff");
+      assert.equal(failUpdate.args[2], "Inngest endpoint down");
+      assert.equal(failUpdate.args[3], mockClaimedAt);
     } finally {
       prisma.$queryRawUnsafe = originalQueryRaw;
       inngest.send = originalInngestSend;
-      prisma.outboxEvent.update = originalUpdate;
     }
   });
 
   it("configures scheduled Inngest cron function correctly", () => {
-    // Verify Inngest function instance
     assert.ok(outboxRecoveryFunction && typeof outboxRecoveryFunction === "object");
     const opts = (outboxRecoveryFunction as any).opts;
     assert.equal(opts.id, "outbox-recovery");

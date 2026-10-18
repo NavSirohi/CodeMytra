@@ -19,6 +19,7 @@ import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
 import { runDesignAgent, saveDesignSpec } from "@/server/agents/designer";
 import { runArchitectureAgent, saveArchitectureSpec } from "@/server/agents/architect";
 import { runQAInspector } from "@/server/agents/qa";
+import { captureSandboxSnapshot } from "@/server/orchestration/sandbox-snapshot";
 import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
 
 export interface CodeAgentState {
@@ -64,48 +65,7 @@ async function recordRunEvent(
   }
 }
 
-/**
- * Reads all project source files from the E2B sandbox filesystem.
- * Excludes node_modules, .next, .cache, and other non-source directories.
- */
-async function readSandboxFiles(sandboxId: string): Promise<Record<string, string>> {
-  const sandbox = await Sandbox.connect(sandboxId);
-  const files: Record<string, string> = {};
 
-  // Read the file listing from sandbox
-  const result = await sandbox.commands.run(
-    `find /home/user -type f \\( -name "*.tsx" -o -name "*.ts" -o -name "*.js" -o -name "*.jsx" -o -name "*.json" -o -name "*.css" -o -name "*.html" -o -name "*.md" -o -name "*.prisma" -o -name "*.sql" -o -name "*.yaml" -o -name "*.yml" -o -name "*.env.example" \\) ! -path "*/node_modules/*" ! -path "*/.next/*" ! -path "*/.cache/*" ! -path "*/.git/*" ! -path "*/dist/*"`,
-    { timeoutMs: 15000 }
-  );
-
-  if (result.exitCode !== 0) {
-    console.error("[readSandboxFiles] find command failed:", result.stderr);
-    return files;
-  }
-
-  const filePaths = result.stdout.trim().split("\n").filter(Boolean);
-  const basePath = "/home/user/";
-
-  for (const fullPath of filePaths) {
-    const relativePath = fullPath.startsWith(basePath)
-      ? fullPath.slice(basePath.length)
-      : fullPath;
-
-    // Skip paths that are still absolute or contain traversal
-    if (relativePath.startsWith("/") || relativePath.includes("..")) continue;
-
-    try {
-      const content = await sandbox.files.read(fullPath);
-      if (typeof content === "string" && content.length > 0 && content.length < 1024 * 1024) {
-        files[relativePath] = content;
-      }
-    } catch {
-      // Skip unreadable files
-    }
-  }
-
-  return files;
-}
 
 export const codeAgentFunction = inngest.createFunction(
   {
@@ -582,20 +542,27 @@ Conclude with an updated <task_summary>...</task_summary>.
         `Verification complete with quality score ${report.score}% (${report.passed ? "PASSED" : "FAILED"})`
       );
 
-      // Read actual sandbox filesystem to capture any QA repair changes
-      let actualFiles = currentFiles;
+      // Capture exact filesystem snapshot from the canonical workspace directory in sandbox
+      let finalFiles = currentFiles;
       if (report.passed) {
         try {
-          const sandboxFiles = await readSandboxFiles(sandboxId);
-          if (Object.keys(sandboxFiles).length > 0) {
-            actualFiles = sandboxFiles;
-          }
-        } catch (readErr) {
-          console.error("[QA] Failed to read sandbox files, using in-memory state:", readErr);
+          const snapshot = await captureSandboxSnapshot(sandboxId);
+          finalFiles = snapshot.files;
+        } catch (snapErr) {
+          // Reject incomplete snapshot instead of falling back silently
+          const errMsg = snapErr instanceof Error ? snapErr.message : String(snapErr);
+          console.error("[QA Snapshot] Snapshot capture failed:", errMsg);
+          report = {
+            ...report,
+            passed: false,
+            score: Math.min(report.score, 50),
+            repairNeeded: true,
+            repairInstructions: `Snapshot capture failed: ${errMsg}. Build artifacts or missing entrypoint detected.`,
+          };
         }
       }
 
-      return { report, finalFiles: actualFiles, finalSummary: currentSummary };
+      return { report, finalFiles, finalSummary: currentSummary };
     });
 
     const { report: qaReport, finalFiles, finalSummary } = qaResult;
@@ -630,7 +597,7 @@ Conclude with an updated <task_summary>...</task_summary>.
         });
       }
 
-      // Create durable immutable revision (idempotent)
+      // Create durable immutable revision (idempotent with atomic CAS)
       const revision = await createProjectRevision({
         projectId,
         generationRunId: runId,
@@ -645,7 +612,12 @@ Conclude with an updated <task_summary>...</task_summary>.
       await transitionRun(runId, GenerationRunStatus.COMPLETED, {
         resultRevisionId: revision.id,
       });
-      await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} permanently persisted`);
+
+      if (revision.promoted) {
+        await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} promoted to active project head`);
+      } else {
+        await recordRunEvent(runId, "COMPLETED", "System", `Revision V${revision.revisionNumber} saved as historical branch; newer revision is already active`);
+      }
 
       return prisma.message.create({
         data: {

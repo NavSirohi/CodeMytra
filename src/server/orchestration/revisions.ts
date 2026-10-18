@@ -1,12 +1,18 @@
 import { prisma } from "@/lib/db";
 import type { Prisma } from "@/generated/prisma/client";
 import path from "path";
+import crypto from "crypto";
 
 export interface FileTreeManifest {
   fileCount: number;
   totalSizeBytes: number;
   paths: string[];
+  hashes?: Record<string, string>; // path -> sha256
 }
+
+export type CreatedProjectRevision = Prisma.ProjectRevisionGetPayload<object> & {
+  promoted: boolean;
+};
 
 export interface CreateRevisionParams {
   projectId: string;
@@ -77,20 +83,25 @@ export function sanitizeProjectFiles(files: Record<string, string>): Record<stri
 export function generateManifest(files: Record<string, string>): FileTreeManifest {
   const paths = Object.keys(files).sort();
   let totalSizeBytes = 0;
+  const hashes: Record<string, string> = {};
 
-  for (const content of Object.values(files)) {
-    totalSizeBytes += Buffer.byteLength(content, "utf8");
+  for (const [p, content] of Object.entries(files)) {
+    const bytes = Buffer.byteLength(content, "utf8");
+    totalSizeBytes += bytes;
+    hashes[p] = crypto.createHash("sha256").update(content, "utf8").digest("hex");
   }
 
   return {
     fileCount: paths.length,
     totalSizeBytes,
     paths,
+    hashes,
   };
 }
 
 /**
- * Validates that an in-memory file tree matches its recorded manifest.
+ * Validates that an in-memory file tree matches its recorded manifest,
+ * including path completeness, file counts, and cryptographic content hashes.
  */
 export function validateRevisionManifest(
   files: Record<string, string>,
@@ -119,6 +130,23 @@ export function validateRevisionManifest(
     }
   }
 
+  if (manifest.hashes && typeof manifest.hashes === "object") {
+    for (const [expectedPath, expectedHash] of Object.entries(manifest.hashes)) {
+      if (files[expectedPath] !== undefined) {
+        const computedHash = crypto
+          .createHash("sha256")
+          .update(files[expectedPath], "utf8")
+          .digest("hex");
+        if (computedHash !== expectedHash) {
+          return {
+            valid: false,
+            error: `Content hash mismatch for ${expectedPath}: expected ${expectedHash}, computed ${computedHash}`,
+          };
+        }
+      }
+    }
+  }
+
   return { valid: true };
 }
 
@@ -134,7 +162,7 @@ export class RestorationError extends Error {
  * Idempotent: returns existing revision if generationRunId has already produced one.
  * Concurrency-safe: atomically assigns monotonically increasing revisionNumber.
  */
-export async function createProjectRevision(params: CreateRevisionParams) {
+export async function createProjectRevision(params: CreateRevisionParams): Promise<CreatedProjectRevision> {
   const { projectId, generationRunId, parentRevisionId, title, summary } = params;
 
   // Idempotency check: if this generation run already generated a revision, return it
@@ -146,7 +174,7 @@ export async function createProjectRevision(params: CreateRevisionParams) {
       },
     });
     if (existing) {
-      return existing;
+      return Object.assign(existing, { promoted: false });
     }
   }
 
@@ -165,7 +193,7 @@ export async function createProjectRevision(params: CreateRevisionParams) {
           const existingInside = await tx.projectRevision.findFirst({
             where: { projectId, generationRunId },
           });
-          if (existingInside) return existingInside;
+          if (existingInside) return Object.assign(existingInside, { promoted: false });
         }
 
         // Get highest revision number
@@ -191,27 +219,45 @@ export async function createProjectRevision(params: CreateRevisionParams) {
           },
         });
 
-        // Safe finalization: only promote if project hasn't moved ahead
+        // Safe finalization: atomic conditional CAS update
+        let promoted = true;
         if (params.expectedCurrentRevisionId !== undefined) {
-          const currentProject = await tx.project.findUnique({
-            where: { id: projectId },
-            select: { currentRevisionId: true },
-          });
+          if (typeof tx.project.updateMany === "function") {
+            const updateResult = await tx.project.updateMany({
+              where: {
+                id: projectId,
+                currentRevisionId: params.expectedCurrentRevisionId,
+              },
+              data: { currentRevisionId: revision.id },
+            });
 
-          if (currentProject?.currentRevisionId !== params.expectedCurrentRevisionId) {
-            // Another generation already promoted a newer revision.
-            // Still create the revision record, but don't update the project pointer.
-            return revision;
+            if (updateResult.count === 0) {
+              // Another generation already promoted a newer active revision.
+              // Revision is preserved for audit trail, but pointer is not overwritten.
+              promoted = false;
+            }
+          } else {
+            const currentProject = await tx.project.findUnique({
+              where: { id: projectId },
+              select: { currentRevisionId: true },
+            });
+            if (currentProject?.currentRevisionId === params.expectedCurrentRevisionId) {
+              await tx.project.update({
+                where: { id: projectId },
+                data: { currentRevisionId: revision.id },
+              });
+            } else {
+              promoted = false;
+            }
           }
+        } else {
+          await tx.project.update({
+            where: { id: projectId },
+            data: { currentRevisionId: revision.id },
+          });
         }
 
-        // Update project pointer to current revision
-        await tx.project.update({
-          where: { id: projectId },
-          data: { currentRevisionId: revision.id },
-        });
-
-        return revision;
+        return Object.assign(revision, { promoted });
       });
     } catch (err: unknown) {
       lastError = err;

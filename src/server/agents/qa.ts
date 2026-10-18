@@ -1,4 +1,4 @@
-import { QAReport, QAReportSchema } from "@/server/agent-contracts/schemas";
+import { QAReport, QAReportSchema, QACheckCategory } from "@/server/agent-contracts/schemas";
 import path from "path";
 import { Sandbox } from "@e2b/code-interpreter";
 
@@ -11,7 +11,8 @@ export interface ValidateProjectOptions {
 
 /**
  * Real QA Inspector executing multi-point verification gates on generated project files,
- * including actual Sandbox TypeScript validation and production build execution.
+ * explicitly distinguishing between static source checks, sandbox connection,
+ * TypeScript compilation, and production build verification.
  */
 export async function runQAInspector(options: ValidateProjectOptions): Promise<QAReport> {
   const { files, summary, sandboxId, runSandboxCommands } = options;
@@ -23,6 +24,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   const hasFiles = filePaths.length > 0;
   checks.push({
     name: "files-exist",
+    category: "static-source",
     status: hasFiles ? "PASS" : "FAIL",
     details: hasFiles ? `${filePaths.length} files generated` : "Zero files generated",
   });
@@ -38,6 +40,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   );
   checks.push({
     name: "entrypoint-exists",
+    category: "static-source",
     status: hasPage ? "PASS" : "FAIL",
     details: hasPage ? "Found primary app/page.tsx" : "Missing primary app/page.tsx",
   });
@@ -61,6 +64,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   }
   checks.push({
     name: "dependency-verification",
+    category: "static-source",
     status: hasValidPackageJson ? "PASS" : "FAIL",
     details: hasValidPackageJson ? "Valid package configuration" : "Malformed package.json",
   });
@@ -72,6 +76,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   const hasSummary = Boolean(summary && summary.trim().length > 10);
   checks.push({
     name: "summary-generated",
+    category: "static-source",
     status: hasSummary ? "PASS" : "FAIL",
     details: hasSummary ? "Valid summary generated" : "Missing summary",
   });
@@ -99,6 +104,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
   checks.push({
     name: "import-integrity",
+    category: "static-source",
     status: missingImports === 0 ? "PASS" : "FAIL",
     details: missingImports === 0 ? "All relative imports resolved" : `${missingImports} dangling imports: ${missingImportList.join(", ")}`,
   });
@@ -123,6 +129,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
   checks.push({
     name: "security-secrets-check",
+    category: "static-source",
     status: !foundExposedSecret ? "PASS" : "FAIL",
     details: !foundExposedSecret ? "Zero credentials detected in source" : "Credential pattern found in code",
   });
@@ -137,12 +144,20 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       const sandbox = await Sandbox.connect(sandboxId);
       executedSandboxChecks = true;
 
+      checks.push({
+        name: "sandbox-connection",
+        category: "sandbox-connection",
+        status: "PASS",
+        details: `Connected to sandbox ${sandboxId}`,
+      });
+
       // TypeScript check
       try {
         const tscResult = await sandbox.commands.run("bun run tsc --noEmit", { timeoutMs: 30000 });
         if (tscResult.exitCode === 0) {
           checks.push({
             name: "typescript-validation",
+            category: "typescript-validation",
             status: "PASS",
             details: "TypeScript compiled with zero errors",
           });
@@ -150,6 +165,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
           const tscErr = (tscResult.stderr || tscResult.stdout || "TypeScript typecheck failed").slice(0, 500);
           checks.push({
             name: "typescript-validation",
+            category: "typescript-validation",
             status: "FAIL",
             details: tscErr,
           });
@@ -158,6 +174,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       } catch (tscCmdErr) {
         checks.push({
           name: "typescript-validation",
+          category: "typescript-validation",
           status: "FAIL",
           details: String(tscCmdErr),
         });
@@ -170,6 +187,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
         if (buildResult.exitCode === 0) {
           checks.push({
             name: "production-build",
+            category: "production-build",
             status: "PASS",
             details: "Production build succeeded",
           });
@@ -177,6 +195,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
           const buildErr = (buildResult.stderr || buildResult.stdout || "Build failed").slice(0, 500);
           checks.push({
             name: "production-build",
+            category: "production-build",
             status: "FAIL",
             details: buildErr,
           });
@@ -185,6 +204,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       } catch (buildCmdErr) {
         checks.push({
           name: "production-build",
+          category: "production-build",
           status: "FAIL",
           details: String(buildCmdErr),
         });
@@ -193,6 +213,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     } catch (sandboxConnErr) {
       checks.push({
         name: "sandbox-connection",
+        category: "sandbox-connection",
         status: "FAIL",
         details: `Failed to connect to sandbox for verification: ${String(sandboxConnErr)}`,
       });
@@ -207,6 +228,19 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
   const verificationMode = executedSandboxChecks ? "sandbox-verified" : "static-only";
 
+  const executedCategories = Array.from(new Set(checks.map((c) => c.category))) as QACheckCategory[];
+
+  let factualSummary = "";
+  if (executedSandboxChecks) {
+    factualSummary = passed
+      ? "Static source analysis, TypeScript typecheck, and production build verification succeeded. Note: Runtime end-to-end user journeys were not tested."
+      : `Sandbox verification failed: ${errors.join("; ")}`;
+  } else {
+    factualSummary = passed
+      ? "Static source checks passed. Sandbox TypeScript validation and production build checks were not executed."
+      : `Static source analysis failed: ${errors.join("; ")}`;
+  }
+
   const report: QAReport = {
     passed,
     score,
@@ -216,6 +250,8 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       ? `Validation failed with the following issues:\n${errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
       : undefined,
     verificationMode,
+    summary: factualSummary,
+    executedCategories,
   };
 
   return QAReportSchema.parse(report);

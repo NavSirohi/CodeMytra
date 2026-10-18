@@ -102,8 +102,18 @@ export type ArchitectureSpec = z.infer<typeof ArchitectureSpecSchema>;
  * QA & Verification Report Schema
  * Emitted by the QA Agent
  */
+export const QACheckCategoryEnum = z.enum([
+  "static-source",
+  "sandbox-connection",
+  "typescript-validation",
+  "production-build",
+  "runtime-health",
+]);
+export type QACheckCategory = z.infer<typeof QACheckCategoryEnum>;
+
 export const QACheckSchema = z.object({
   name: z.string(),
+  category: QACheckCategoryEnum,
   status: z.enum(["PASS", "FAIL", "SKIPPED"]),
   details: z.string().optional(),
 });
@@ -115,6 +125,8 @@ export const QAReportSchema = z.object({
   repairNeeded: z.boolean(),
   repairInstructions: z.string().optional(),
   verificationMode: z.enum(["sandbox-verified", "static-only"]).default("static-only"),
+  summary: z.string().default("Verification executed"),
+  executedCategories: z.array(QACheckCategoryEnum).default([]),
 });
 
 export type QAReport = z.infer<typeof QAReportSchema>;

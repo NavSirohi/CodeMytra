@@ -32,44 +32,49 @@ export const createMessage = async (value: string, projectId: string) => {
     throw new Error("Prompt exceeds maximum length of 4000 characters");
   }
 
-  // 2. Concurrency Control: Check for active generation in progress
-  const activeRun = await prisma.generationRun.findFirst({
-    where: {
-      projectId,
-      status: {
-        in: [
-          GenerationRunStatus.QUEUED,
-          GenerationRunStatus.PLANNING,
-          GenerationRunStatus.AWAITING_APPROVAL,
-          GenerationRunStatus.DESIGNING,
-          GenerationRunStatus.ARCHITECTING,
-          GenerationRunStatus.RUNNING,
-          GenerationRunStatus.VALIDATING,
-        ],
-      },
-    },
-  });
-
-  if (activeRun) {
-    throw new Error("A generation run is already in progress for this project. Please wait for it to complete.");
-  }
-
-  const project = await prisma.project.findUnique({
-    where: {
-      id: projectId,
-      userId: user.id,
-    },
-    select: {
-      id: true,
-      currentRevisionId: true,
-    },
-  });
-
-  if (!project) {
-    throw new Error("Project not found");
-  }
-
+  // Database-level coordination: execute row lock and active run check atomically
   const { newMessage, outboxEvent } = await prisma.$transaction(async (tx) => {
+    // 1. Lock project row to serialize concurrent generation requests for this project
+    await tx.$queryRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR UPDATE`, projectId);
+
+    // 2. Check project existence and ownership under lock
+    const project = await tx.project.findUnique({
+      where: {
+        id: projectId,
+        userId: user.id,
+      },
+      select: {
+        id: true,
+        currentRevisionId: true,
+      },
+    });
+
+    if (!project) {
+      throw new Error("Project not found");
+    }
+
+    // 3. Concurrency check: Ensure no active run exists for this project
+    const activeRun = await tx.generationRun.findFirst({
+      where: {
+        projectId,
+        status: {
+          in: [
+            GenerationRunStatus.QUEUED,
+            GenerationRunStatus.PLANNING,
+            GenerationRunStatus.AWAITING_APPROVAL,
+            GenerationRunStatus.DESIGNING,
+            GenerationRunStatus.ARCHITECTING,
+            GenerationRunStatus.RUNNING,
+            GenerationRunStatus.VALIDATING,
+          ],
+        },
+      },
+    });
+
+    if (activeRun) {
+      throw new Error("A generation run is already in progress for this project. Please wait for it to complete.");
+    }
+
     const message = await tx.message.create({
       data: {
         projectId,

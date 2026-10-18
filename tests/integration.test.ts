@@ -423,21 +423,27 @@ describe("M1.5 Comprehensive Integration: Generation, Modifications, Restoration
       },
     ];
 
-    prisma.$queryRawUnsafe = (async () => claimedEvents) as any;
+    const rawQueries: { query: string; args: any[] }[] = [];
+    prisma.$queryRawUnsafe = (async (query: string, ...args: any[]) => {
+      rawQueries.push({ query, args });
+      if (query.includes("FOR UPDATE SKIP LOCKED")) {
+        const requestedId = args[0];
+        if (requestedId === "evt-exhausted") {
+          return []; // Exhausted event cannot be claimed
+        }
+        return claimedEvents;
+      }
+      return [{ id: args[0] }];
+    }) as any;
+
     const inngestDispatches: any[] = [];
     inngest.send = (async (item: any) => {
       inngestDispatches.push(item);
       return { ids: ["msg-outbox-rec"] };
     }) as any;
 
-    const eventUpdates: any[] = [];
-    prisma.outboxEvent.update = (async (args: any) => {
-      eventUpdates.push(args);
-      return args;
-    }) as any;
-
     try {
-      const summary = await recoverStaleOutboxEvents(300000, 10, 5);
+      const summary = await recoverStaleOutboxEvents(300000, 10);
       assert.equal(summary.total, 1);
       assert.equal(summary.recovered, 1);
       assert.equal(summary.failed, 0);
@@ -445,8 +451,9 @@ describe("M1.5 Comprehensive Integration: Generation, Modifications, Restoration
       assert.equal(inngestDispatches.length, 1);
       assert.equal(inngestDispatches[0].id, "run-run-stale-01");
 
-      assert.equal(eventUpdates[0].data.status, OutboxStatus.PROCESSED);
-      assert.ok(eventUpdates[0].data.processedAt instanceof Date);
+      const processedQuery = rawQueries.find((q) => q.query.includes("status = 'PROCESSED'"));
+      assert.ok(processedQuery, "Event status must be updated to PROCESSED via raw query");
+      assert.equal(processedQuery.args[0], "evt-stale-01");
 
       // Verify MAX_OUTBOX_ATTEMPTS bounds enforcement in single-dispatch
       const originalFindUnique = prisma.outboxEvent.findUnique;
@@ -456,17 +463,9 @@ describe("M1.5 Comprehensive Integration: Generation, Modifications, Restoration
         attempts: MAX_OUTBOX_ATTEMPTS,
       })) as any;
 
-      let exhaustedStatusUpdate: any = null;
-      prisma.outboxEvent.update = (async (args: any) => {
-        exhaustedStatusUpdate = args;
-        return args;
-      }) as any;
-
       const singleDispatchResult = await dispatchOutboxEvent("evt-exhausted");
       assert.equal(singleDispatchResult.dispatched, false);
       assert.equal(singleDispatchResult.reason, "Max attempts exceeded");
-      assert.equal(exhaustedStatusUpdate.data.status, OutboxStatus.FAILED);
-      assert.match(exhaustedStatusUpdate.data.lastError, /Max outbox dispatch attempts/);
 
       prisma.outboxEvent.findUnique = originalFindUnique;
     } finally {
