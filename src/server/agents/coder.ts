@@ -59,6 +59,15 @@ export const FORBIDDEN_COMMAND_PATTERNS = [
   /\b(curl|wget)\b.*(@|--upload-file|--post-file)/i,
 ];
 
+/**
+ * Application-level command guardrail.
+ *
+ * Security Architecture Note:
+ * In accordance with defense-in-depth principles, pattern-based command filtering serves as
+ * an application-level guardrail to intercept accidental environment/secret access or workspace
+ * escaping. The isolated E2B microVM hypervisor container boundary provides the primary,
+ * authoritative security barrier against malicious execution.
+ */
 export function validateSandboxCommand(command: string): { allowed: boolean; reason?: string } {
   for (const pattern of FORBIDDEN_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
@@ -221,10 +230,16 @@ export async function runCodingAgent(
           command: z.string(),
         }),
         handler: async ({ command }) => {
-          // Pre-execution security check
+          // Pre-execution security check (defense-in-depth)
           const secCheck = validateSandboxCommand(command);
           if (!secCheck.allowed) {
-            return secCheck.reason || "Command blocked by security policy.";
+            return JSON.stringify({
+              success: false,
+              exitCode: 126,
+              stdout: "",
+              stderr: secCheck.reason || "Command blocked by security policy.",
+              error: "COMMAND_SECURITY_BLOCKED",
+            });
           }
 
           return await runStep("terminal", async () => {
@@ -248,27 +263,30 @@ export async function runCodingAgent(
                 timeoutMs: MAX_COMMAND_TIMEOUT_MS,
               });
 
-              let finalOut = result.stdout || stdout || "Command completed with zero output.";
-              if (finalOut.length > MAX_COMMAND_OUTPUT_BYTES) {
-                finalOut =
-                  finalOut.slice(0, MAX_COMMAND_OUTPUT_BYTES) +
-                  "\n... [Output truncated to 256 KB to preserve memory]";
-              }
-              return finalOut;
+              const exitCode = result.exitCode ?? 0;
+              const cleanStdout = (result.stdout || stdout || "").slice(0, MAX_COMMAND_OUTPUT_BYTES);
+              const cleanStderr = (result.stderr || stderr || "").slice(0, MAX_COMMAND_OUTPUT_BYTES);
+
+              return JSON.stringify({
+                success: exitCode === 0,
+                exitCode,
+                stdout: cleanStdout,
+                stderr: cleanStderr,
+              });
             } catch (error) {
-              let errOut = `Command failed: ${error} \n stdout: ${stdout}\n stderr: ${stderr}`;
-              if (errOut.length > MAX_COMMAND_OUTPUT_BYTES) {
-                errOut =
-                  errOut.slice(0, MAX_COMMAND_OUTPUT_BYTES) +
-                  "\n... [Error output truncated to 256 KB]";
-              }
-              return errOut;
+              return JSON.stringify({
+                success: false,
+                exitCode: 1,
+                stdout: stdout.slice(0, MAX_COMMAND_OUTPUT_BYTES),
+                stderr: stderr.slice(0, MAX_COMMAND_OUTPUT_BYTES),
+                error: `Command failed: ${error instanceof Error ? error.message : String(error)}`,
+              });
             }
           });
         },
       }),
 
-      // 2. createOrUpdateFiles Tool (enforces project workspace boundary, secrets protection, and resource limits)
+      // 2. createOrUpdateFiles Tool (pre-validates entire batch before writing to avoid partial corruptions)
       createTool({
         name: "createOrUpdateFiles",
         description: `Create or update files in the sandbox project workspace (${PROJECT_WORKSPACE_DIR})`,
@@ -281,49 +299,98 @@ export async function runCodingAgent(
           ).min(1).max(50),
         }),
         handler: async ({ files }, { network }) => {
-          const updatedFiles = await runStep("createOrUpdateFiles", async () => {
-            try {
-              const currentFiles = network?.state?.data?.files || initialFiles;
-              const sandbox = await Sandbox.connect(sandboxId);
+          const stepResult = await runStep("createOrUpdateFiles", async () => {
+            // STEP 1: Pre-validation of entire batch BEFORE any sandbox writes or state mutations
+            const validatedFiles: Array<{
+              relativePath: string;
+              fullWorkspacePath: string;
+              content: string;
+            }> = [];
 
-              for (const file of files) {
-                // Strict path validation: all files must remain inside project workspace
-                const fullWorkspacePath = resolveWorkspacePath(file.path);
-
-                // Security check: block sensitive platform files
-                if (isSensitiveFilePath(file.path)) {
-                  throw new Error(
-                    `Writing to sensitive file "${file.path}" is forbidden by security policy.`
-                  );
-                }
-
-                // Resource limit check per file (1 MB)
-                const fileBytes = Buffer.byteLength(file.content, "utf8");
-                if (fileBytes > 1024 * 1024) {
-                  throw new Error(`File "${file.path}" exceeds maximum size limit of 1 MB`);
-                }
-
-                await sandbox.files.write(fullWorkspacePath, file.content);
-                currentFiles[file.path] = file.content;
+            for (const file of files) {
+              // Path boundary validation
+              let fullWorkspacePath: string;
+              try {
+                fullWorkspacePath = resolveWorkspacePath(file.path);
+              } catch {
+                return {
+                  success: false,
+                  error: `Path traversal forbidden: file "${file.path}" resolves outside project workspace.`,
+                  failedFile: file.path,
+                };
               }
 
-              return currentFiles;
-            } catch (error) {
-              return `Error writing files: ${error instanceof Error ? error.message : String(error)}`;
+              // Sensitive file policy check
+              if (isSensitiveFilePath(file.path)) {
+                return {
+                  success: false,
+                  error: `Writing to sensitive file "${file.path}" is forbidden by security policy.`,
+                  failedFile: file.path,
+                };
+              }
+
+              // Resource limit check per file (1 MB)
+              const fileBytes = Buffer.byteLength(file.content || "", "utf8");
+              if (fileBytes > 1024 * 1024) {
+                return {
+                  success: false,
+                  error: `File "${file.path}" exceeds maximum size limit of 1 MB (${fileBytes} bytes).`,
+                  failedFile: file.path,
+                };
+              }
+
+              validatedFiles.push({
+                relativePath: file.path,
+                fullWorkspacePath,
+                content: file.content,
+              });
+            }
+
+            // STEP 2: All files passed validation. Execute sandbox writes atomically across the batch.
+            try {
+              const sandbox = await Sandbox.connect(sandboxId);
+              for (const vFile of validatedFiles) {
+                await sandbox.files.write(vFile.fullWorkspacePath, vFile.content);
+              }
+
+              const updatedMap = validatedFiles.reduce((acc, f) => {
+                acc[f.relativePath] = f.content;
+                return acc;
+              }, {} as Record<string, string>);
+
+              return {
+                success: true,
+                filesWritten: validatedFiles.map((f) => f.relativePath),
+                count: validatedFiles.length,
+                updatedMap,
+              };
+            } catch (writeErr) {
+              return {
+                success: false,
+                error: `Sandbox write error: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`,
+              };
             }
           });
 
-          if (
-            typeof updatedFiles === "object" &&
-            updatedFiles !== null &&
-            network?.state?.data
-          ) {
-            network.state.data.files = updatedFiles as Record<string, string>;
+          // Only mutate network state if the entire batch write succeeded
+          if (stepResult.success && stepResult.updatedMap && network?.state?.data) {
+            network.state.data.files = {
+              ...(network.state.data.files || initialFiles),
+              ...stepResult.updatedMap,
+            };
           }
+
+          return JSON.stringify({
+            success: stepResult.success,
+            filesWritten: stepResult.filesWritten,
+            count: stepResult.count,
+            error: stepResult.error,
+            failedFile: stepResult.failedFile,
+          });
         },
       }),
 
-      // 3. readFiles Tool (reads from project workspace with secrets protection)
+      // 3. readFiles Tool (reads from project workspace with secrets protection and structured results)
       createTool({
         name: "readFiles",
         description: `Read files from the sandbox project workspace (${PROJECT_WORKSPACE_DIR})`,
@@ -332,18 +399,31 @@ export async function runCodingAgent(
         }),
         handler: async ({ files }) => {
           return await runStep("readFiles", async () => {
+            // Pre-validate all requested paths
+            for (const filePath of files) {
+              if (isSensitiveFilePath(filePath)) {
+                return JSON.stringify({
+                  success: false,
+                  error: `Reading sensitive file "${filePath}" is forbidden by security policy.`,
+                  failedFile: filePath,
+                });
+              }
+              try {
+                resolveWorkspacePath(filePath);
+              } catch {
+                return JSON.stringify({
+                  success: false,
+                  error: `Path traversal forbidden: file "${filePath}" resolves outside project workspace.`,
+                  failedFile: filePath,
+                });
+              }
+            }
+
             try {
               const sandbox = await Sandbox.connect(sandboxId);
               const contents: Array<{ path: string; content: string }> = [];
 
               for (const filePath of files) {
-                // Security check: block reading sensitive files
-                if (isSensitiveFilePath(filePath)) {
-                  throw new Error(
-                    `Reading sensitive file "${filePath}" is forbidden by security policy.`
-                  );
-                }
-
                 const fullWorkspacePath = resolveWorkspacePath(filePath);
                 let content = await sandbox.files.read(fullWorkspacePath);
                 if (typeof content === "string" && content.length > 1024 * 1024) {
@@ -356,9 +436,16 @@ export async function runCodingAgent(
                 });
               }
 
-              return JSON.stringify(contents);
+              return JSON.stringify({
+                success: true,
+                files: contents,
+                count: contents.length,
+              });
             } catch (error) {
-              return `Error reading files: ${error instanceof Error ? error.message : String(error)}`;
+              return JSON.stringify({
+                success: false,
+                error: `Error reading files: ${error instanceof Error ? error.message : String(error)}`,
+              });
             }
           });
         },

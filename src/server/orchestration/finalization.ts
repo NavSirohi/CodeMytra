@@ -35,6 +35,11 @@ export interface FinalizeGenerationFailureParams {
   errorMessage: string;
 }
 
+export interface FinalizeGenerationFailureResult {
+  messageId: string;
+  isIdempotentReplay: boolean;
+}
+
 /**
  * Transactionally and idempotently finalizes a successful generation run.
  * Guarantees:
@@ -43,6 +48,7 @@ export interface FinalizeGenerationFailureParams {
  * 3. Atomic CAS promotion: only updates project pointer if project hasn't advanced.
  * 4. Transactional atomicity: revision, run status, event, and assistant message succeed or fail together.
  * 5. Replay safety: retrying after partial failure never duplicates revisions or messages.
+ * 6. Validates project ownership and prevents terminal state corruptions.
  */
 export async function finalizeGenerationSuccess(
   params: FinalizeGenerationSuccessParams
@@ -58,20 +64,27 @@ export async function finalizeGenerationSuccess(
   } = params;
 
   return await prisma.$transaction(async (tx) => {
-    // 1. Idempotency Check: if run is already completed with a revision, return idempotently
+    // 1. Validate run existence and ownership
     const currentRun = await tx.generationRun.findUnique({
       where: { id: generationRunId },
       include: { revisions: true },
     });
 
-    if (currentRun?.status === GenerationRunStatus.COMPLETED && currentRun.revisions.length > 0) {
+    if (!currentRun) {
+      throw new Error(`GenerationRun "${generationRunId}" not found`);
+    }
+
+    if (currentRun.projectId !== projectId) {
+      throw new Error(
+        `GenerationRun "${generationRunId}" does not belong to project "${projectId}"`
+      );
+    }
+
+    // 2. Idempotency Check: if run is already completed with a revision, return idempotently
+    if (currentRun.status === GenerationRunStatus.COMPLETED && currentRun.revisions.length > 0) {
       const existingRev = currentRun.revisions[0];
-      const existingMsg = await tx.message.findFirst({
-        where: {
-          projectId,
-          type: MessageType.RESULT,
-        },
-        orderBy: { createdAt: "desc" },
+      const existingMsg = await tx.message.findUnique({
+        where: { generationRunId },
       });
 
       return {
@@ -82,7 +95,19 @@ export async function finalizeGenerationSuccess(
       };
     }
 
-    // 2. Check if revision already created in an earlier attempted commit
+    // Terminal state guard: if run was cancelled or failed, prevent overwriting
+    if (currentRun.status === GenerationRunStatus.CANCELLED) {
+      throw new Error(
+        `GenerationRun "${generationRunId}" is CANCELLED and cannot be finalized as COMPLETED`
+      );
+    }
+    if (currentRun.status === GenerationRunStatus.FAILED) {
+      throw new Error(
+        `GenerationRun "${generationRunId}" is already FAILED and cannot be finalized as COMPLETED`
+      );
+    }
+
+    // 3. Check if revision already created in an earlier attempted commit
     let revision = await tx.projectRevision.findFirst({
       where: { projectId, generationRunId },
     });
@@ -116,7 +141,7 @@ export async function finalizeGenerationSuccess(
         },
       });
 
-      // 3. Atomic CAS promotion: only promote if expectedCurrentRevisionId matches
+      // Atomic CAS promotion: only promote if expectedCurrentRevisionId matches
       if (typeof tx.project.updateMany === "function") {
         const updateResult = await tx.project.updateMany({
           where: {
@@ -148,7 +173,7 @@ export async function finalizeGenerationSuccess(
       promoted = currentProject?.currentRevisionId === revision.id;
     }
 
-    // 4. Mark GenerationRun as COMPLETED
+    // 4. Mark GenerationRun as COMPLETED safely under concurrency
     await tx.generationRun.update({
       where: { id: generationRunId },
       data: {
@@ -170,20 +195,16 @@ export async function finalizeGenerationSuccess(
       },
     });
 
-    // 6. Create assistant Message with fragment (if not already existing)
-    let message = await tx.message.findFirst({
-      where: {
-        projectId,
-        content: summary,
-        role: MessageRole.ASSISTANT,
-        type: MessageType.RESULT,
-      },
+    // 6. Create assistant Message with fragment linked to generationRunId
+    let message = await tx.message.findUnique({
+      where: { generationRunId },
     });
 
     if (!message) {
       message = await tx.message.create({
         data: {
           projectId,
+          generationRunId,
           content: summary,
           role: MessageRole.ASSISTANT,
           type: MessageType.RESULT,
@@ -208,19 +229,70 @@ export async function finalizeGenerationSuccess(
 }
 
 /**
- * Transactionally finalizes a failed generation run.
+ * Transactionally and idempotently finalizes a failed generation run.
  * Guarantees:
  * 1. GenerationRun transitions to FAILED with error code and diagnostics.
  * 2. Active project revision pointer is NEVER altered, strictly preserving prior working state.
- * 3. Error message is created and failure event recorded.
+ * 3. Never overwrites an already COMPLETED run.
+ * 4. Idempotent replay never generates duplicate failure events or error messages.
+ * 5. Validates project ownership and ensures safe terminal transitions under concurrency.
  */
 export async function finalizeGenerationFailure(
   params: FinalizeGenerationFailureParams
-): Promise<{ messageId: string }> {
+): Promise<FinalizeGenerationFailureResult> {
   const { projectId, generationRunId, errorCode, errorMessage } = params;
 
   return await prisma.$transaction(async (tx) => {
-    // 1. Transition run to FAILED
+    // 1. Validate run existence and ownership
+    const currentRun = await tx.generationRun.findUnique({
+      where: { id: generationRunId },
+    });
+
+    if (!currentRun) {
+      throw new Error(`GenerationRun "${generationRunId}" not found`);
+    }
+
+    if (currentRun.projectId !== projectId) {
+      throw new Error(
+        `GenerationRun "${generationRunId}" does not belong to project "${projectId}"`
+      );
+    }
+
+    // 2. Prevent failed finalization from overwriting an already COMPLETED run
+    if (currentRun.status === GenerationRunStatus.COMPLETED) {
+      const existingMsg = await tx.message.findUnique({
+        where: { generationRunId },
+      });
+      return {
+        messageId: existingMsg?.id || "existing-message",
+        isIdempotentReplay: true,
+      };
+    }
+
+    // 3. Repeated failure delivery (idempotent replay):
+    // If run is already FAILED, return existing messageId without duplicate events or messages
+    if (currentRun.status === GenerationRunStatus.FAILED) {
+      const existingMsg = await tx.message.findUnique({
+        where: { generationRunId },
+      });
+      return {
+        messageId: existingMsg?.id || "existing-message",
+        isIdempotentReplay: true,
+      };
+    }
+
+    // If run is CANCELLED, do not transition to FAILED
+    if (currentRun.status === GenerationRunStatus.CANCELLED) {
+      const existingMsg = await tx.message.findUnique({
+        where: { generationRunId },
+      });
+      return {
+        messageId: existingMsg?.id || "existing-message",
+        isIdempotentReplay: true,
+      };
+    }
+
+    // 4. Transition run to FAILED
     await tx.generationRun.update({
       where: { id: generationRunId },
       data: {
@@ -231,7 +303,7 @@ export async function finalizeGenerationFailure(
       },
     });
 
-    // 2. Record FAILED event
+    // 5. Record FAILED event exactly once
     await tx.runEvent.create({
       data: {
         runId: generationRunId,
@@ -241,16 +313,23 @@ export async function finalizeGenerationFailure(
       },
     });
 
-    // 3. Create error message for user
-    const message = await tx.message.create({
-      data: {
-        projectId,
-        content: `Quality Assurance failed: ${errorMessage} Your prior working revision is preserved.`,
-        role: MessageRole.ASSISTANT,
-        type: MessageType.ERROR,
-      },
+    // 6. Create error message for user, tied to generationRunId
+    let message = await tx.message.findUnique({
+      where: { generationRunId },
     });
 
-    return { messageId: message.id };
+    if (!message) {
+      message = await tx.message.create({
+        data: {
+          projectId,
+          generationRunId,
+          content: `Quality Assurance failed: ${errorMessage} Your prior working revision is preserved.`,
+          role: MessageRole.ASSISTANT,
+          type: MessageType.ERROR,
+        },
+      });
+    }
+
+    return { messageId: message.id, isIdempotentReplay: false };
   });
 }

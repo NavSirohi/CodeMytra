@@ -9,9 +9,85 @@ export interface GenerateProjectZipOptions {
   userId: string;
 }
 
+export class ExportValidationError extends Error {
+  constructor(message: string, public readonly details?: Record<string, unknown>) {
+    super(message);
+    this.name = "ExportValidationError";
+  }
+}
+
+/**
+ * Validates that the revision contains authentic, standalone project configuration.
+ * Prevents exporting broken or incomplete revisions without authentic package.json or tsconfig.json.
+ */
+export function validateExportFiles(files: Record<string, string>): void {
+  const fileKeys = Object.keys(files).map((f) =>
+    path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase()
+  );
+
+  // 1. Mandatory package.json check
+  const pkgKey = Object.keys(files).find(
+    (f) => path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase() === "package.json"
+  );
+  if (!pkgKey) {
+    throw new ExportValidationError(
+      "Export validation failed: revision is missing required 'package.json'. Export must reflect authentic project files."
+    );
+  }
+
+  let pkgJson: Record<string, unknown>;
+  try {
+    pkgJson = JSON.parse(files[pkgKey]);
+  } catch {
+    throw new ExportValidationError(
+      "Export validation failed: 'package.json' contains invalid JSON syntax."
+    );
+  }
+
+  // 2. Validate essential scripts
+  const scripts = (pkgJson.scripts as Record<string, string>) || {};
+  if (!scripts.build) {
+    throw new ExportValidationError(
+      "Export validation failed: 'package.json' must contain a 'build' script for standalone compilation."
+    );
+  }
+
+  // 3. Validate essential runtime dependencies
+  const deps = (pkgJson.dependencies as Record<string, string>) || {};
+  if (!deps.next || !deps.react || !deps["react-dom"]) {
+    throw new ExportValidationError(
+      "Export validation failed: 'package.json' is missing core dependencies ('next', 'react', 'react-dom')."
+    );
+  }
+
+  // 4. Mandatory tsconfig.json check
+  const hasTsConfig = fileKeys.includes("tsconfig.json");
+  if (!hasTsConfig) {
+    throw new ExportValidationError(
+      "Export validation failed: revision is missing required 'tsconfig.json'. Standalone TypeScript compilation cannot proceed."
+    );
+  }
+
+  // 5. Mandatory entrypoint check
+  const hasEntrypoint = fileKeys.some(
+    (k) =>
+      k === "app/page.tsx" ||
+      k === "src/app/page.tsx" ||
+      k === "app/page.jsx" ||
+      k === "src/app/page.jsx" ||
+      k === "pages/index.tsx" ||
+      k === "pages/index.jsx"
+  );
+  if (!hasEntrypoint) {
+    throw new ExportValidationError(
+      "Export validation failed: revision is missing entrypoint file (app/page.tsx or src/app/page.tsx)."
+    );
+  }
+}
+
 /**
  * Generates a clean, validated ZIP archive of a project's revision.
- * Enforces server-side authorization and strict Zip Slip protection.
+ * Enforces server-side authorization, strict Zip Slip protection, and authentic project integrity.
  */
 export async function generateProjectZip(options: GenerateProjectZipOptions) {
   const { projectId, revisionId, userId } = options;
@@ -45,6 +121,9 @@ export async function generateProjectZip(options: GenerateProjectZipOptions) {
   const rawFiles = (revision.files as Record<string, string>) || {};
   const cleanFiles = sanitizeProjectFiles(rawFiles);
 
+  // 3. Strict authenticity and completeness validation
+  validateExportFiles(cleanFiles);
+
   const zip = new JSZip();
 
   // Root folder inside the zip for clean extraction
@@ -69,86 +148,6 @@ export async function generateProjectZip(options: GenerateProjectZipOptions) {
     }
 
     folder.file(normalized, content);
-  }
-
-  // Ensure standalone configuration files are present and valid
-  const hasPackageJson = Object.keys(cleanFiles).some(
-    (f) => path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase() === "package.json"
-  );
-  if (!hasPackageJson) {
-    const defaultPackageJson = JSON.stringify(
-      {
-        name: (project.name || "codemytra-app")
-          .toLowerCase()
-          .replace(/[^a-z0-9_-]/g, "-")
-          .replace(/^-+|-+$/g, "") || "codemytra-app",
-        version: "0.1.0",
-        private: true,
-        scripts: {
-          dev: "next dev",
-          build: "next build",
-          start: "next start",
-        },
-        dependencies: {
-          next: "16.2.9",
-          react: "19.2.4",
-          "react-dom": "19.2.4",
-          "lucide-react": "^1.21.0",
-          clsx: "^2.1.1",
-          "tailwind-merge": "^3.0.1",
-        },
-        devDependencies: {
-          typescript: "^5.7.3",
-          "@types/node": "^22.0.0",
-          "@types/react": "^19.0.0",
-          "@types/react-dom": "^19.0.0",
-          tailwindcss: "^4.0.0",
-        },
-      },
-      null,
-      2
-    );
-    folder.file("package.json", defaultPackageJson);
-  }
-
-  const hasTsConfig = Object.keys(cleanFiles).some(
-    (f) => path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase() === "tsconfig.json"
-  );
-  if (!hasTsConfig) {
-    const defaultTsConfig = JSON.stringify(
-      {
-        compilerOptions: {
-          target: "ES2017",
-          lib: ["dom", "dom.iterable", "esnext"],
-          allowJs: true,
-          skipLibCheck: true,
-          strict: true,
-          noEmit: true,
-          esModuleInterop: true,
-          module: "esnext",
-          moduleResolution: "bundler",
-          resolveJsonModule: true,
-          isolatedModules: true,
-          jsx: "preserve",
-          incremental: true,
-          plugins: [{ name: "next" }],
-          paths: { "@/*": ["./*"] },
-        },
-        include: ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-        exclude: ["node_modules"],
-      },
-      null,
-      2
-    );
-    folder.file("tsconfig.json", defaultTsConfig);
-  }
-
-  const hasNextConfig = Object.keys(cleanFiles).some((f) => {
-    const norm = path.normalize(f).replace(/^(\.\/|\/)/, "").toLowerCase();
-    return norm === "next.config.ts" || norm === "next.config.mjs" || norm === "next.config.js";
-  });
-  if (!hasNextConfig) {
-    folder.file("next.config.ts", "import type { NextConfig } from 'next';\n\nconst nextConfig: NextConfig = {};\n\nexport default nextConfig;\n");
   }
 
   // Include default README if user project didn't generate one

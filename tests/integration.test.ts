@@ -503,6 +503,13 @@ describe("M1.5 Comprehensive Integration: Generation, Modifications, Restoration
       revisionNumber: 1,
       files: {
         "app/page.tsx": "export default function Page() { return <h1>Portfolio</h1>; }",
+        "tsconfig.json": JSON.stringify({ compilerOptions: {} }),
+        "package.json": JSON.stringify({
+          name: "portfolio-app",
+          version: "0.1.0",
+          scripts: { build: "next build" },
+          dependencies: { next: "15.0.0", react: "19.0.0", "react-dom": "19.0.0" },
+        }),
         "../../etc/passwd": "malicious content",
         ".env": "SECRET_KEY=123",
       },

@@ -16,6 +16,7 @@ import {
 import {
   finalizeGenerationSuccess,
   finalizeGenerationFailure,
+  FinalizeGenerationSuccessResult,
 } from "@/server/orchestration/finalization";
 import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
 import { runDesignAgent, saveDesignSpec } from "@/server/agents/designer";
@@ -426,7 +427,7 @@ Conclude with an updated <task_summary>...</task_summary>.
       return `http://${sandbox.getHost(3000)}`;
     });
 
-    await step.run("save-result", async () => {
+    const finalizationResult = await step.run("save-result", async () => {
       if (!qaReport.passed || qaReport.verificationMode === "static-only") {
         const failureReason = qaReport.verificationMode === "static-only"
           ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
@@ -451,11 +452,30 @@ Conclude with an updated <task_summary>...</task_summary>.
       });
     });
 
+    if (!qaReport.passed || qaReport.verificationMode === "static-only") {
+      const failureReason = qaReport.verificationMode === "static-only"
+        ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
+        : (qaReport.repairInstructions || "Validation checks failed");
+
+      return {
+        status: "FAILED" as const,
+        error: failureReason,
+        priorRevisionPreserved: true,
+        messageId: finalizationResult.messageId,
+      };
+    }
+
+    const successResult = finalizationResult as FinalizeGenerationSuccessResult;
+
     return {
+      status: "COMPLETED" as const,
       url: sandboxUrl,
       title: fragmentTitle,
       files: finalFiles,
       summary: finalSummary,
+      revisionId: successResult.revision.id,
+      revisionNumber: successResult.revision.revisionNumber,
+      messageId: successResult.messageId,
     };
   }
 );

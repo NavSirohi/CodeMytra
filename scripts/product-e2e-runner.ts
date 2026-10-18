@@ -14,12 +14,14 @@ import {
   PROJECT_WORKSPACE_DIR,
 } from "../src/server/orchestration/workspace";
 import {
-  createProjectRevision,
   restoreHistoricalRevision,
   validateRevisionManifest,
   FileTreeManifest,
 } from "../src/server/orchestration/revisions";
-import { transitionRun } from "../src/server/orchestration/state-machine";
+import {
+  finalizeGenerationSuccess,
+  finalizeGenerationFailure,
+} from "../src/server/orchestration/finalization";
 import { generateProjectZip } from "../src/server/export/zip-export";
 import { prisma } from "../src/lib/db";
 import { GenerationRunStatus } from "../src/generated/prisma/client";
@@ -269,25 +271,27 @@ async function main() {
 
     const genRun1 = await prisma.generationRun.create({
       data: {
+        id: `run_e2e_v1_${Date.now()}`,
         projectId: testProjectId,
         userId: testUserId,
         prompt: initialPrompt,
-        status: GenerationRunStatus.COMPLETED,
+        status: GenerationRunStatus.RUNNING,
         baseRevisionId: null,
       },
     });
 
-    const rev1 = await createProjectRevision({
+    const finalizationResultV1 = await finalizeGenerationSuccess({
       projectId: testProjectId,
       generationRunId: genRun1.id,
-      parentRevisionId: null,
-      expectedCurrentRevisionId: null,
-      title: "V1: Sourdough Bakery Initial Build",
+      baseRevisionId: null,
+      fragmentTitle: "V1: Sourdough Bakery Initial Build",
       summary: v1Implementation.summary,
       files: snapshotV1.files,
+      sandboxUrl: `http://${sandbox.getHost(3000)}`,
     });
+    const rev1 = finalizationResultV1.revision;
 
-    console.log(`  ✓ Revision V${rev1.revisionNumber} persisted (ID: ${rev1.id}, promoted: ${rev1.promoted}).`);
+    console.log(`  ✓ Revision V${rev1.revisionNumber} persisted (ID: ${rev1.id}, promoted: ${finalizationResultV1.promoted}).`);
 
     // -------------------------------------------------------------------------
     // STEP 6: Modification-Aware Planning & Follow-up Prompt
@@ -347,24 +351,26 @@ async function main() {
     const snapshotV2 = await captureSandboxSnapshot(sandbox.sandboxId);
     const genRun2 = await prisma.generationRun.create({
       data: {
+        id: `run_e2e_v2_${Date.now()}`,
         projectId: testProjectId,
         userId: testUserId,
         prompt: followUpPrompt,
-        status: GenerationRunStatus.COMPLETED,
+        status: GenerationRunStatus.RUNNING,
         baseRevisionId: rev1.id,
       },
     });
 
-    const rev2 = await createProjectRevision({
+    const finalizationResultV2 = await finalizeGenerationSuccess({
       projectId: testProjectId,
       generationRunId: genRun2.id,
-      parentRevisionId: rev1.id,
-      expectedCurrentRevisionId: rev1.id,
-      title: "V2: Workshop Registration Form Addition",
+      baseRevisionId: rev1.id,
+      fragmentTitle: "V2: Workshop Registration Form Addition",
       summary: v2Implementation.summary,
       files: snapshotV2.files,
+      sandboxUrl: `http://${sandbox.getHost(3000)}`,
     });
-    console.log(`  ✓ Revision V${rev2.revisionNumber} persisted (ID: ${rev2.id}, promoted: ${rev2.promoted}).`);
+    const rev2 = finalizationResultV2.revision;
+    console.log(`  ✓ Revision V${rev2.revisionNumber} persisted (ID: ${rev2.id}, promoted: ${finalizationResultV2.promoted}).`);
 
     // -------------------------------------------------------------------------
     // STEP 8: Historical Revision Restoration (Cloning Without Mutation)
@@ -497,40 +503,46 @@ async function main() {
     console.log("  ✓ Standalone production build succeeded (exit code 0).");
 
     // -------------------------------------------------------------------------
-    // STEP 11: Production Orchestration Failure Simulation
+    // STEP 11: Production QA Failure & Finalization Simulation
     // -------------------------------------------------------------------------
-    console.log("\n▶ Step 11: Simulating Production Failure Through Orchestration State Machine...");
+    console.log("\n▶ Step 11: Production QA Failure & Finalization Simulation...");
+    const failedRunId = `run_e2e_fail_${Date.now()}`;
     const failedRun = await prisma.generationRun.create({
       data: {
+        id: failedRunId,
         projectId: testProjectId,
         userId: testUserId,
         prompt: "Intentional syntax error test",
         status: GenerationRunStatus.RUNNING,
+        baseRevisionId: rev3.id,
       },
     });
 
-    // Transition via production state machine
-    await transitionRun(failedRun.id, GenerationRunStatus.FAILED, {
-      errorCode: "QA_VERIFICATION_FAILED",
-      errorMessage: "Simulated sandbox build failure during QA gate",
+    // Run real QA inspector against broken source files
+    const qaReportFail = await runQAInspector({
+      files: { "app/page.tsx": "export default function () { return <div>Broken" },
+      summary: "Broken files",
+      sandboxId: "",
+      runSandboxCommands: false,
     });
 
-    // Attempting CAS promotion with wrong expected revision must be rejected
-    const failedRevisionAttempt = await createProjectRevision({
+    // Finalize failure through production finalizeGenerationFailure service
+    const failFinalizeResult = await finalizeGenerationFailure({
       projectId: testProjectId,
       generationRunId: failedRun.id,
-      parentRevisionId: rev2.id,
-      expectedCurrentRevisionId: rev2.id, // rev3 is now current, so rev2 must fail CAS!
-      title: "Broken Revision Attempt",
-      summary: "This revision should not be promoted",
-      files: { "app/page.tsx": "broken syntax" },
+      errorCode: "QA_VERIFICATION_FAILED",
+      errorMessage: qaReportFail.repairInstructions || "Validation checks failed: syntax error in page",
     });
 
-    if (failedRevisionAttempt.promoted) {
-      throw new Error("CAS race guard failed: Outdated revision attempt was promoted");
+    // Verify GenerationRun transitioned to FAILED
+    const persistedFailedRun = await prisma.generationRun.findUnique({
+      where: { id: failedRun.id },
+    });
+    if (persistedFailedRun?.status !== GenerationRunStatus.FAILED) {
+      throw new Error(`Expected run status to be FAILED, got ${persistedFailedRun?.status}`);
     }
 
-    // Verify currentRevisionId remains set to rev3
+    // Verify currentRevisionId remains strictly set to rev3 (prior working revision preserved)
     const currentProject = await prisma.project.findUnique({
       where: { id: testProjectId },
       select: { currentRevisionId: true },
@@ -539,7 +551,27 @@ async function main() {
     if (currentProject?.currentRevisionId !== rev3.id) {
       throw new Error(`Project pointer corruption: expected ${rev3.id}, found ${currentProject?.currentRevisionId}`);
     }
-    console.log(`  ✓ Verified: Failed run (${failedRun.id}) properly handled via orchestration state machine. Pointer intact (${rev3.id}).`);
+
+    // Verify error message was created with 1:1 generationRunId association
+    const errorMessage = await prisma.message.findUnique({
+      where: { generationRunId: failedRun.id },
+    });
+    if (!errorMessage || errorMessage.type !== "ERROR") {
+      throw new Error("Expected failure error message linked to generationRunId");
+    }
+
+    // Verify idempotent replay of failure delivery does not create duplicate records
+    const replayFailResult = await finalizeGenerationFailure({
+      projectId: testProjectId,
+      generationRunId: failedRun.id,
+      errorCode: "QA_VERIFICATION_FAILED",
+      errorMessage: "Duplicate delivery attempt",
+    });
+    if (replayFailResult.messageId !== failFinalizeResult.messageId) {
+      throw new Error("Idempotent replay of failure did not return original messageId");
+    }
+
+    console.log(`  ✓ Verified: Failed run (${failedRun.id}) properly finalized via production failure service. Pointer intact (${rev3.id}).`);
 
     console.log("\n================================================================================");
     console.log("STATUS: [SUCCESS] All 11 Genuine Product End-to-End Flows Passed!");

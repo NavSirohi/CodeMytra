@@ -66,6 +66,9 @@ model Message {
   projectId String
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
+  generationRunId String?        @unique
+  generationRun   GenerationRun? @relation(fields: [generationRunId], references: [id], onDelete: SetNull)
+
   fragments Fragment?
 
   @@index([projectId, createdAt])
@@ -117,6 +120,7 @@ model GenerationRun {
   revisions ProjectRevision[]
   tasks     AgentTask[]
   events    RunEvent[]
+  message   Message?
 
   @@index([projectId, createdAt])
   @@index([status, createdAt])

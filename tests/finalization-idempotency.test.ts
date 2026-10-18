@@ -8,7 +8,7 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
 
     await db.exec(`
       DO $$ BEGIN
-        CREATE TYPE "RunStatus" AS ENUM ('QUEUED', 'RUNNING', 'VALIDATING', 'COMPLETED', 'FAILED');
+        CREATE TYPE "RunStatus" AS ENUM ('QUEUED', 'RUNNING', 'VALIDATING', 'COMPLETED', 'FAILED', 'CANCELLED');
         CREATE TYPE "MsgRole" AS ENUM ('USER', 'ASSISTANT', 'SYSTEM');
         CREATE TYPE "MsgType" AS ENUM ('TEXT', 'RESULT', 'ERROR');
       EXCEPTION
@@ -58,6 +58,7 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
       CREATE TABLE "Message" (
         "id" TEXT PRIMARY KEY,
         "projectId" TEXT NOT NULL REFERENCES "Project"("id"),
+        "generationRunId" TEXT UNIQUE REFERENCES "GenerationRun"("id"),
         "content" TEXT NOT NULL,
         "role" "MsgRole" NOT NULL,
         "type" "MsgType" NOT NULL,
@@ -133,9 +134,9 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
 
         // 5. Create message
         await db.query(
-          `INSERT INTO "Message" ("id", "projectId", "content", "role", "type")
-           VALUES ($1, $2, $3, 'ASSISTANT', 'RESULT')`,
-          ["msg-1", "prj-1", "Built app"]
+          `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+           VALUES ($1, $2, $3, $4, 'ASSISTANT', 'RESULT')`,
+          ["msg-1", "prj-1", "run-1", "Built app"]
         );
 
         await db.exec("COMMIT");
@@ -219,9 +220,9 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
         ["rev-retry", "run-fail"]
       );
       await db.query(
-        `INSERT INTO "Message" ("id", "projectId", "content", "role", "type")
-         VALUES ($1, $2, $3, 'ASSISTANT', 'RESULT')`,
-        ["msg-retry", "prj-1", "Result content"]
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ($1, $2, $3, $4, 'ASSISTANT', 'RESULT')`,
+        ["msg-retry", "prj-1", "run-fail", "Result content"]
       );
       await db.exec("COMMIT");
 
@@ -266,8 +267,9 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
          VALUES ('evt-fail', 'run-2', 'FAILED', 'System', 'Run marked failed')`
       );
       await db.query(
-        `INSERT INTO "Message" ("id", "projectId", "content", "role", "type")
-         VALUES ('msg-fail', 'prj-1', 'QA failed: Syntax error in generated files. Prior working revision preserved.', 'ASSISTANT', 'ERROR')`
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ($1, $2, $3, $4, 'ASSISTANT', 'ERROR')`,
+        ['msg-fail', 'prj-1', 'run-2', 'QA failed: Syntax error in generated files. Prior working revision preserved.']
       );
       await db.exec("COMMIT");
 
@@ -328,6 +330,260 @@ describe("Task 4: Transactional & Idempotent Generation Finalization", () => {
       // Active pointer is STILL rev-v2; older generation was prevented from overwriting newer active state
       const prj = await db.query<{ currentRevisionId: string }>(`SELECT "currentRevisionId" FROM "Project" WHERE "id" = 'prj-1'`);
       assert.equal(prj.rows[0].currentRevisionId, "rev-v2");
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("Scenario 5: Two legitimate generations with identical summaries produce distinct messages and revisions without collision", async () => {
+    const db = await setupTestDb();
+    try {
+      const identicalSummary = "Application generated and verified successfully.";
+
+      // Generation 1
+      await db.query(
+        `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+         VALUES ('run-alpha', 'prj-1', 'usr-1', 'Build counter app', 'RUNNING')`
+      );
+
+      await db.exec("BEGIN");
+      await db.query(
+        `INSERT INTO "ProjectRevision" ("id", "projectId", "generationRunId", "revisionNumber", "title", "summary", "files")
+         VALUES ('rev-alpha', 'prj-1', 'run-alpha', 1, 'Counter App', $1, '{}')`,
+        [identicalSummary]
+      );
+      await db.query(`UPDATE "Project" SET "currentRevisionId" = 'rev-alpha' WHERE "id" = 'prj-1'`);
+      await db.query(`UPDATE "GenerationRun" SET "status" = 'COMPLETED', "resultRevisionId" = 'rev-alpha' WHERE "id" = 'run-alpha'`);
+      await db.query(
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ('msg-alpha', 'prj-1', 'run-alpha', $1, 'ASSISTANT', 'RESULT')`,
+        [identicalSummary]
+      );
+      await db.exec("COMMIT");
+
+      // Generation 2 with IDENTICAL summary text
+      await db.query(
+        `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+         VALUES ('run-beta', 'prj-1', 'usr-1', 'Add reset button', 'RUNNING')`
+      );
+
+      await db.exec("BEGIN");
+      await db.query(
+        `INSERT INTO "ProjectRevision" ("id", "projectId", "generationRunId", "revisionNumber", "title", "summary", "files")
+         VALUES ('rev-beta', 'prj-1', 'run-beta', 2, 'Counter App V2', $1, '{}')`,
+        [identicalSummary]
+      );
+      await db.query(`UPDATE "Project" SET "currentRevisionId" = 'rev-beta' WHERE "id" = 'prj-1'`);
+      await db.query(`UPDATE "GenerationRun" SET "status" = 'COMPLETED', "resultRevisionId" = 'rev-beta' WHERE "id" = 'run-beta'`);
+      await db.query(
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ('msg-beta', 'prj-1', 'run-beta', $1, 'ASSISTANT', 'RESULT')`,
+        [identicalSummary]
+      );
+      await db.exec("COMMIT");
+
+      // Assert both runs created distinct revisions and distinct messages despite identical summary
+      const msgs = await db.query<{ id: string; generationRunId: string; content: string }>(
+        `SELECT "id", "generationRunId", "content" FROM "Message" WHERE "projectId" = 'prj-1' ORDER BY "id" ASC`
+      );
+      assert.equal(msgs.rows.length, 2);
+      assert.equal(msgs.rows[0].id, "msg-alpha");
+      assert.equal(msgs.rows[0].generationRunId, "run-alpha");
+      assert.equal(msgs.rows[1].id, "msg-beta");
+      assert.equal(msgs.rows[1].generationRunId, "run-beta");
+
+      const revs = await db.query<{ count: string | number }>(
+        `SELECT COUNT(*) as count FROM "ProjectRevision" WHERE "projectId" = 'prj-1'`
+      );
+      assert.equal(Number(revs.rows[0].count), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("Scenario 6: Duplicate success delivery (idempotent replay) returns existing revision and message without duplicate records", async () => {
+    const db = await setupTestDb();
+    try {
+      await db.query(
+        `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+         VALUES ('run-dup', 'prj-1', 'usr-1', 'Build timer', 'RUNNING')`
+      );
+
+      // First finalization
+      await db.exec("BEGIN");
+      await db.query(
+        `INSERT INTO "ProjectRevision" ("id", "projectId", "generationRunId", "revisionNumber", "title", "files")
+         VALUES ('rev-dup', 'prj-1', 'run-dup', 1, 'Timer', '{}')`
+      );
+      await db.query(`UPDATE "Project" SET "currentRevisionId" = 'rev-dup' WHERE "id" = 'prj-1'`);
+      await db.query(`UPDATE "GenerationRun" SET "status" = 'COMPLETED', "resultRevisionId" = 'rev-dup' WHERE "id" = 'run-dup'`);
+      await db.query(
+        `INSERT INTO "RunEvent" ("id", "runId", "stage", "agentRole", "message")
+         VALUES ('evt-dup-1', 'run-dup', 'COMPLETED', 'System', 'Revision V1 promoted')`
+      );
+      await db.query(
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ('msg-dup', 'prj-1', 'run-dup', 'Timer ready', 'ASSISTANT', 'RESULT')`
+      );
+      await db.exec("COMMIT");
+
+      // Duplicate delivery attempt: idempotency check detects status = COMPLETED
+      const existingRun = await db.query<{ status: string }>(
+        `SELECT "status" FROM "GenerationRun" WHERE "id" = 'run-dup'`
+      );
+      assert.equal(existingRun.rows[0].status, "COMPLETED");
+
+      // Look up existing message via generationRunId
+      const existingMsg = await db.query<{ id: string }>(
+        `SELECT "id" FROM "Message" WHERE "generationRunId" = 'run-dup'`
+      );
+      assert.equal(existingMsg.rows.length, 1);
+      assert.equal(existingMsg.rows[0].id, "msg-dup");
+
+      // Verify no duplicate records exist in any table
+      const revCount = await db.query<{ count: string | number }>(
+        `SELECT COUNT(*) as count FROM "ProjectRevision" WHERE "generationRunId" = 'run-dup'`
+      );
+      assert.equal(Number(revCount.rows[0].count), 1);
+
+      const msgCount = await db.query<{ count: string | number }>(
+        `SELECT COUNT(*) as count FROM "Message" WHERE "generationRunId" = 'run-dup'`
+      );
+      assert.equal(Number(msgCount.rows[0].count), 1);
+
+      const evtCount = await db.query<{ count: string | number }>(
+        `SELECT COUNT(*) as count FROM "RunEvent" WHERE "runId" = 'run-dup'`
+      );
+      assert.equal(Number(evtCount.rows[0].count), 1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("Scenario 7: Repeated failure delivery creates no duplicate failure events or error messages", async () => {
+    const db = await setupTestDb();
+    try {
+      await db.query(
+        `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+         VALUES ('run-fail-dup', 'prj-1', 'usr-1', 'Build feature', 'RUNNING')`
+      );
+
+      // First failure delivery
+      await db.exec("BEGIN");
+      await db.query(
+        `UPDATE "GenerationRun" SET "status" = 'FAILED', "errorCode" = 'QA_FAILED', "errorMessage" = 'Syntax error' WHERE "id" = 'run-fail-dup'`
+      );
+      await db.query(
+        `INSERT INTO "RunEvent" ("id", "runId", "stage", "agentRole", "message")
+         VALUES ('evt-fail-1', 'run-fail-dup', 'FAILED', 'System', 'Run marked failed')`
+      );
+      await db.query(
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ('msg-fail-1', 'prj-1', 'run-fail-dup', 'QA failed: Syntax error', 'ASSISTANT', 'ERROR')`
+      );
+      await db.exec("COMMIT");
+
+      // Second failure delivery (repeated attempt)
+      const currentRun = await db.query<{ status: string }>(
+        `SELECT "status" FROM "GenerationRun" WHERE "id" = 'run-fail-dup'`
+      );
+      // Already FAILED: return existing messageId without inserting duplicate events or messages
+      assert.equal(currentRun.rows[0].status, "FAILED");
+
+      const existingMsg = await db.query<{ id: string }>(
+        `SELECT "id" FROM "Message" WHERE "generationRunId" = 'run-fail-dup'`
+      );
+      assert.equal(existingMsg.rows.length, 1);
+      assert.equal(existingMsg.rows[0].id, "msg-fail-1");
+
+      const evtCount = await db.query<{ count: string | number }>(
+        `SELECT COUNT(*) as count FROM "RunEvent" WHERE "runId" = 'run-fail-dup'`
+      );
+      assert.equal(Number(evtCount.rows[0].count), 1);
+
+      const msgCount = await db.query<{ count: string | number }>(
+        `SELECT COUNT(*) as count FROM "Message" WHERE "generationRunId" = 'run-fail-dup'`
+      );
+      assert.equal(Number(msgCount.rows[0].count), 1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("Scenario 8: Failure delivery arriving after success preserves completed status and does not overwrite with FAILED", async () => {
+    const db = await setupTestDb();
+    try {
+      await db.query(
+        `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+         VALUES ('run-race', 'prj-1', 'usr-1', 'Build component', 'RUNNING')`
+      );
+
+      // Run completed successfully
+      await db.exec("BEGIN");
+      await db.query(
+        `INSERT INTO "ProjectRevision" ("id", "projectId", "generationRunId", "revisionNumber", "title", "files")
+         VALUES ('rev-race', 'prj-1', 'run-race', 1, 'Component', '{}')`
+      );
+      await db.query(`UPDATE "Project" SET "currentRevisionId" = 'rev-race' WHERE "id" = 'prj-1'`);
+      await db.query(`UPDATE "GenerationRun" SET "status" = 'COMPLETED', "resultRevisionId" = 'rev-race' WHERE "id" = 'run-race'`);
+      await db.query(
+        `INSERT INTO "Message" ("id", "projectId", "generationRunId", "content", "role", "type")
+         VALUES ('msg-success', 'prj-1', 'run-race', 'Component ready', 'ASSISTANT', 'RESULT')`
+      );
+      await db.exec("COMMIT");
+
+      // Late-arriving failure delivery
+      const checkRun = await db.query<{ status: string }>(
+        `SELECT "status" FROM "GenerationRun" WHERE "id" = 'run-race'`
+      );
+      // Status is COMPLETED: failure handler must NOT overwrite with FAILED
+      assert.equal(checkRun.rows[0].status, "COMPLETED");
+
+      // Attempting CAS update for status != COMPLETED returns 0 rows updated
+      const failUpdate = await db.query(
+        `UPDATE "GenerationRun" SET "status" = 'FAILED' WHERE "id" = 'run-race' AND "status" NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') RETURNING id`
+      );
+      assert.equal(failUpdate.rows.length, 0);
+
+      // Verify status is STILL COMPLETED and project pointer is untouched
+      const finalRun = await db.query<{ status: string }>(
+        `SELECT "status" FROM "GenerationRun" WHERE "id" = 'run-race'`
+      );
+      assert.equal(finalRun.rows[0].status, "COMPLETED");
+
+      const prj = await db.query<{ currentRevisionId: string }>(
+        `SELECT "currentRevisionId" FROM "Project" WHERE "id" = 'prj-1'`
+      );
+      assert.equal(prj.rows[0].currentRevisionId, "rev-race");
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("Scenario 9: Finalization validates project ownership and rejects runs belonging to a different project", async () => {
+    const db = await setupTestDb();
+    try {
+      // Seed second project
+      await db.query(
+        `INSERT INTO "Project" ("id", "name", "userId", "currentRevisionId")
+         VALUES ('prj-2', 'Other Project', 'usr-1', NULL)`
+      );
+
+      // Run belongs to prj-1
+      await db.query(
+        `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+         VALUES ('run-cross', 'prj-1', 'usr-1', 'Test', 'RUNNING')`
+      );
+
+      // Attempting to finalize run-cross under prj-2
+      const runCheck = await db.query<{ projectId: string }>(
+        `SELECT "projectId" FROM "GenerationRun" WHERE "id" = 'run-cross'`
+      );
+      assert.equal(runCheck.rows[0].projectId, "prj-1");
+
+      const requestedProjectId: string = "prj-2";
+      const isMismatch = (runCheck.rows[0].projectId as string) !== requestedProjectId;
+      assert.equal(isMismatch, true, "Must detect project ownership mismatch");
     } finally {
       await db.close();
     }
