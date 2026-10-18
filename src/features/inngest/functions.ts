@@ -2,11 +2,10 @@ import { prisma } from "@/lib/db";
 import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
 import { MessageRole, MessageType, GenerationRunStatus, Prisma } from "@/generated/prisma/client";
-import { createAgent, createNetwork, createState, createTool } from "@inngest/agent-kit";
+import { createAgent } from "@inngest/agent-kit";
 import { getGeminiModel } from "@/server/providers/gemini";
 import { FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
-import z from "zod";
-import { agentOutputText, connectSandbox, lastAssistantTextMessageContent } from "./utils";
+import { agentOutputText, connectSandbox } from "./utils";
 import { transitionRun } from "@/server/orchestration/state-machine";
 import {
   createProjectRevision,
@@ -21,6 +20,11 @@ import { runArchitectureAgent, saveArchitectureSpec } from "@/server/agents/arch
 import { runQAInspector } from "@/server/agents/qa";
 import { captureSandboxSnapshot } from "@/server/orchestration/sandbox-snapshot";
 import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
+import { runCodingAgent } from "@/server/agents/coder";
+import {
+  initializeSandboxWorkspace,
+  resolveWorkspacePath,
+} from "@/server/orchestration/workspace";
 
 export interface CodeAgentState {
   sandboxId: string;
@@ -226,23 +230,28 @@ export const codeAgentFunction = inngest.createFunction(
         template: getE2BTemplateId(),
       });
 
-      // 2. Restore files from base revision
+      // Initialize authoritative project workspace inside sandbox
+      await initializeSandboxWorkspace(sandbox);
+
+      // 2. Restore files from base revision into authoritative project workspace
       const fileEntries = Object.entries(baseFiles);
       if (fileEntries.length > 0) {
         for (const [filePath, content] of fileEntries) {
           try {
-            await sandbox.files.write(filePath, content);
+            const targetPath = resolveWorkspacePath(filePath);
+            await sandbox.files.write(targetPath, content);
           } catch (writeError) {
-            throw new RestorationError(`Failed to restore file ${filePath} into sandbox: ${String(writeError)}`);
+            throw new RestorationError(`Failed to restore file ${filePath} into sandbox workspace: ${String(writeError)}`);
           }
         }
 
         // 3. Verify restoration completeness
         for (const [filePath] of fileEntries) {
           try {
-            await sandbox.files.read(filePath);
+            const targetPath = resolveWorkspacePath(filePath);
+            await sandbox.files.read(targetPath);
           } catch {
-            throw new RestorationError(`Completeness check failed: Restored file ${filePath} could not be read`);
+            throw new RestorationError(`Completeness check failed: Restored file ${filePath} could not be read from workspace`);
           }
         }
       }
@@ -267,197 +276,26 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 5: IMPLEMENTATION (Coding Agent with Injected Specifications)
+    // STAGE 5: IMPLEMENTATION (Authoritative Coding Agent Engine)
     // ─────────────────────────────────────────────────────────────────────────
-    const state = createState<CodeAgentState>(
-      { sandboxId, summary: "", files: { ...baseFiles } },
-      { messages: previousMessages }
-    );
-
-    const geminiModel = getGeminiModel({
-      model: "gemini-2.5-flash",
+    const { summary, files } = await runCodingAgent({
+      sandboxId,
+      prompt: promptValue,
+      prd,
+      designSpec,
+      architectureSpec: archSpec,
+      baseFiles,
+      previousMessages,
+      step,
     });
-
-    // Comprehensive contextual prompt incorporating PRD, Design, and Architecture
-    const contextEnhancedPrompt = `
-You are the Lead Full-Stack Code Implementation Agent for CodeMytra.
-Build a complete, working, interactive Next.js application adhering strictly to the approved specifications.
-
-=== APPROVED PRODUCT REQUIREMENTS ===
-Project: ${prd.projectName}
-Summary: ${prd.summary}
-Target Audience: ${prd.targetAudience}
-
-Pages to implement:
-${prd.pages.map((p) => `- ${p.route} (${p.title}): ${p.purpose} [Components: ${p.keyComponents?.join(", ") || "Main"}]`).join("\n")}
-
-Data Entities:
-${prd.dataEntities?.length ? prd.dataEntities.map((e) => `- ${e.name}: fields=[${e.fields.join(", ")}], relationships=[${e.relationships?.join(", ") || "none"}]`).join("\n") : "None specified"}
-
-User Flows:
-${prd.userFlows?.length ? prd.userFlows.map((f) => `- ${f.name}: ${f.steps.join(" -> ")}`).join("\n") : "Standard user journey"}
-
-=== DESIGN SPECIFICATION ===
-Theme: ${designSpec.aestheticTheme}
-Primary: ${designSpec.colorPalette.primary} | Secondary: ${designSpec.colorPalette.secondary} | Surface: ${designSpec.colorPalette.surface} | Text: ${designSpec.colorPalette.text}
-Font: ${designSpec.typography.headingFont} / ${designSpec.typography.bodyFont}
-Layout: ${designSpec.layoutStyle}
-
-=== ARCHITECTURE SPECIFICATION ===
-Routes & Endpoints:
-${archSpec.routeEndpoints.map((r) => `- [${r.type.toUpperCase()}] ${r.path}: ${r.purpose}`).join("\n")}
-
-Database Models:
-${archSpec.databaseModels?.length ? archSpec.databaseModels.map((m) => `- ${m.modelName} (${m.fields.join(", ")})`).join("\n") : "In-memory / client state"}
-
-File Boundaries:
-- Frontend: ${archSpec.fileOwnership.frontend.join(", ")}
-- Backend: ${archSpec.fileOwnership.backend.join(", ")}
-- Database: ${archSpec.fileOwnership.database.join(", ")}
-
-=== FULL-STACK IMPLEMENTATION RULES ===
-1. Use the "createOrUpdateFiles" tool to write clean, complete, working React/Next.js components.
-2. Put the primary landing content and user interface in app/page.tsx.
-3. For applications requiring backend data operations:
-   - Provide route handlers in app/api/**/route.ts (or server actions).
-   - If managing data entities, provide a robust data layer (e.g. lib/db.ts or in-memory repository with initial realistic seed data so the app is instantly usable upon preview).
-4. Use Tailwind CSS with clean, accessible classes matching the design token colors.
-5. Do NOT import non-existent external npm packages.
-6. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
-`;
-
-    const codeAgent = createAgent({
-      name: "code-agent",
-      description: "Expert full-stack implementation agent",
-      system: contextEnhancedPrompt,
-      model: geminiModel,
-      tools: [
-        // 1. Terminal
-        createTool({
-          name: "terminal",
-          description: "Use the terminal to run allowed commands",
-          parameters: z.object({
-            command: z.string(),
-          }),
-          handler: async ({ command }, { step }) => {
-            return await step?.run("terminal", async () => {
-              const buffers = { stdout: "", stderr: "" };
-
-              try {
-                const sandbox = await Sandbox.connect(sandboxId);
-                const result = await sandbox.commands.run(command, {
-                  onStdout: (data) => {
-                    buffers.stdout += data;
-                  },
-                  onStderr: (data) => {
-                    buffers.stderr += data;
-                  },
-                });
-
-                return result.stdout;
-              } catch (error) {
-                return `Command failed: ${error} \n stdout: ${buffers.stdout}\n stderr: ${buffers.stderr}`;
-              }
-            });
-          },
-        }),
-
-        // 2. createOrUpdateFiles
-        createTool({
-          name: "createOrUpdateFiles",
-          description: "Create or update files in the sandbox",
-          parameters: z.object({
-            files: z.array(
-              z.object({
-                path: z.string(),
-                content: z.string(),
-              })
-            ),
-          }),
-          handler: async ({ files }, { step, network }) => {
-            const newFiles = await step?.run("createOrUpdateFiles", async () => {
-              try {
-                const updatedFiles = network?.state?.data.files || {};
-                const sandbox = await Sandbox.connect(sandboxId);
-
-                for (const file of files) {
-                  await sandbox.files.write(file.path, file.content);
-                  updatedFiles[file.path] = file.content;
-                }
-
-                return updatedFiles;
-              } catch (error) {
-                return "Error: " + error;
-              }
-            });
-
-            if (typeof newFiles === "object" && newFiles !== null && network?.state?.data) {
-              network.state.data.files = newFiles as Record<string, string>;
-            }
-          },
-        }),
-
-        // 3. readFiles
-        createTool({
-          name: "readFiles",
-          description: "Read files from the sandbox",
-          parameters: z.object({
-            files: z.array(z.string()),
-          }),
-          handler: async ({ files }, { step }) => {
-            return await step?.run("readFiles", async () => {
-              try {
-                const sandbox = await Sandbox.connect(sandboxId);
-                const contents: Array<{ path: string; content: string }> = [];
-
-                for (const file of files) {
-                  const content = await sandbox.files.read(file);
-                  contents.push({ path: file, content });
-                }
-                return JSON.stringify(contents);
-              } catch (error) {
-                return "Error: " + error;
-              }
-            });
-          },
-        }),
-      ],
-
-      lifecycle: {
-        onResponse: async ({ result, network }) => {
-          const lastAssistantMessageText =
-            lastAssistantTextMessageContent(result);
-
-          if (lastAssistantMessageText && network) {
-            if (lastAssistantMessageText.includes("<task_summary>")) {
-              network.state.data.summary = lastAssistantMessageText;
-            }
-          }
-
-          return result;
-        },
-      },
-    });
-
-    const network = createNetwork({
-      name: "code-agent-network",
-      agents: [codeAgent],
-      maxIter: 15,
-      router: async ({ network }) => {
-        const summary = network.state.data.summary;
-        if (summary) {
-          return;
-        }
-        return codeAgent;
-      },
-    });
-
-    const result = await network.run(promptValue, { state });
-    const { summary, files } = result.state.data;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 6: TITLE & RESPONSE TEXT HELPERS
     // ─────────────────────────────────────────────────────────────────────────
+    const geminiModel = getGeminiModel({
+      model: "gemini-2.5-flash",
+    });
+
     const makeTextAgent = (name: string, system: string) =>
       createAgent({ name, system, model: geminiModel });
 
@@ -515,13 +353,21 @@ Ensure all TypeScript and Next.js compiler errors are resolved.
 Conclude with an updated <task_summary>...</task_summary>.
 `;
         try {
-          const repairResult = await network.run(repairPrompt, { state });
-          if (repairResult.state.data.files) {
-            currentFiles = repairResult.state.data.files;
-          }
-          if (repairResult.state.data.summary) {
-            currentSummary = repairResult.state.data.summary;
-          }
+          const repairResult = await runCodingAgent({
+            sandboxId,
+            prompt: repairPrompt,
+            prd,
+            designSpec,
+            architectureSpec: archSpec,
+            baseFiles: currentFiles,
+            previousMessages: [
+              { role: "user", content: promptValue },
+              { role: "assistant", content: currentSummary },
+            ],
+            step,
+          });
+          currentFiles = repairResult.files;
+          currentSummary = repairResult.summary;
 
           // Re-verify after repair attempt
           report = await runQAInspector({

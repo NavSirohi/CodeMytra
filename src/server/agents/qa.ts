@@ -1,6 +1,7 @@
 import { QAReport, QAReportSchema, QACheckCategory } from "@/server/agent-contracts/schemas";
 import path from "path";
 import { Sandbox } from "@e2b/code-interpreter";
+import { PROJECT_WORKSPACE_DIR } from "@/server/orchestration/workspace";
 
 export interface ValidateProjectOptions {
   files: Record<string, string>;
@@ -153,7 +154,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
       // TypeScript check
       try {
-        const tscResult = await sandbox.commands.run("bun run tsc --noEmit", { timeoutMs: 30000 });
+        const tscResult = await sandbox.commands.run(`cd "${PROJECT_WORKSPACE_DIR}" && bun run tsc --noEmit`, { timeoutMs: 30000 });
         if (tscResult.exitCode === 0) {
           checks.push({
             name: "typescript-validation",
@@ -183,7 +184,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
       // Production build check
       try {
-        const buildResult = await sandbox.commands.run("bun run build", { timeoutMs: 60000 });
+        const buildResult = await sandbox.commands.run(`cd "${PROJECT_WORKSPACE_DIR}" && bun run build`, { timeoutMs: 60000 });
         if (buildResult.exitCode === 0) {
           checks.push({
             name: "production-build",

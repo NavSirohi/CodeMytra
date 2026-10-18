@@ -3,6 +3,10 @@ import path from "path";
 import { Sandbox } from "@e2b/code-interpreter";
 import { runQAInspector } from "../src/server/agents/qa";
 import { captureSandboxSnapshot } from "../src/server/orchestration/sandbox-snapshot";
+import {
+  initializeSandboxWorkspace,
+  resolveWorkspacePath,
+} from "../src/server/orchestration/workspace";
 
 // Load .env or .env.local if present
 function loadEnv() {
@@ -70,6 +74,10 @@ async function main() {
     sandbox = await Sandbox.create({ template: e2bTemplateId });
     console.log(`  ✓ Sandbox container provisioned: ${sandbox.sandboxId}`);
 
+    console.log("  - Initializing project workspace inside container...");
+    await initializeSandboxWorkspace(sandbox);
+    console.log("  ✓ Project workspace initialized at /home/user/workspace.");
+
     console.log("\n▶ Step 2: Writing static Coffee Roastery application code...");
     const samplePage = `"use client";
 import { useState } from "react";
@@ -112,8 +120,8 @@ export default function CoffeeApp() {
 }
 `;
 
-    await sandbox.files.write("app/page.tsx", samplePage);
-    console.log("  ✓ Written app/page.tsx to sandbox filesystem.");
+    await sandbox.files.write(resolveWorkspacePath("app/page.tsx"), samplePage);
+    console.log("  ✓ Written app/page.tsx to sandbox project workspace.");
 
     console.log("\n▶ Step 3: Executing TypeScript validation and production build in sandbox...");
     const qaReport = await runQAInspector({

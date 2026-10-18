@@ -5,9 +5,12 @@ import {
   generateManifest,
   FileTreeManifest,
 } from "./revisions";
+import {
+  PROJECT_WORKSPACE_DIR,
+  toRelativeWorkspacePath,
+} from "./workspace";
 
-export const CANONICAL_WORKSPACE_DIR = "/home/user/workspace";
-export const FALLBACK_WORKSPACE_DIR = "/home/user";
+export const CANONICAL_WORKSPACE_DIR = PROJECT_WORKSPACE_DIR;
 
 export const MAX_SINGLE_FILE_SIZE_BYTES = 1024 * 1024; // 1 MB
 export const MAX_SNAPSHOT_FILES = 2000;
@@ -22,7 +25,6 @@ export class SnapshotError extends Error {
 
 export interface CaptureSnapshotOptions {
   expectedFiles?: string[];
-  workspaceDir?: string;
 }
 
 export interface CaptureSnapshotResult {
@@ -31,10 +33,10 @@ export interface CaptureSnapshotResult {
 }
 
 /**
- * Captures the exact, complete filesystem snapshot from the defined project workspace in the E2B sandbox.
- * Strictly validates path safety, size limits, entrypoint presence, and content hashes.
- * Rejects unsupported/corrupted content and fails fast on malformed paths.
- * Excludes secrets, shell configurations, build caches, and non-workspace home directory files.
+ * Captures the exact, complete filesystem snapshot from the authoritative project workspace in the E2B sandbox.
+ * Operates strictly within PROJECT_WORKSPACE_DIR (/home/user/workspace).
+ * Rejects unsupported/corrupted content and fails fast on malformed or escaping paths.
+ * Excludes secrets, build caches, and non-workspace artifacts.
  * Throws SnapshotError on any failure or incomplete snapshot (never silently falls back).
  */
 export async function captureSandboxSnapshot(
@@ -48,19 +50,19 @@ export async function captureSandboxSnapshot(
     throw new SnapshotError(`Failed to connect to sandbox for snapshot: ${String(err)}`);
   }
 
-  // Determine active project workspace directory: prefer /home/user/workspace if present, fallback to /home/user
-  let targetWorkspaceDir = options.workspaceDir || CANONICAL_WORKSPACE_DIR;
+  // Verify that the authoritative project workspace exists
   try {
-    const checkDirRes = await sandbox.commands.run(`test -d "${targetWorkspaceDir}" && echo "EXISTS"`, { timeoutMs: 5000 });
-    if (!checkDirRes.stdout.includes("EXISTS")) {
-      targetWorkspaceDir = FALLBACK_WORKSPACE_DIR;
+    const dirCheck = await sandbox.commands.run(`test -d "${PROJECT_WORKSPACE_DIR}" && echo "EXISTS"`, { timeoutMs: 5000 });
+    if (!dirCheck.stdout.includes("EXISTS")) {
+      throw new SnapshotError(`Authoritative workspace "${PROJECT_WORKSPACE_DIR}" not found in sandbox ${sandboxId}`);
     }
-  } catch {
-    targetWorkspaceDir = FALLBACK_WORKSPACE_DIR;
+  } catch (err) {
+    if (err instanceof SnapshotError) throw err;
+    throw new SnapshotError(`Failed checking workspace directory in sandbox: ${String(err)}`);
   }
 
-  // Strictly exclude non-project files, credentials, shell dotfiles, and build artifacts
-  const findCmd = `find "${targetWorkspaceDir}" -type f ` +
+  // Strictly scan inside the authoritative project workspace directory
+  const findCmd = `find "${PROJECT_WORKSPACE_DIR}" -type f ` +
     `! -path "*/node_modules/*" ` +
     `! -path "*/.next/*" ` +
     `! -path "*/.cache/*" ` +
@@ -69,15 +71,6 @@ export async function captureSandboxSnapshot(
     `! -path "*/.turbo/*" ` +
     `! -path "*/.npm/*" ` +
     `! -path "*/.bun/*" ` +
-    `! -path "*/.local/*" ` +
-    `! -path "*/.config/*" ` +
-    `! -path "*/.gnupg/*" ` +
-    `! -path "*/.ssh/*" ` +
-    `! -name ".bash*" ` +
-    `! -name ".profile" ` +
-    `! -name ".zsh*" ` +
-    `! -name ".wget-hsts" ` +
-    `! -name ".selected_editor" ` +
     `! -name ".env*" ` +
     `! -name "*.pem" ` +
     `! -name "*.key" ` +
@@ -107,7 +100,7 @@ export async function captureSandboxSnapshot(
 
   const filePaths = stdout.trim().split("\n").filter((p) => p.trim().length > 0);
   if (filePaths.length === 0) {
-    throw new SnapshotError("Sandbox project workspace contains zero discovered project files");
+    throw new SnapshotError(`Sandbox project workspace (${PROJECT_WORKSPACE_DIR}) contains zero discovered project files`);
   }
 
   if (filePaths.length > MAX_SNAPSHOT_FILES) {
@@ -115,40 +108,23 @@ export async function captureSandboxSnapshot(
   }
 
   const rawFiles: Record<string, string> = {};
-  const basePrefix = `${targetWorkspaceDir}/`;
   let totalSnapshotBytes = 0;
 
   for (const fullPath of filePaths) {
     const normalizedFullPath = fullPath.trim();
-    if (!normalizedFullPath.startsWith(basePrefix)) {
-      continue;
-    }
 
-    const relativePath = normalizedFullPath.slice(basePrefix.length);
-
-    // Fail immediately on dangerous or invalid paths (never ignore or silently skip)
-    if (
-      !relativePath ||
-      relativePath.startsWith("/") ||
-      relativePath.includes("..") ||
-      relativePath.includes("\\") ||
-      relativePath.includes("\0")
-    ) {
-      throw new SnapshotError(`Invalid path discovered in workspace: "${relativePath}" (path traversal or malformed characters detected)`);
-    }
-
-    // Exclude unrelated home-directory dotfiles if running in fallback home dir
-    if (targetWorkspaceDir === FALLBACK_WORKSPACE_DIR) {
-      const parts = relativePath.split("/");
-      if (parts[0].startsWith(".") && parts[0] !== ".gitignore" && parts[0] !== ".env.example") {
-        continue;
-      }
+    // Enforce that path is strictly within the project workspace
+    let relativePath: string;
+    try {
+      relativePath = toRelativeWorkspacePath(normalizedFullPath);
+    } catch (pathErr) {
+      throw new SnapshotError(`Invalid discovered path in workspace: ${String(pathErr)}`);
     }
 
     try {
       const content = await sandbox.files.read(normalizedFullPath);
 
-      // Reject unsupported non-string or binary content (never replace with empty string)
+      // Reject unsupported non-string or binary content (never silently convert to empty string)
       if (typeof content !== "string") {
         throw new SnapshotError(`Unsupported file content in ${relativePath}: Expected text string, received ${typeof content}`);
       }

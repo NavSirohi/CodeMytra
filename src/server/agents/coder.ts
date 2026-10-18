@@ -1,163 +1,320 @@
-import { getGeminiModel } from "@/server/providers/gemini";
-import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
 import { Sandbox } from "@e2b/code-interpreter";
-import { createAgent } from "@inngest/agent-kit";
-import { agentOutputText } from "@/features/inngest/utils";
+import {
+  createAgent,
+  createTool,
+  createNetwork,
+  createState,
+} from "@inngest/agent-kit";
 import { z } from "zod";
+import { getGeminiModel } from "@/server/providers/gemini";
+import {
+  PRD,
+  DesignSpec,
+  ArchitectureSpec,
+} from "@/server/agent-contracts/schemas";
+import {
+  PROJECT_WORKSPACE_DIR,
+  resolveWorkspacePath,
+} from "@/server/orchestration/workspace";
+import {
+  lastAssistantTextMessageContent,
+} from "@/features/inngest/utils";
 
-export const IMPLEMENTATION_PROMPT = `
-You are the Principal Full-Stack Engineer for CodeMytra.
-Your role is to write clean, production-grade Next.js (App Router), TypeScript, and Tailwind CSS applications.
-
-CRITICAL ARCHITECTURE RULES:
-1. Generate complete, working source code for the application.
-2. The main page MUST be located at "app/page.tsx" (using "use client"; for interactivity).
-3. Use Tailwind CSS with clean, modern utility classes matching the design palette.
-4. Include realistic state or seed data so the app is instantly usable upon preview.
-5. Every imported component, style, or helper must be defined in the files array.
-6. NEVER include hardcoded credentials, API keys, or secret tokens.
-7. You MUST respond with a single valid JSON object matching this schema:
-{
-  "files": [
-    {
-      "path": "string",
-      "content": "string"
-    }
-  ],
-  "summary": "string"
+export interface CodeAgentState {
+  sandboxId: string;
+  summary: string;
+  files: Record<string, string>;
 }
-Do NOT wrap your JSON in markdown code blocks (\`\`\`json). Return ONLY the raw valid JSON.
-`;
 
-export const ImplementationOutputSchema = z.object({
-  files: z.array(
-    z.object({
-      path: z.string().min(1),
-      content: z.string(),
-    })
-  ).min(1),
-  summary: z.string().min(1),
-});
+export interface InngestStepLike {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  run: <T>(name: string, fn: () => Promise<T>) => Promise<any>;
+}
 
-export interface ImplementationAgentInput {
+export interface RunCodingAgentOptions {
+  sandboxId: string;
   prompt: string;
   prd: PRD;
   designSpec: DesignSpec;
   architectureSpec: ArchitectureSpec;
-  existingFiles?: Record<string, string> | null;
-  sandboxId?: string;
+  baseFiles?: Record<string, string> | null;
+  previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
+  step?: InngestStepLike;
 }
 
-export interface ImplementationResult {
+export interface CodingAgentResult {
   files: Record<string, string>;
   summary: string;
 }
 
-export class ImplementationError extends Error {
-  constructor(message: string, public readonly rawOutput?: string) {
+export class CodingAgentError extends Error {
+  constructor(message: string, public readonly details?: unknown) {
     super(message);
-    this.name = "ImplementationError";
+    this.name = "CodingAgentError";
   }
 }
 
 /**
- * Runs the CodeMytra Implementation Agent to generate or modify full-stack application code.
- * Integrates PRD, DesignSpec, ArchitectureSpec, and existing files into the prompt.
- * Optionally writes generated files into a connected E2B sandbox.
+ * Builds the authoritative context prompt for the Implementation Agent,
+ * embedding PRD, DesignSpec, ArchitectureSpec, and project rules.
  */
-export async function runImplementationAgent(
-  input: ImplementationAgentInput
-): Promise<ImplementationResult> {
-  const { prompt, prd, designSpec, architectureSpec, existingFiles, sandboxId } = input;
+export function buildContextEnhancedPrompt(
+  prd: PRD,
+  designSpec: DesignSpec,
+  archSpec: ArchitectureSpec
+): string {
+  return `
+You are the Lead Full-Stack Code Implementation Agent for CodeMytra.
+Build a complete, working, interactive Next.js application adhering strictly to the approved specifications.
+All source files must reside in the project workspace (${PROJECT_WORKSPACE_DIR}).
 
-  const model = getGeminiModel({
-    model: "gemini-2.5-pro",
-    temperature: 0.1,
-  });
+=== APPROVED PRODUCT REQUIREMENTS ===
+Project: ${prd.projectName}
+Summary: ${prd.summary}
+Target Audience: ${prd.targetAudience}
 
-  const isFollowUp = Boolean(existingFiles && Object.keys(existingFiles).length > 0);
+Pages to implement:
+${prd.pages.map((p) => `- ${p.route} (${p.title}): ${p.purpose} [Components: ${p.keyComponents?.join(", ") || "Main"}]`).join("\n")}
 
-  let userPrompt = `Application Name: ${prd.projectName}\nSummary: ${prd.summary}\n`;
-  userPrompt += `Target Audience: ${prd.targetAudience}\n`;
-  userPrompt += `Design Theme: ${designSpec.aestheticTheme} (Primary: ${designSpec.colorPalette.primary}, Accent: ${designSpec.colorPalette.accent})\n`;
-  userPrompt += `Typography: ${designSpec.typography.headingFont} / ${designSpec.typography.bodyFont}\n\n`;
+Data Entities:
+${prd.dataEntities?.length ? prd.dataEntities.map((e) => `- ${e.name}: fields=[${e.fields.join(", ")}], relationships=[${e.relationships?.join(", ") || "none"}]`).join("\n") : "None specified"}
 
-  if (isFollowUp) {
-    userPrompt += `FOLLOW-UP MODIFICATION REQUEST:\n"${prompt}"\n\n`;
-    userPrompt += `PRESERVATION REQUIREMENT: You are modifying an existing application. Retain all existing features, catalogs, and functionality while seamlessly adding the requested updates. Do NOT remove prior features.\n\n`;
-    userPrompt += `CURRENT FILES IN PROJECT:\n`;
-    for (const [filePath, content] of Object.entries(existingFiles || {})) {
-      userPrompt += `--- START FILE: ${filePath} ---\n${content}\n--- END FILE: ${filePath} ---\n\n`;
+User Flows:
+${prd.userFlows?.length ? prd.userFlows.map((f) => `- ${f.name}: ${f.steps.join(" -> ")}`).join("\n") : "Standard user journey"}
+
+=== DESIGN SPECIFICATION ===
+Theme: ${designSpec.aestheticTheme}
+Primary: ${designSpec.colorPalette.primary} | Secondary: ${designSpec.colorPalette.secondary} | Surface: ${designSpec.colorPalette.surface} | Text: ${designSpec.colorPalette.text}
+Font: ${designSpec.typography.headingFont} / ${designSpec.typography.bodyFont}
+Layout: ${designSpec.layoutStyle}
+
+=== ARCHITECTURE SPECIFICATION ===
+Routes & Endpoints:
+${archSpec.routeEndpoints.map((r) => `- [${r.type.toUpperCase()}] ${r.path}: ${r.purpose}`).join("\n")}
+
+Database Models:
+${archSpec.databaseModels?.length ? archSpec.databaseModels.map((m) => `- ${m.modelName} (${m.fields.join(", ")})`).join("\n") : "In-memory / client state"}
+
+File Boundaries:
+- Frontend: ${archSpec.fileOwnership.frontend.join(", ")}
+- Backend: ${archSpec.fileOwnership.backend.join(", ")}
+- Database: ${archSpec.fileOwnership.database.join(", ")}
+
+=== FULL-STACK IMPLEMENTATION RULES ===
+1. Use the "createOrUpdateFiles" tool to write clean, complete, working React/Next.js components.
+2. Put the primary landing content and user interface in app/page.tsx (use "use client"; for interactive state).
+3. For applications requiring backend data operations:
+   - Provide route handlers in app/api/**/route.ts (or server actions).
+   - If managing data entities, provide a robust data layer with initial realistic seed data so the app is instantly usable upon preview.
+4. Use Tailwind CSS with clean, accessible classes matching the design token colors.
+5. Do NOT import non-existent external npm packages.
+6. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
+7. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
+`;
+}
+
+/**
+ * Authoritative Implementation Engine for CodeMytra.
+ * Shared by both the customer-facing Inngest workflow and standalone E2E runners.
+ * Executes multi-turn tool calling (terminal, createOrUpdateFiles, readFiles) against the sandbox workspace.
+ */
+export async function runCodingAgent(
+  options: RunCodingAgentOptions
+): Promise<CodingAgentResult> {
+  const {
+    sandboxId,
+    prompt,
+    prd,
+    designSpec,
+    architectureSpec,
+    baseFiles = {},
+    previousMessages = [],
+    step,
+  } = options;
+
+  const runStep = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+    if (step && typeof step.run === "function") {
+      return await step.run(name, fn);
     }
-  } else {
-    userPrompt += `INITIAL BUILD REQUEST:\n"${prompt}"\n\n`;
-    userPrompt += `Required Core Features:\n${prd.coreFeatures.map((f) => `- ${f.name} (${f.priority}): ${f.description}`).join("\n")}\n\n`;
-    userPrompt += `Planned Routes:\n${prd.pages.map((p) => `- ${p.route}: ${p.title} (${p.purpose})`).join("\n")}\n\n`;
-    userPrompt += `Data Models:\n${architectureSpec.databaseModels.map((m) => `- ${m.modelName}: ${m.fields.join(", ")}`).join("\n")}\n\n`;
-    userPrompt += `Route Endpoints:\n${architectureSpec.routeEndpoints.map((r) => `- ${r.path} (${r.type}): ${r.purpose}`).join("\n")}\n`;
-  }
+    return await fn();
+  };
 
-  const agent = createAgent({
-    name: "implementation-agent",
-    description: "Generates full-stack Next.js application code",
-    system: IMPLEMENTATION_PROMPT,
-    model,
+  const initialFiles: Record<string, string> = { ...(baseFiles || {}) };
+
+  const state = createState<CodeAgentState>(
+    { sandboxId, summary: "", files: initialFiles },
+    {
+      messages: previousMessages.map((m) => ({
+        type: "text" as const,
+        role: m.role,
+        content: m.content,
+      })),
+    }
+  );
+
+  const geminiModel = getGeminiModel({
+    model: "gemini-2.5-flash",
   });
 
-  const agentResult = await agent.run(userPrompt);
-  const rawText = agentOutputText(agentResult.output, "").trim();
-  let cleanedText = rawText.trim();
-  if (cleanedText.startsWith("```json")) {
-    cleanedText = cleanedText.slice(7);
-  } else if (cleanedText.startsWith("```")) {
-    cleanedText = cleanedText.slice(3);
-  }
-  if (cleanedText.endsWith("```")) {
-    cleanedText = cleanedText.slice(0, -3);
-  }
-  cleanedText = cleanedText.trim();
+  const systemPrompt = buildContextEnhancedPrompt(
+    prd,
+    designSpec,
+    architectureSpec
+  );
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(cleanedText);
-  } catch (parseErr) {
-    throw new ImplementationError(
-      `Implementation Agent output was not valid JSON: ${String(parseErr)}`,
-      rawText
-    );
-  }
+  const codeAgent = createAgent({
+    name: "code-agent",
+    description: "Authoritative full-stack implementation agent",
+    system: systemPrompt,
+    model: geminiModel,
+    tools: [
+      // 1. Terminal Tool (operates inside project workspace)
+      createTool({
+        name: "terminal",
+        description: `Run allowed terminal commands inside the project workspace (${PROJECT_WORKSPACE_DIR})`,
+        parameters: z.object({
+          command: z.string(),
+        }),
+        handler: async ({ command }) => {
+          return await runStep("terminal", async () => {
+            const buffers = { stdout: "", stderr: "" };
+            try {
+              const sandbox = await Sandbox.connect(sandboxId);
+              // Ensure commands execute inside the project workspace
+              const wrappedCommand = `cd "${PROJECT_WORKSPACE_DIR}" && ${command}`;
+              const result = await sandbox.commands.run(wrappedCommand, {
+                onStdout: (data) => {
+                  buffers.stdout += data;
+                },
+                onStderr: (data) => {
+                  buffers.stderr += data;
+                },
+                timeoutMs: 30000,
+              });
+              return result.stdout || buffers.stdout || "Command completed with zero output.";
+            } catch (error) {
+              return `Command failed: ${error} \n stdout: ${buffers.stdout}\n stderr: ${buffers.stderr}`;
+            }
+          });
+        },
+      }),
 
-  const validation = ImplementationOutputSchema.safeParse(parsed);
-  if (!validation.success) {
-    throw new ImplementationError(
-      `Implementation Agent output failed schema validation: ${validation.error.message}`,
-      rawText
-    );
-  }
+      // 2. createOrUpdateFiles Tool (enforces project workspace boundary and resource limits)
+      createTool({
+        name: "createOrUpdateFiles",
+        description: `Create or update files in the sandbox project workspace (${PROJECT_WORKSPACE_DIR})`,
+        parameters: z.object({
+          files: z.array(
+            z.object({
+              path: z.string(),
+              content: z.string(),
+            })
+          ).min(1).max(50),
+        }),
+        handler: async ({ files }, { network }) => {
+          const updatedFiles = await runStep("createOrUpdateFiles", async () => {
+            try {
+              const currentFiles = network?.state?.data?.files || initialFiles;
+              const sandbox = await Sandbox.connect(sandboxId);
 
-  const fileMap: Record<string, string> = {};
-  // If follow-up, copy existing files as base
-  if (isFollowUp && existingFiles) {
-    Object.assign(fileMap, existingFiles);
-  }
-  for (const f of validation.data.files) {
-    fileMap[f.path] = f.content;
-  }
+              for (const file of files) {
+                // Strict path validation: all files must remain inside project workspace
+                const fullWorkspacePath = resolveWorkspacePath(file.path);
 
-  // If connected sandbox provided, write generated files to sandbox
-  if (sandboxId) {
-    try {
-      const sandbox = await Sandbox.connect(sandboxId);
-      for (const f of validation.data.files) {
-        await sandbox.files.write(f.path, f.content);
+                // Resource limit check per file (1 MB)
+                const fileBytes = Buffer.byteLength(file.content, "utf8");
+                if (fileBytes > 1024 * 1024) {
+                  throw new Error(`File "${file.path}" exceeds maximum size limit of 1 MB`);
+                }
+
+                await sandbox.files.write(fullWorkspacePath, file.content);
+                currentFiles[file.path] = file.content;
+              }
+
+              return currentFiles;
+            } catch (error) {
+              return `Error writing files: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          });
+
+          if (
+            typeof updatedFiles === "object" &&
+            updatedFiles !== null &&
+            network?.state?.data
+          ) {
+            network.state.data.files = updatedFiles as Record<string, string>;
+          }
+        },
+      }),
+
+      // 3. readFiles Tool (reads from project workspace)
+      createTool({
+        name: "readFiles",
+        description: `Read files from the sandbox project workspace (${PROJECT_WORKSPACE_DIR})`,
+        parameters: z.object({
+          files: z.array(z.string()).min(1).max(20),
+        }),
+        handler: async ({ files }) => {
+          return await runStep("readFiles", async () => {
+            try {
+              const sandbox = await Sandbox.connect(sandboxId);
+              const contents: Array<{ path: string; content: string }> = [];
+
+              for (const filePath of files) {
+                const fullWorkspacePath = resolveWorkspacePath(filePath);
+                const content = await sandbox.files.read(fullWorkspacePath);
+                contents.push({ path: filePath, content: typeof content === "string" ? content : "" });
+              }
+
+              return JSON.stringify(contents);
+            } catch (error) {
+              return `Error reading files: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          });
+        },
+      }),
+    ],
+
+    lifecycle: {
+      onResponse: async ({ result, network }) => {
+        const lastText = lastAssistantTextMessageContent(result);
+        if (lastText && network) {
+          if (lastText.includes("<task_summary>")) {
+            network.state.data.summary = lastText;
+          }
+        }
+        return result;
+      },
+    },
+  });
+
+  const network = createNetwork({
+    name: "code-agent-network",
+    agents: [codeAgent],
+    maxIter: 15,
+    router: async ({ network }) => {
+      const summary = network.state.data.summary;
+      if (summary) {
+        return;
       }
-    } catch (writeErr) {
-      throw new ImplementationError(`Failed to write generated files to sandbox ${sandboxId}: ${String(writeErr)}`);
-    }
+      return codeAgent;
+    },
+  });
+
+  const result = await network.run(prompt, { state });
+  const finalSummaryRaw = result.state.data.summary || "";
+  const finalFiles = result.state.data.files || initialFiles;
+
+  let cleanedSummary = finalSummaryRaw;
+  const match = finalSummaryRaw.match(/<task_summary>([\s\S]*?)<\/task_summary>/);
+  if (match) {
+    cleanedSummary = match[1].trim();
+  } else if (!cleanedSummary) {
+    cleanedSummary = `Built ${prd.projectName} with ${Object.keys(finalFiles).length} files adhering to approved PRD and design guidelines.`;
   }
 
   return {
-    files: fileMap,
-    summary: validation.data.summary,
+    files: finalFiles,
+    summary: cleanedSummary,
   };
 }
