@@ -124,6 +124,55 @@ export function PRDViewer({ projectId }: PRDViewerProps) {
                   ))}
                 </div>
               </div>
+
+              {prd.dataEntities && prd.dataEntities.length > 0 && (
+                <div>
+                  <h5 className="font-semibold mb-2 text-foreground">Data Entities</h5>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {prd.dataEntities.map((e, i) => (
+                      <div key={i} className="rounded-lg border p-2.5 bg-muted/30">
+                        <div className="font-medium text-foreground">{e.name}</div>
+                        <div className="flex flex-wrap gap-1 mt-1.5">
+                          {e.fields.map((field, fi) => (
+                            <span key={fi} className="px-1.5 py-0.2 rounded bg-background border font-mono text-[10px]">
+                              {field}
+                            </span>
+                          ))}
+                        </div>
+                        {e.relationships && e.relationships.length > 0 && (
+                          <div className="text-[10px] text-muted-foreground mt-1.5 italic">
+                            Rel: {e.relationships.join(", ")}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {prd.userFlows && prd.userFlows.length > 0 && (
+                <div>
+                  <h5 className="font-semibold mb-2 text-foreground">User Journeys</h5>
+                  <div className="space-y-2">
+                    {prd.userFlows.map((f, i) => (
+                      <div key={i} className="rounded-lg border p-2.5 bg-muted/30">
+                        <div className="font-medium mb-1.5">{f.name}</div>
+                        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                          {f.steps.map((step, si) => (
+                            <div key={si} className="flex items-center gap-1">
+                              <span className="size-4 rounded-full bg-primary/20 text-primary text-[10px] flex items-center justify-center font-bold">
+                                {si + 1}
+                              </span>
+                              <span className="text-foreground/80">{step}</span>
+                              {si < f.steps.length - 1 && <span className="text-muted-foreground">→</span>}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </TabsContent>
 
             {/* TAB 2: DESIGN SPEC */}
@@ -188,6 +237,26 @@ export function PRDViewer({ projectId }: PRDViewerProps) {
                       ))}
                     </div>
                   </div>
+
+                  {archSpec.databaseModels && archSpec.databaseModels.length > 0 && (
+                    <div>
+                      <h5 className="font-semibold mb-2 text-foreground">Database Models</h5>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {archSpec.databaseModels.map((m, i) => (
+                          <div key={i} className="rounded-lg border p-2.5 bg-muted/30">
+                            <div className="font-medium text-primary">{m.modelName}</div>
+                            <div className="flex flex-wrap gap-1 mt-1">
+                              {m.fields.map((f, fi) => (
+                                <span key={fi} className="px-1.5 py-0.2 rounded bg-background border font-mono text-[10px]">
+                                  {f}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div>
                     <h5 className="font-semibold mb-2 text-foreground">File Ownership Boundaries</h5>

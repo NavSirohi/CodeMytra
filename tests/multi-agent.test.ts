@@ -121,4 +121,54 @@ describe("Multi-Agent Contracts & State Flow", () => {
     assert.equal(isValidTransition(GenerationRunStatus.RUNNING, GenerationRunStatus.VALIDATING), true);
     assert.equal(isValidTransition(GenerationRunStatus.VALIDATING, GenerationRunStatus.COMPLETED), true);
   });
+
+  it("validates full-stack appointment booking contract with models and route handlers", () => {
+    const bookingPRD = {
+      projectName: "Saloon & Clinic Appointments",
+      summary: "Full-stack appointment scheduling system with double-booking prevention",
+      targetAudience: "Customers and clinic staff",
+      coreFeatures: [
+        { name: "Slot Picker", description: "Select date and available time slot", priority: "MUST" as const },
+        { name: "Double Booking Guard", description: "Atomic slot reservation", priority: "MUST" as const },
+      ],
+      pages: [
+        { route: "/", title: "Booking Calendar", purpose: "Select specialist and slot", keyComponents: ["Calendar", "SlotGrid"] },
+        { route: "/confirmation", title: "Confirmation", purpose: "View booked appointment", keyComponents: ["Receipt"] },
+      ],
+      dataEntities: [
+        { name: "Service", fields: ["id", "title", "durationMinutes", "price"], relationships: ["hasMany Bookings"] },
+        { name: "Booking", fields: ["id", "serviceId", "customerName", "slotTime", "status"], relationships: ["belongsTo Service"] },
+      ],
+      userFlows: [
+        { name: "Book Slot", steps: ["Select Service", "Pick Time Slot", "Fill Details", "Confirm Booking"] },
+      ],
+    };
+
+    const parsedPRD = PRDSchema.parse(bookingPRD);
+    assert.equal(parsedPRD.dataEntities?.length, 2);
+    assert.equal(parsedPRD.userFlows?.length, 1);
+
+    const bookingArch = {
+      appType: "nextjs-fullstack",
+      routeEndpoints: [
+        { path: "/", type: "page" as const, purpose: "Main booking UI" },
+        { path: "/api/services", type: "api" as const, purpose: "List active services" },
+        { path: "/api/bookings", type: "api" as const, purpose: "Create and validate appointment" },
+      ],
+      databaseModels: [
+        { modelName: "Service", fields: ["id", "title", "price"] },
+        { modelName: "Booking", fields: ["id", "serviceId", "slotTime", "customerEmail"] },
+      ],
+      fileOwnership: {
+        frontend: ["app/page.tsx", "components/**/*.tsx"],
+        backend: ["app/api/**/*.ts"],
+        database: ["prisma/schema.prisma", "lib/db.ts"],
+      },
+      dependencies: ["date-fns"],
+    };
+
+    const parsedArch = ArchitectureSpecSchema.parse(bookingArch);
+    assert.equal(parsedArch.routeEndpoints.length, 3);
+    assert.equal(parsedArch.databaseModels?.length, 2);
+  });
 });

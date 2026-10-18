@@ -283,24 +283,44 @@ Build a complete, working, interactive Next.js application adhering strictly to 
 === APPROVED PRODUCT REQUIREMENTS ===
 Project: ${prd.projectName}
 Summary: ${prd.summary}
+Target Audience: ${prd.targetAudience}
+
 Pages to implement:
-${prd.pages.map((p) => `- ${p.route} (${p.title}): ${p.purpose}`).join("\n")}
+${prd.pages.map((p) => `- ${p.route} (${p.title}): ${p.purpose} [Components: ${p.keyComponents?.join(", ") || "Main"}]`).join("\n")}
+
+Data Entities:
+${prd.dataEntities?.length ? prd.dataEntities.map((e) => `- ${e.name}: fields=[${e.fields.join(", ")}], relationships=[${e.relationships?.join(", ") || "none"}]`).join("\n") : "None specified"}
+
+User Flows:
+${prd.userFlows?.length ? prd.userFlows.map((f) => `- ${f.name}: ${f.steps.join(" -> ")}`).join("\n") : "Standard user journey"}
 
 === DESIGN SPECIFICATION ===
 Theme: ${designSpec.aestheticTheme}
-Primary: ${designSpec.colorPalette.primary} | Secondary: ${designSpec.colorPalette.secondary} | Surface: ${designSpec.colorPalette.surface}
-Font: ${designSpec.typography.headingFont}
+Primary: ${designSpec.colorPalette.primary} | Secondary: ${designSpec.colorPalette.secondary} | Surface: ${designSpec.colorPalette.surface} | Text: ${designSpec.colorPalette.text}
+Font: ${designSpec.typography.headingFont} / ${designSpec.typography.bodyFont}
+Layout: ${designSpec.layoutStyle}
 
 === ARCHITECTURE SPECIFICATION ===
-Routes:
-${archSpec.routeEndpoints.map((r) => `- [${r.type}] ${r.path}: ${r.purpose}`).join("\n")}
+Routes & Endpoints:
+${archSpec.routeEndpoints.map((r) => `- [${r.type.toUpperCase()}] ${r.path}: ${r.purpose}`).join("\n")}
 
-=== RULES ===
+Database Models:
+${archSpec.databaseModels?.length ? archSpec.databaseModels.map((m) => `- ${m.modelName} (${m.fields.join(", ")})`).join("\n") : "In-memory / client state"}
+
+File Boundaries:
+- Frontend: ${archSpec.fileOwnership.frontend.join(", ")}
+- Backend: ${archSpec.fileOwnership.backend.join(", ")}
+- Database: ${archSpec.fileOwnership.database.join(", ")}
+
+=== FULL-STACK IMPLEMENTATION RULES ===
 1. Use the "createOrUpdateFiles" tool to write clean, complete, working React/Next.js components.
-2. Put primary landing content in app/page.tsx.
-3. Use Tailwind CSS with clean classes.
-4. Do NOT import non-existent external packages.
-5. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
+2. Put the primary landing content and user interface in app/page.tsx.
+3. For applications requiring backend data operations:
+   - Provide route handlers in app/api/**/route.ts (or server actions).
+   - If managing data entities, provide a robust data layer (e.g. lib/db.ts or in-memory repository with initial realistic seed data so the app is instantly usable upon preview).
+4. Use Tailwind CSS with clean, accessible classes matching the design token colors.
+5. Do NOT import non-existent external npm packages.
+6. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
 `;
 
     const codeAgent = createAgent({
