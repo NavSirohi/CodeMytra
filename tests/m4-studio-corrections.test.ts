@@ -329,18 +329,13 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
             events: [],
           };
         },
-        refetchInterval: (q) => {
-          const status = (q.state.data as { status?: string } | null)?.status ?? null;
-          // While null, schedule refetch at scheduledIntervalMs
-          if (status === null) {
-            return scheduledIntervalMs;
-          }
-          // Once resolved to QUEUED, transition to active polling
-          if (isGenerationActiveStatus(status)) {
-            return 2000;
-          }
-          return false;
-        },
+        // Uses the production getActiveRunPollInterval callback with configurable initial discovery interval
+        refetchInterval: (q) =>
+          getActiveRunPollInterval({
+            status: (q.state.data as { status?: string } | null)?.status ?? null,
+            dataUpdateCount: q.state.dataUpdateCount,
+            initialDiscoveryIntervalMs: scheduledIntervalMs,
+          }),
         refetchIntervalInBackground: true,
       });
 
@@ -387,95 +382,114 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
     });
 
     it("recovers legitimately delayed generation runs via two-stage adaptive discovery and verifies user recovery path after discovery expiration", async () => {
-      const queryClient = new QueryClient();
+      let databaseGenerationRun: { id: string; status: string } | null = null;
+      let queryFnExecutionCount = 0;
+
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
       const projectId = "proj-delayed-recovery-test";
 
-      function Monitor() {
-        useGetActiveGenerationRun(projectId);
-        return null;
-      }
+      // Real query function that fetches from the database
+      const fetchActiveRun = async () => {
+        queryFnExecutionCount++;
+        return databaseGenerationRun;
+      };
 
-      renderToString(
-        React.createElement(
-          QueryClientProvider,
-          { client: queryClient },
-          React.createElement(Monitor)
-        )
-      );
+      // Set up QueryObserver using the production polling callback: getActiveRunPollInterval
+      const observer = new QueryObserver(queryClient, {
+        queryKey: ["active-generation-run", projectId],
+        queryFn: fetchActiveRun,
+        refetchInterval: (query) => getActiveRunPollInterval(query),
+      });
+
+      let observedData: { id: string; status: string } | null = null;
+      const unsubscribe = observer.subscribe((res) => {
+        observedData = (res.data as { id: string; status: string } | null) ?? null;
+      });
 
       const query = queryClient
         .getQueryCache()
         .find({ queryKey: ["active-generation-run", projectId] }) as Query;
-      const refetchIntervalFn = (
-        query.options as unknown as { refetchInterval: (q: unknown) => number | false }
-      ).refetchInterval;
 
-      // Stage 1 (Fast Discovery): attempts 0 through 4 poll at 1500ms (~7.5s)
-      for (let i = 0; i < 5; i++) {
+      try {
+        // Stage 1 (Fast Discovery): attempts 0 through 4 (dataUpdateCount < 5) poll at 1500ms (~7.5s)
+        // Each attempt executes the actual query function rather than query.setData()
+        for (let i = 0; i < 5; i++) {
+          assert.strictEqual(
+            getActiveRunPollInterval(query),
+            1500,
+            `Fast discovery attempt ${i + 1} must poll at 1500ms`
+          );
+          await query.fetch();
+          assert.strictEqual(query.state.data, null);
+        }
+
+        // Stage 2 (Extended Recovery Window): attempts 5 through 11 back off to 5000ms (~35s)
+        // Each attempt executes the actual query function rather than query.setData()
+        for (let i = 5; i < 12; i++) {
+          assert.strictEqual(
+            getActiveRunPollInterval(query),
+            5000,
+            `Extended recovery attempt ${i + 1} must poll at 5000ms backoff`
+          );
+          await query.fetch();
+          assert.strictEqual(query.state.data, null);
+        }
+
+        // Stage 3 (Cessation): On attempt 12 (dataUpdateCount >= 12), polling halts
+        assert.strictEqual(query.state.dataUpdateCount, 12);
         assert.strictEqual(
-          refetchIntervalFn(query),
-          1500,
-          `Fast discovery attempt ${i + 1} must poll at 1500ms`
+          getActiveRunPollInterval(query),
+          false,
+          "Must halt polling after 12 discovery attempts (~42.5s) to prevent permanent polling on idle projects"
         );
-        query.setData(null);
-      }
 
-      // Stage 2 (Extended Recovery Window): attempts 5 through 11 back off to 5000ms (~35s)
-      // to handle database cold-starts and connection queueing without network floods
-      for (let i = 5; i < 12; i++) {
+        // Verification of recovery after discovery expiration through an actual query function/refetch:
+        // Background worker eventually completes queueing and persists the run in database:
+        databaseGenerationRun = {
+          id: "delayed-run-discovered-via-refetch",
+          status: "QUEUED",
+        };
+
+        const countBeforeRecovery = queryFnExecutionCount;
+
+        // User initiates recovery action in Studio (e.g. submitting a follow-up prompt or clicking retry).
+        // This triggers queryClient.invalidateQueries({ queryKey: ["active-generation-run", projectId] }).
+        // Because the observer is subscribed, invalidating the query triggers an ACTUAL refetch/query function execution.
+        await queryClient.invalidateQueries({
+          queryKey: ["active-generation-run", projectId],
+        });
+
+        // Verify the actual query function executed again (NO query.setData() used)
+        assert.ok(
+          queryFnExecutionCount > countBeforeRecovery,
+          "Actual query function must execute upon user recovery invalidation"
+        );
+
+        // The query state and observer receive the delayed run from the real query function
         assert.strictEqual(
-          refetchIntervalFn(query),
-          5000,
-          `Extended recovery attempt ${i + 1} must poll at 5000ms backoff`
+          (query.state.data as { status?: string })?.status,
+          "QUEUED",
+          "Query state must resolve to QUEUED via actual query function execution"
         );
-        query.setData(null);
+        assert.strictEqual(
+          observedData?.status,
+          "QUEUED",
+          "Subscribed observer must observe QUEUED run returned by query function"
+        );
+
+        // Once discovered through the actual query refetch, the production polling callback
+        // immediately resumes active 2000ms polling
+        assert.strictEqual(
+          getActiveRunPollInterval(query),
+          2000,
+          "Delayed run recovery must immediately transition from expired/halted state to 2000ms active polling"
+        );
+      } finally {
+        unsubscribe();
+        queryClient.clear();
       }
-
-      // Stage 3 (Cessation): On attempt 12 (dataUpdateCount >= 12), polling halts
-      assert.strictEqual(query.state.dataUpdateCount, 12);
-      assert.strictEqual(
-        refetchIntervalFn(query),
-        false,
-        "Must halt polling after 12 discovery attempts (~42.5s) to prevent permanent polling on idle projects"
-      );
-
-      // Requirement 2: Verify delayed-run recovery after discovery window expires,
-      // including the available user recovery path.
-      //
-      // In the Studio interface (e.g. useCreateMessage or retry trigger),
-      // the user recovery action calls queryClient.invalidateQueries({ queryKey: ["active-generation-run", projectId] }).
-      // This resets stale state and triggers an immediate recheck.
-      let delayedRunDatabaseRecord: { id: string; status: string } | null = null;
-
-      // Simulates background worker eventually finishing outbox processing and persisting the run:
-      delayedRunDatabaseRecord = {
-        id: "delayed-run-discovered-after-window",
-        status: "QUEUED",
-      };
-
-      // User initiates recovery action in Studio:
-      await queryClient.invalidateQueries({
-        queryKey: ["active-generation-run", projectId],
-      });
-
-      // Verify the query was marked invalidated by the user recovery path
-      assert.strictEqual(
-        query.state.isInvalidated,
-        true,
-        "User recovery path must invalidate query to trigger fresh discovery"
-      );
-
-      // Database returns the delayed run on refetch
-      query.setData(delayedRunDatabaseRecord);
-
-      // Once discovered, polling immediately transitions to 2000ms active polling
-      assert.strictEqual(
-        refetchIntervalFn(query),
-        2000,
-        "Delayed run recovery must immediately transition from expired/halted state to 2000ms active polling"
-      );
-
-      queryClient.clear();
     });
 
     it("verifies FAILED, CANCELLED, and COMPLETED terminal behaviors halt polling on mounted hook", () => {

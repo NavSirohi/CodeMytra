@@ -97,6 +97,9 @@ export interface ActiveRunPollOptions {
   dataUpdateCount?: number;
   maxFastDiscoveryAttempts?: number;
   maxExtendedDiscoveryAttempts?: number;
+  initialDiscoveryIntervalMs?: number;
+  extendedDiscoveryIntervalMs?: number;
+  activeIntervalMs?: number;
 }
 
 export const DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS = 5;
@@ -106,21 +109,42 @@ export const INITIAL_DISCOVERY_POLL_INTERVAL_MS = 1500;
 export const EXTENDED_DISCOVERY_POLL_INTERVAL_MS = 5000;
 
 export const getActiveRunPollInterval = (
-  statusOrOptions?: string | null | ActiveRunPollOptions,
+  statusOrOptionsOrQuery?:
+    | string
+    | null
+    | ActiveRunPollOptions
+    | { state?: { data?: { status?: string | null } | null; dataUpdateCount?: number } },
   legacyDataUpdateCount?: number
 ): number | false => {
   let status: string | null | undefined;
   let dataUpdateCount = 0;
   let maxFast = DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS;
   let maxExtended = DEFAULT_MAX_EXTENDED_DISCOVERY_ATTEMPTS;
+  let initialInterval = INITIAL_DISCOVERY_POLL_INTERVAL_MS;
+  let extendedInterval = EXTENDED_DISCOVERY_POLL_INTERVAL_MS;
+  let activeInterval = ACTIVE_RUN_POLL_INTERVAL_MS;
 
-  if (typeof statusOrOptions === "object" && statusOrOptions !== null) {
-    status = statusOrOptions.status;
-    dataUpdateCount = statusOrOptions.dataUpdateCount ?? 0;
-    maxFast = statusOrOptions.maxFastDiscoveryAttempts ?? DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS;
-    maxExtended = statusOrOptions.maxExtendedDiscoveryAttempts ?? DEFAULT_MAX_EXTENDED_DISCOVERY_ATTEMPTS;
+  if (typeof statusOrOptionsOrQuery === "object" && statusOrOptionsOrQuery !== null) {
+    if ("state" in statusOrOptionsOrQuery && typeof statusOrOptionsOrQuery.state === "object") {
+      // Direct TanStack Query object passed from refetchInterval: (query) => getActiveRunPollInterval(query)
+      const queryState = statusOrOptionsOrQuery.state as {
+        data?: { status?: string | null } | null;
+        dataUpdateCount?: number;
+      };
+      status = queryState?.data?.status ?? null;
+      dataUpdateCount = queryState?.dataUpdateCount ?? 0;
+    } else {
+      const opts = statusOrOptionsOrQuery as ActiveRunPollOptions;
+      status = opts.status;
+      dataUpdateCount = opts.dataUpdateCount ?? 0;
+      maxFast = opts.maxFastDiscoveryAttempts ?? DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS;
+      maxExtended = opts.maxExtendedDiscoveryAttempts ?? DEFAULT_MAX_EXTENDED_DISCOVERY_ATTEMPTS;
+      if (opts.initialDiscoveryIntervalMs !== undefined) initialInterval = opts.initialDiscoveryIntervalMs;
+      if (opts.extendedDiscoveryIntervalMs !== undefined) extendedInterval = opts.extendedDiscoveryIntervalMs;
+      if (opts.activeIntervalMs !== undefined) activeInterval = opts.activeIntervalMs;
+    }
   } else {
-    status = statusOrOptions;
+    status = statusOrOptionsOrQuery;
     dataUpdateCount = legacyDataUpdateCount ?? 0;
   }
 
@@ -131,7 +155,7 @@ export const getActiveRunPollInterval = (
 
   // 2. Active generation run -> poll every 2000ms
   if (isGenerationActiveStatus(status)) {
-    return ACTIVE_RUN_POLL_INTERVAL_MS;
+    return activeInterval;
   }
 
   // 3. Initial discovery window when status is null or undefined:
@@ -143,10 +167,10 @@ export const getActiveRunPollInterval = (
   // Stage 3 (Cessation): After 12 attempts without discovering a run, stop polling to prevent indefinite loops.
   if (status === null || status === undefined) {
     if (dataUpdateCount < maxFast) {
-      return INITIAL_DISCOVERY_POLL_INTERVAL_MS;
+      return initialInterval;
     }
     if (dataUpdateCount < maxExtended) {
-      return EXTENDED_DISCOVERY_POLL_INTERVAL_MS;
+      return extendedInterval;
     }
     return false;
   }
@@ -162,12 +186,7 @@ export const useGetActiveGenerationRun = (projectId: string) => {
       return run;
     },
     enabled: Boolean(projectId),
-    refetchInterval: (query) => {
-      return getActiveRunPollInterval({
-        status: query.state.data?.status ?? null,
-        dataUpdateCount: query.state.dataUpdateCount,
-      });
-    },
+    refetchInterval: (query) => getActiveRunPollInterval(query),
   });
 };
 
