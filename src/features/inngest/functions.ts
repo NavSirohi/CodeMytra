@@ -102,6 +102,56 @@ async function recordRunEvent(
 
 
 
+/**
+ * Concurrency-safe initialization and retrieval of persisted generation start-time.
+ * Guarantees:
+ * 1. Never overwrites an existing startedAt.
+ * 2. Uses atomic CAS (updateMany where startedAt is null) so concurrent workers converge on one timestamp.
+ * 3. Never silently adopts a transient local timestamp if persistence fails.
+ * 4. Ensures Inngest retries derive an unchanged deadline from the persisted timestamp.
+ */
+export async function initializeRunStartTime(
+  runId: string,
+  dbClient: {
+    generationRun: {
+      findUnique: (args: { where: { id: string }; select: { startedAt: boolean; createdAt?: boolean } }) => Promise<{ startedAt: Date | null; createdAt?: Date } | null>;
+      updateMany: (args: { where: { id: string; startedAt: null }; data: { startedAt: Date } }) => Promise<{ count: number }>;
+    };
+  } = prisma
+): Promise<Date> {
+  const existingRun = await dbClient.generationRun.findUnique({
+    where: { id: runId },
+    select: { startedAt: true, createdAt: true },
+  });
+
+  if (!existingRun) {
+    throw new Error(`GenerationRun "${runId}" not found in database`);
+  }
+
+  if (existingRun.startedAt) {
+    return existingRun.startedAt;
+  }
+
+  const now = new Date();
+  await dbClient.generationRun.updateMany({
+    where: { id: runId, startedAt: null },
+    data: { startedAt: now },
+  });
+
+  const reloadedRun = await dbClient.generationRun.findUnique({
+    where: { id: runId },
+    select: { startedAt: true },
+  });
+
+  if (!reloadedRun?.startedAt) {
+    throw new Error(
+      `Failed to persist start time for GenerationRun "${runId}". Refusing to adopt transient local timestamp.`
+    );
+  }
+
+  return reloadedRun.startedAt;
+}
+
 export const codeAgentFunction = inngest.createFunction(
   {
     id: "code-agent",
@@ -154,32 +204,15 @@ export const codeAgentFunction = inngest.createFunction(
     const runId = event.data.runId as string;
     const promptValue = event.data.value as string;
     const baseRevisionId = (event.data.baseRevisionId as string) || undefined;
+
     // Enforce required persisted runId
     if (!runId) {
       throw new Error("Missing required persisted runId for generation execution");
     }
 
-    // Establish persisted start time and deterministic deadline across Inngest retries
-    const existingRun = await prisma.generationRun.findUnique({
-      where: { id: runId },
-      select: { startedAt: true, createdAt: true },
-    });
-
-    let persistedStart = existingRun?.startedAt ?? null;
-    if (!persistedStart) {
-      const now = new Date();
-      await prisma.generationRun
-        .update({
-          where: { id: runId },
-          data: { startedAt: now },
-        })
-        .catch((err) => console.warn("[Generation] Could not update startedAt:", err));
-      persistedStart = now;
-    }
-
-    const { deadlineMs, startedAtMs } = establishRunDeadline(
-      persistedStart || existingRun?.createdAt || Date.now()
-    );
+    // Concurrency-safe persisted start-time initialization
+    const persistedStart = await initializeRunStartTime(runId);
+    const { deadlineMs, startedAtMs } = establishRunDeadline(persistedStart);
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 0: RESOLVE BASE FILES & EXISTING SPECIFICATIONS
