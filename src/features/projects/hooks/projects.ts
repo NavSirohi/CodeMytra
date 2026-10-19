@@ -95,12 +95,15 @@ export const isGenerationActiveStatus = (status?: string | null): boolean => {
 export interface ActiveRunPollOptions {
   status?: string | null;
   dataUpdateCount?: number;
-  maxDiscoveryAttempts?: number;
+  maxFastDiscoveryAttempts?: number;
+  maxExtendedDiscoveryAttempts?: number;
 }
 
-export const DEFAULT_MAX_DISCOVERY_ATTEMPTS = 5;
+export const DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS = 5;
+export const DEFAULT_MAX_EXTENDED_DISCOVERY_ATTEMPTS = 12; // 5 * 1.5s + 7 * 5s = ~42.5s total discovery window
 export const ACTIVE_RUN_POLL_INTERVAL_MS = 2000;
 export const INITIAL_DISCOVERY_POLL_INTERVAL_MS = 1500;
+export const EXTENDED_DISCOVERY_POLL_INTERVAL_MS = 5000;
 
 export const getActiveRunPollInterval = (
   statusOrOptions?: string | null | ActiveRunPollOptions,
@@ -108,12 +111,14 @@ export const getActiveRunPollInterval = (
 ): number | false => {
   let status: string | null | undefined;
   let dataUpdateCount = 0;
-  let maxDiscoveryAttempts = DEFAULT_MAX_DISCOVERY_ATTEMPTS;
+  let maxFast = DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS;
+  let maxExtended = DEFAULT_MAX_EXTENDED_DISCOVERY_ATTEMPTS;
 
   if (typeof statusOrOptions === "object" && statusOrOptions !== null) {
     status = statusOrOptions.status;
     dataUpdateCount = statusOrOptions.dataUpdateCount ?? 0;
-    maxDiscoveryAttempts = statusOrOptions.maxDiscoveryAttempts ?? DEFAULT_MAX_DISCOVERY_ATTEMPTS;
+    maxFast = statusOrOptions.maxFastDiscoveryAttempts ?? DEFAULT_MAX_FAST_DISCOVERY_ATTEMPTS;
+    maxExtended = statusOrOptions.maxExtendedDiscoveryAttempts ?? DEFAULT_MAX_EXTENDED_DISCOVERY_ATTEMPTS;
   } else {
     status = statusOrOptions;
     dataUpdateCount = legacyDataUpdateCount ?? 0;
@@ -130,13 +135,18 @@ export const getActiveRunPollInterval = (
   }
 
   // 3. Initial discovery window when status is null or undefined:
-  // Studio may initially receive null if the generation run record is being created or delayed in the DB.
-  // Poll at 1500ms intervals up to maxDiscoveryAttempts (~7.5s) to discover the newly queued run.
-  // Once maxDiscoveryAttempts is reached without discovering an active run, stop polling to prevent
-  // unnecessary permanent polling on genuinely idle projects.
+  // Studio may initially receive null if the generation run record is being created, queued in outbox,
+  // or delayed by database connection pool/cold start.
+  // Stage 1 (Fast Discovery): Poll every 1500ms for first 5 attempts (~7.5s).
+  // Stage 2 (Extended Recovery): Back off to 5000ms for attempts 5-11 (up to ~42.5s) to discover legitimately
+  // delayed runs without flooding the database.
+  // Stage 3 (Cessation): After 12 attempts without discovering a run, stop polling to prevent indefinite loops.
   if (status === null || status === undefined) {
-    if (dataUpdateCount < maxDiscoveryAttempts) {
+    if (dataUpdateCount < maxFast) {
       return INITIAL_DISCOVERY_POLL_INTERVAL_MS;
+    }
+    if (dataUpdateCount < maxExtended) {
+      return EXTENDED_DISCOVERY_POLL_INTERVAL_MS;
     }
     return false;
   }
