@@ -1,6 +1,13 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 
 const nextConfig: NextConfig = {
+  // ─── Turbopack Root Resolution ─────────────────────────────────────────────
+  // Explicitly anchors project root to avoid parent workspace/monorepo resolution bugs
+  turbopack: {
+    root: path.resolve(__dirname),
+  },
+
   // ─── Security Headers ──────────────────────────────────────────────────────
   // Applied to all routes. Tightened for the CodeMytra platform.
   // E2B sandbox iframes are served from *.e2b.app — allowed in frame-src only.

@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useState } from "react";
 
 import { useAuth, UserButton, SignOutButton } from "@clerk/nextjs";
+import { isClerkPublishableKeyValid } from "@/lib/auth-keys";
 
 export interface HeaderProps {
   isAuthenticated?: boolean;
@@ -99,7 +100,7 @@ export function Header({ isAuthenticated }: HeaderProps = {}) {
     { href: "/contact", label: "Contact", active: pathname === "/contact" },
   ];
 
-  const hasClerk = Boolean(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY);
+  const hasClerk = isClerkPublishableKeyValid(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY);
 
   // Fallback navigation blocks for mock/test states
   const signedInNav = (

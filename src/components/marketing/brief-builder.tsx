@@ -321,9 +321,37 @@ export function BriefBuilder() {
           </div>
 
           {errorMessage && (
-            <p className="notice" style={{ color: "#e5484d", marginTop: "12px" }}>
-              {errorMessage}
-            </p>
+            <div
+              className="error-recovery-banner"
+              style={{
+                marginTop: "14px",
+                padding: "12px 16px",
+                borderRadius: "8px",
+                backgroundColor: "rgba(229, 72, 77, 0.1)",
+                border: "1px solid rgba(229, 72, 77, 0.3)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <p className="notice" style={{ color: "#e5484d", margin: 0, fontWeight: 500 }}>
+                {errorMessage}
+              </p>
+              <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="btn orange"
+                  onClick={handleGenerateProject}
+                  disabled={isSubmitting}
+                  style={{ padding: "6px 12px", fontSize: "12px" }}
+                >
+                  {isSubmitting ? "Retrying..." : "Retry generation"}
+                </button>
+                <span style={{ fontSize: "12px", color: "var(--muted, #888)" }}>
+                  Your brief and configuration remain preserved.
+                </span>
+              </div>
+            </div>
           )}
 
           {statusMessage && (

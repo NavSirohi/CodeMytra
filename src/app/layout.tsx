@@ -3,7 +3,8 @@ import "./globals.css";
 import { cn } from "@/lib/utils";
 import { ThemeProvider } from "@/components/providers/theme-provider";
 import { QueryProvider } from "@/components/providers/query-provider";
-import { ClerkProvider} from '@clerk/nextjs'
+import { ClerkProvider } from '@clerk/nextjs'
+import { isClerkPublishableKeyValid } from "@/lib/auth-keys";
 // Offline-safe font variable bindings for Next.js build
 const inter = { variable: "font-sans" };
 const geistSans = { variable: "font-geist-sans" };
@@ -38,6 +39,15 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const clerkPublishableKey = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+  const isKeyValid = isClerkPublishableKeyValid(clerkPublishableKey);
+
+  if (clerkPublishableKey && !isKeyValid && process.env.NODE_ENV !== "production") {
+    console.warn(
+      "[CodeMytra] NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY is present but malformed. ClerkProvider is disabled until a valid pk_test_... or pk_live_... key is configured."
+    );
+  }
+
   return (
     <html
       lang="en"
@@ -46,8 +56,8 @@ export default function RootLayout({
       style={{ colorScheme: "dark" }}
     >
       <body className="min-h-full flex flex-col">
-        {process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ? (
-          <ClerkProvider publishableKey={process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}>
+        {isKeyValid ? (
+          <ClerkProvider publishableKey={clerkPublishableKey}>
             <ThemeProvider
               attribute="class"
               defaultTheme="dark"

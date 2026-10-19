@@ -1,6 +1,6 @@
 "use server";
 
-import { getCurrentUser } from "@/features/auth/actions";
+import { getCurrentUser, getAuthSessionState } from "@/features/auth/actions";
 import { MessageRole, MessageType, GenerationRunStatus } from "@/generated/prisma/client";
 import { generateSlug } from "random-word-slugs";
 import { prisma } from "@/lib/db";
@@ -8,13 +8,15 @@ import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
 import { restoreHistoricalRevision } from "@/server/orchestration/revisions";
 
 export const createProject = async (value: string, idempotencyKey?: string) => {
-  const user = await getCurrentUser();
+  const session = await getAuthSessionState();
 
-  if (!user) {
+  if (session.status !== "authenticated" || !session.user) {
     return {
       error: "Unauthorized",
     };
   }
+
+  const user = session.user;
 
   const trimmed = value?.trim();
   if (!trimmed || trimmed.length < 3) {
@@ -85,8 +87,11 @@ export const createProject = async (value: string, idempotencyKey?: string) => {
         }
         return match.project;
       }
-    } catch {
-      // Continue to creation if lookup fails
+    } catch (dbErr) {
+      console.error("❌ Failed to verify existing idempotency record:", dbErr);
+      return {
+        error: "Database error during idempotency verification. Please try again.",
+      };
     }
   }
 

@@ -26,6 +26,9 @@ export default defineConfig({
   },
   datasource: {
     // Migrations use the DIRECT url to avoid PgBouncer limitations.
-    url: process.env["DATABASE_URL_DIRECT"] ?? process.env["DATABASE_URL"],
+    url:
+      process.env["DATABASE_URL_DIRECT"] ??
+      process.env["DIRECT_URL"] ??
+      process.env["DATABASE_URL"],
   },
 });

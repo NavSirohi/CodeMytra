@@ -1,5 +1,6 @@
 import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server'
-import { NextResponse, type NextRequest, type NextFetchEvent } from 'next/server'
+import { NextResponse, type NextRequest, type NextFetchEvent, type NextMiddleware } from 'next/server'
+import { isClerkPublishableKeyValid, isClerkSecretKeyValid } from '@/lib/auth-keys'
 
 export const isPublicRoute = createRouteMatcher([
   '/',
@@ -30,12 +31,20 @@ export function evaluateAuthRouting(
     allowInsecureDevAuth: process.env.ALLOW_INSECURE_DEV_AUTH,
   }
 ): { action: "public" | "delegate_to_clerk" | "allow_dev_insecure" | "fail_closed"; response?: NextResponse } {
-  const hasClerkKeys = Boolean(env.clerkPublishableKey && env.clerkSecretKey);
-  if (hasClerkKeys) {
+  // Inngest background functions and discovery endpoints are strictly isolated from Clerk
+  if (req.nextUrl.pathname.startsWith("/api/inngest")) {
+    return { action: "public", response: NextResponse.next() };
+  }
+
+  const isClerkConfigured =
+    isClerkPublishableKeyValid(env.clerkPublishableKey) &&
+    isClerkSecretKeyValid(env.clerkSecretKey);
+
+  if (isClerkConfigured) {
     return { action: "delegate_to_clerk" };
   }
 
-  // If Clerk keys are missing:
+  // If Clerk keys are missing or invalid:
   if (isPublicRoute(req)) {
     return { action: "public", response: NextResponse.next() };
   }
@@ -49,11 +58,16 @@ export function evaluateAuthRouting(
 
   // Fail closed in production or whenever explicit dev auth is not granted
   if (req.nextUrl.pathname.startsWith("/api/")) {
+    const isInvalid = Boolean(env.clerkPublishableKey || env.clerkSecretKey);
     return {
       action: "fail_closed",
       response: NextResponse.json(
-        { error: "Authentication service unavailable or unconfigured" },
-        { status: 401 }
+        {
+          error: isInvalid
+            ? "Authentication credentials invalid"
+            : "Authentication service unconfigured",
+        },
+        { status: isInvalid ? 503 : 401 }
       ),
     };
   }
@@ -66,17 +80,24 @@ export function evaluateAuthRouting(
   };
 }
 
-const clerkHandler = clerkMiddleware(
-  async (auth, request) => {
-    if (!isPublicRoute(request)) {
-      await auth.protect();
-    }
-  },
-  {
-    signInUrl: "/sign-in",
-    signUpUrl: "/sign-in",
+let cachedClerkHandler: NextMiddleware | null = null;
+
+function getClerkHandler(): NextMiddleware {
+  if (!cachedClerkHandler) {
+    cachedClerkHandler = clerkMiddleware(
+      async (auth, request) => {
+        if (!isPublicRoute(request)) {
+          await auth.protect();
+        }
+      },
+      {
+        signInUrl: "/sign-in",
+        signUpUrl: "/sign-in",
+      }
+    );
   }
-);
+  return cachedClerkHandler;
+}
 
 export async function proxy(req: NextRequest, evt: NextFetchEvent) {
   const result = evaluateAuthRouting(req);
@@ -85,7 +106,8 @@ export async function proxy(req: NextRequest, evt: NextFetchEvent) {
     return result.response!;
   }
 
-  return clerkHandler(req, evt);
+  const handler = getClerkHandler();
+  return handler(req, evt);
 }
 
 export default proxy;

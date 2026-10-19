@@ -211,6 +211,7 @@ describe("M4 Authentication & Navigation Regression Suite", () => {
 
       prisma.user.upsert = (async () => testUser) as any;
       prisma.user.findUnique = (async () => testUser) as any;
+      prisma.project.findUnique = (async () => null) as any;
       prisma.$queryRawUnsafe = (async () => [{ id: "evt_resumed_1", status: "PROCESSING", attempts: 1 }]) as any;
 
       const submissionId = "brief_resumed_flow_uuid_789";
