@@ -27,7 +27,7 @@ export default function ContactPage() {
               Tell us what <i>you&apos;re building.</i>
             </h2>
             <p className="muted">
-              Use this contact draft to outline your question. This static prototype doesn&apos;t send email or collect submissions; live contact delivery will be enabled when the production backend is configured.
+              Use this form to share your feedback or questions. When backend storage is active, messages are saved securely for our team; if unconfigured, your message is preserved for direct copy.
             </p>
             <div className="card">
               <strong>Good reasons to reach out</strong>

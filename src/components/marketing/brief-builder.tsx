@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { createProject } from "@/features/projects/actions";
 
 const EXAMPLES = [
   {
@@ -28,28 +30,150 @@ const STYLES = [
   "Minimal & technical",
 ];
 
+const PENDING_BRIEF_STORAGE_KEY = "codemytra_pending_brief";
+
 export function BriefBuilder() {
+  const router = useRouter();
   const [selectedExample, setSelectedExample] = useState<string | null>(null);
   const [selectedStyle, setSelectedStyle] = useState("Calm & editorial");
   const [idea, setIdea] = useState("");
   const [brief, setBrief] = useState<string | null>(null);
   const [copyStatus, setCopyStatus] = useState("Copy brief");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  // Restore brief across authentication redirect without duplicate runs
+  useEffect(() => {
+    try {
+      const searchParams = new URLSearchParams(window.location.search);
+      const isResume = searchParams.get("resume") === "true";
+      const savedRaw = sessionStorage.getItem(PENDING_BRIEF_STORAGE_KEY);
+
+      if (savedRaw) {
+        const saved = JSON.parse(savedRaw);
+        if (saved && typeof saved.idea === "string") {
+          queueMicrotask(() => {
+            setIdea(saved.idea);
+            if (saved.selectedStyle) setSelectedStyle(saved.selectedStyle);
+            if (saved.selectedExample) setSelectedExample(saved.selectedExample);
+
+            const briefText = `CodeMytra project brief\nGoal: ${saved.idea}\nStyle: ${saved.selectedStyle || "Calm & editorial"}\nNext steps: requirements clarification, plan approval, design and architecture, implementation, integration and validation.`;
+            setBrief(briefText);
+
+            if (isResume) {
+              // Strip search param from address bar so page refresh does not trigger resume again
+              window.history.replaceState({}, document.title, window.location.pathname);
+
+              if (saved.pendingSubmit) {
+                // Disarm pendingSubmit immediately to guarantee duplicate runs are impossible
+                sessionStorage.setItem(
+                  PENDING_BRIEF_STORAGE_KEY,
+                  JSON.stringify({ ...saved, pendingSubmit: false })
+                );
+
+                setStatusMessage("Authentication verified. Starting project generation...");
+                setIsSubmitting(true);
+
+                const fullPrompt = `Goal: ${saved.idea}\nVisual Style: ${saved.selectedStyle || "Calm & editorial"}`;
+                createProject(fullPrompt)
+                  .then((result) => {
+                    if ("error" in result && result.error) {
+                      setErrorMessage(result.error);
+                      setStatusMessage(null);
+                      setIsSubmitting(false);
+                    } else if ("id" in result && result.id) {
+                      sessionStorage.removeItem(PENDING_BRIEF_STORAGE_KEY);
+                      router.push(`/projects/${result.id}`);
+                    }
+                  })
+                  .catch((err) => {
+                    setErrorMessage(err?.message || "Failed to start generation");
+                    setStatusMessage(null);
+                    setIsSubmitting(false);
+                  });
+              } else {
+                setStatusMessage("Your project brief has been restored. Ready to build!");
+              }
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("Could not inspect saved brief", e);
+    }
+  }, [router]);
 
   const handleSelectExample = (ex: (typeof EXAMPLES)[number]) => {
     setSelectedExample(ex.label);
     setIdea(ex.prompt);
+    setErrorMessage(null);
   };
 
   const handleCreateBrief = () => {
     const trimmed = idea.trim();
     if (!trimmed) {
       document.getElementById("idea")?.focus();
+      setErrorMessage("Please describe your project idea.");
       return;
     }
 
-    const briefText = `CodeMytra project brief\nGoal: ${trimmed}\nStyle: ${selectedStyle}\nNext steps: requirements clarification, plan approval, design and architecture, implementation, integration and validation.\nStatus: Design prototype; no generation started.`;
+    setErrorMessage(null);
+    const briefText = `CodeMytra project brief\nGoal: ${trimmed}\nStyle: ${selectedStyle}\nNext steps: requirements clarification, plan approval, design and architecture, implementation, integration and validation.`;
     setBrief(briefText);
     setCopyStatus("Copy brief");
+  };
+
+  const handleGenerateProject = async () => {
+    const trimmed = idea.trim();
+    if (!trimmed || trimmed.length < 3) {
+      setErrorMessage("Please describe your project in at least 3 characters.");
+      document.getElementById("idea")?.focus();
+      return;
+    }
+
+    setErrorMessage(null);
+    setStatusMessage(null);
+    setIsSubmitting(true);
+
+    const fullPrompt = `Goal: ${trimmed}\nVisual Style: ${selectedStyle}`;
+
+    try {
+      const result = await createProject(fullPrompt);
+
+      if ("error" in result && result.error) {
+        if (result.error === "Unauthorized") {
+          // Preserve prompt in sessionStorage through authentication flow
+          sessionStorage.setItem(
+            PENDING_BRIEF_STORAGE_KEY,
+            JSON.stringify({
+              idea: trimmed,
+              selectedStyle,
+              selectedExample,
+              pendingSubmit: true,
+              savedAt: Date.now(),
+            })
+          );
+
+          setStatusMessage("Please sign in to start generation. Preserving your brief...");
+          router.push(`/sign-in?redirect_url=${encodeURIComponent("/builder?resume=true")}`);
+          return;
+        }
+
+        setErrorMessage(result.error);
+        setIsSubmitting(false);
+        return;
+      }
+
+      if ("id" in result && result.id) {
+        sessionStorage.removeItem(PENDING_BRIEF_STORAGE_KEY);
+        router.push(`/projects/${result.id}`);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to create project";
+      setErrorMessage(message);
+      setIsSubmitting(false);
+    }
   };
 
   const handleCopy = async () => {
@@ -91,7 +215,7 @@ export function BriefBuilder() {
             <p>What should it do?</p>
           </div>
         </div>
-        <p className="notice">Design preview. No data is sent or stored.</p>
+        <p className="notice">Create a brief or launch full-stack generation directly with CodeMytra.</p>
       </aside>
 
       <div className="buildermain">
@@ -131,32 +255,68 @@ export function BriefBuilder() {
             id="idea"
             placeholder="I want to build..."
             value={idea}
-            onChange={(e) => setIdea(e.target.value)}
+            onChange={(e) => {
+              setIdea(e.target.value);
+              setErrorMessage(null);
+            }}
           />
 
           <div className="actions">
             <button
               className="btn orange"
+              id="startProject"
+              type="button"
+              onClick={handleGenerateProject}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? "Starting generation..." : "Generate application →"}
+            </button>
+            <button
+              className="btn"
               id="makeBrief"
               type="button"
               onClick={handleCreateBrief}
             >
-              Create project brief →
+              Create project brief
             </button>
             <Link href="/how-it-works" className="btn alt">
               Learn the process
             </Link>
           </div>
+
+          {errorMessage && (
+            <p className="notice" style={{ color: "#e5484d", marginTop: "12px" }}>
+              {errorMessage}
+            </p>
+          )}
+
+          {statusMessage && (
+            <p className="notice" style={{ color: "#2b7a4b", marginTop: "12px" }}>
+              {statusMessage}
+            </p>
+          )}
         </div>
 
         {brief && (
           <div id="brief" aria-live="polite" style={{ margin: "20px 0" }}>
             <div className="card">
-              <h3>Your starting brief</h3>
-              <p style={{ whiteSpace: "pre-line" }}>{brief}</p>
-              <button className="btn" type="button" onClick={handleCopy}>
-                {copyStatus}
-              </button>
+              <span className="eyebrow" style={{ color: "var(--accent)" }}>Ready to build</span>
+              <h3 style={{ marginTop: "4px" }}>Your starting brief</h3>
+              <p style={{ whiteSpace: "pre-line", marginTop: "8px" }}>{brief}</p>
+              <div style={{ display: "flex", gap: "10px", marginTop: "16px", flexWrap: "wrap" }}>
+                <button
+                  className="btn orange"
+                  id="buildFromBrief"
+                  type="button"
+                  onClick={handleGenerateProject}
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting ? "Starting generation..." : "Generate application →"}
+                </button>
+                <button className="btn" type="button" onClick={handleCopy}>
+                  {copyStatus}
+                </button>
+              </div>
             </div>
           </div>
         )}

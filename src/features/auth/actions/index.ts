@@ -45,6 +45,31 @@ export async function onBoardUser() {
 }
 
 export const getCurrentUser = async () => {
+    // When explicit insecure dev auth is enabled in non-production, provide the local dev user
+    if (process.env.ALLOW_INSECURE_DEV_AUTH === "true" && process.env.NODE_ENV !== "production") {
+      try {
+        return await prisma.user.upsert({
+          where: { clerkId: "dev-user-local" },
+          create: {
+            clerkId: "dev-user-local",
+            email: "dev@codemytra.local",
+            name: "Dev User",
+          },
+          update: {},
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            imageUrl: true,
+            clerkId: true,
+          },
+        });
+      } catch (dbErr) {
+        console.error("❌ Error resolving dev auth user:", dbErr);
+        return null;
+      }
+    }
+
     try {
       const user = await currentUser();
   
@@ -52,7 +77,7 @@ export const getCurrentUser = async () => {
         return null;
       }
   
-      const dbUser = await prisma.user.findUnique({
+      let dbUser = await prisma.user.findUnique({
         where: {
           clerkId: user.id,
         },
@@ -64,6 +89,22 @@ export const getCurrentUser = async () => {
           clerkId: true,
         },
       });
+
+      if (!dbUser) {
+        await onBoardUser();
+        dbUser = await prisma.user.findUnique({
+          where: {
+            clerkId: user.id,
+          },
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            imageUrl: true,
+            clerkId: true,
+          },
+        });
+      }
   
       return dbUser;
     } catch (error) {

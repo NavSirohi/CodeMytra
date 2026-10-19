@@ -4,19 +4,19 @@ import { BriefBuilder } from "@/components/marketing/brief-builder";
 export const metadata: Metadata = {
   title: "Builder Preview | CodeMytra",
   description:
-    "Explore the CodeMytra guided brief and builder interface concept",
+    "Explore the CodeMytra guided brief builder and launch your full-stack application",
 };
 
 export default function BuilderPage() {
   return (
     <main>
       <div className="wrap pagehead">
-        <span className="eyebrow">Product interaction preview</span>
+        <span className="eyebrow">Project builder & onboarding</span>
         <h1>
           Tell us about <i>your idea.</i>
         </h1>
         <p className="lede">
-          This interactive brief demonstrates the proposed CodeMytra onboarding. It creates a structured local summary you can copy; AI generation is not connected in this static design.
+          Create a structured brief for your project, choose your visual style, and launch full-stack generation with CodeMytra&apos;s multi-agent AI architecture.
         </p>
       </div>
 
