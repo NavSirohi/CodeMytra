@@ -36,9 +36,9 @@ function FragmentCard({
     <button
       type="button"
       className={cn(
-        "flex w-fit items-start gap-2 rounded-lg border bg-muted p-2 text-start transition-colors hover:bg-secondary",
+        "flex w-fit items-start gap-2.5 rounded-xl border border-[#2e3e33] bg-[#243328]/80 p-2.5 text-start transition-all hover:border-[#c75c35]/60 hover:bg-[#28392d]",
         isActiveFragment &&
-          "border-primary bg-primary text-primary-foreground hover:bg-primary"
+          "border-[#c75c35] bg-[#c75c35]/15 text-[#f7f6f1] ring-1 ring-[#c75c35]"
       )}
       onClick={() =>
         onFragmentClick({
@@ -47,12 +47,17 @@ function FragmentCard({
         })
       }
     >
-      <Code2Icon className="mt-0.5 size-4" />
-      <div className="flex flex-1 flex-col">
-        <span className="line-clamp-1 text-sm font-medium">{fragment.title}</span>
-        <span className="text-sm">Preview</span>
+      <div className="p-1 rounded-md bg-[#284938]/40 text-[#81aa80]">
+        <Code2Icon className="size-4" />
       </div>
-      <ChevronRightIcon className="mt-0.5 size-4" />
+      <div className="flex flex-1 flex-col">
+        <span className="line-clamp-1 text-xs font-semibold text-[#f7f6f1]">{fragment.title}</span>
+        <span className="text-[11px] text-[#8a9a8e] flex items-center gap-1">
+          <span className="size-1.5 rounded-full bg-[#388257]" />
+          Preview Available
+        </span>
+      </div>
+      <ChevronRightIcon className="mt-1 size-3.5 text-[#8a9a8e]" />
     </button>
   );
 }
@@ -64,8 +69,8 @@ function FragmentCard({
  */
 function UserMessage({ content }: { content: string }) {
   return (
-    <div className="flex justify-end pb-4 pl-10 pr-2">
-      <Card className="max-w-[80%] break-words rounded-lg border-none bg-muted p-2 shadow-none">
+    <div className="flex justify-end pb-4 pl-8 pr-1">
+      <Card className="max-w-[85%] break-words rounded-2xl border border-[#284938]/40 bg-[#284938]/25 text-[#f7f6f1] px-3.5 py-2.5 text-xs leading-relaxed shadow-none">
         {content}
       </Card>
     </div>
@@ -104,18 +109,19 @@ function AssistantMessage({
   return (
     <div
       className={cn(
-        "group flex flex-col px-2 pb-4",
-        type === MessageType.ERROR && "text-red-700 dark:text-red-500"
+        "group flex flex-col px-1 pb-4",
+        type === MessageType.ERROR && "text-red-400"
       )}
     >
-      <div className="mb-2 flex items-center gap-2 pl-2">
-        <Chai0Mark className="h-7 w-auto shrink-0" />
-        <span className="text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
-          {format(new Date(createdAt), "HH:mm 'on' MMM dd, yyyy")}
+      <div className="mb-2 flex items-center gap-2 pl-1">
+        <Chai0Mark className="h-5.5 w-5.5 shrink-0" />
+        <span className="text-[11px] font-medium text-[#8a9a8e]">CodeMytra Assistant</span>
+        <span className="text-[10px] text-[#617066] font-mono opacity-0 transition-opacity group-hover:opacity-100">
+          {format(new Date(createdAt), "HH:mm 'on' MMM dd")}
         </span>
       </div>
 
-      <div className="flex flex-col gap-y-4 pl-8.5">
+      <div className="flex flex-col gap-y-3 pl-8 text-xs text-[#eae8df] leading-relaxed">
         <Response>{content}</Response>
         {fragment && type === MessageType.RESULT && (
           <FragmentCard

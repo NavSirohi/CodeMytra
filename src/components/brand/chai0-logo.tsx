@@ -21,28 +21,15 @@ type CodeMytraLogoProps = {
  */
 function CodeMytraMark({ className }: { className?: string }) {
   return (
-    <svg
-      viewBox="0 0 44 48"
-      fill="none"
-      aria-hidden
-      aria-label="CodeMytra"
-      className={cn("shrink-0", className)}
+    <span
+      className={cn(
+        "w-7 h-7 inline-grid place-items-center bg-[#284938] text-white rounded-[9px] font-serif font-semibold text-base leading-none select-none shrink-0 -rotate-6 shadow-xs",
+        className
+      )}
+      aria-hidden="true"
     >
-      <rect
-        x="8.5"
-        y="4"
-        width="27"
-        height="40"
-        rx="13.5"
-        stroke="currentColor"
-        strokeWidth="5"
-        fill="none"
-      />
-      <path
-        fill="currentColor"
-        d="M10.8 38.2C10.8 32.5 13.8 26.5 19.5 24.8C16.2 29.2 13.2 34.2 10.8 38.2Z"
-      />
-    </svg>
+      म
+    </span>
   );
 }
 
@@ -56,10 +43,12 @@ export function CodeMytraLogo({
   showWordmark = true,
 }: CodeMytraLogoProps) {
   return (
-    <span className={cn("inline-flex items-center gap-2.5 text-foreground", className)}>
-      <CodeMytraMark className="h-7 w-auto" />
+    <span className={cn("inline-flex items-center gap-2 text-foreground font-sans", className)}>
+      <CodeMytraMark className="h-7 w-7" />
       {showWordmark ? (
-        <span className="text-base font-semibold tracking-tight">CodeMytra</span>
+        <span className="text-base font-bold tracking-tight">
+          Code<em className="text-[#c75c35] not-italic">Mytra</em>
+        </span>
       ) : null}
     </span>
   );

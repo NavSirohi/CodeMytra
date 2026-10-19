@@ -23,13 +23,13 @@ export function GenerationStatusBanner({ projectId }: { projectId: string }) {
   return (
     <div
       className={cn(
-        "flex items-center gap-2 border-b px-3 py-1.5 text-xs font-medium transition-colors",
-        isPlanning && "bg-muted text-muted-foreground",
-        isDesigning && "bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/20",
-        isArchitecting && "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/20",
-        isRunning && "bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20",
-        isValidating && "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20",
-        isFailed && "bg-destructive/10 text-destructive border-destructive/20"
+        "flex items-center gap-2 border-b px-3 py-1.5 text-xs font-medium transition-colors backdrop-blur-xs",
+        isPlanning && "bg-[#202822] text-[#8a9a8e] border-[#2e3e33]",
+        isDesigning && "bg-[#c75c35]/15 text-[#e4835d] border-[#c75c35]/30",
+        isArchitecting && "bg-[#dcba69]/15 text-[#e2c77d] border-[#dcba69]/30",
+        isRunning && "bg-[#284938]/30 text-[#81aa80] border-[#284938]/40",
+        isValidating && "bg-amber-500/15 text-amber-400 border-amber-500/30",
+        isFailed && "bg-destructive/15 text-red-400 border-destructive/30"
       )}
     >
       {isPlanning && (
