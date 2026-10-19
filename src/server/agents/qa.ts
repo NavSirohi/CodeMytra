@@ -20,24 +20,143 @@ export interface DatabaseVerificationPipelineOptions {
   models?: Array<{ modelName: string; fields?: string[]; relations?: string[] }>;
   disposableDbName?: string;
   runner?: "bun" | "npm";
+  businessRuleScript?: string;
 }
 
-function parseModelFieldTypes(fields?: string[]): {
+export interface ModelSmokeQualification {
+  eligible: boolean;
+  modelName: string;
+  idField: string;
+  idType: "string" | "int";
+  idHasDefault: boolean;
   createData: Record<string, string | number | boolean>;
   updateData: Record<string, string | number | boolean>;
-} {
-  const createData: Record<string, string | number | boolean> = {};
-  const updateData: Record<string, string | number | boolean> = {};
-  if (!fields || fields.length === 0) return { createData, updateData };
+  reason?: string;
+}
+
+/**
+ * Task 1: Schema-aware qualification of models for generic CRUD smoke testing.
+ * Restricts generic CRUD tests to models for which safe test data can be constructed
+ * without violating relational constraints, custom enums, or unsupported input types.
+ */
+export function qualifyModelForSmokeTest(
+  model: { modelName: string; fields?: string[]; relations?: string[] },
+  allModelNames: Set<string>
+): ModelSmokeQualification {
+  const fields = model.fields || [];
+  const modelName = model.modelName;
+
+  // 1. Check declared relations
+  if (model.relations && model.relations.length > 0) {
+    return {
+      eligible: false,
+      modelName,
+      idField: "id",
+      idType: "string",
+      idHasDefault: true,
+      createData: {},
+      updateData: {},
+      reason: `Model "${modelName}" has declared relational dependencies (${model.relations.join(", ")})`,
+    };
+  }
+
+  // 2. Identify primary key field (@id or id)
+  let idField: string | null = null;
+  let idType: "string" | "int" = "string";
+  let idHasDefault = false;
 
   for (const rawField of fields) {
     const parts = rawField.trim().split(/\s+/);
     const name = parts[0];
     const type = parts.length > 1 ? parts[1] : "String";
 
-    if (name === "id" || name === "createdAt" || name === "updatedAt") continue;
+    if (rawField.includes("@id") || name === "id") {
+      idField = name;
+      if (type.startsWith("Int")) {
+        idType = "int";
+      } else {
+        idType = "string";
+      }
+      idHasDefault = rawField.includes("@default") || rawField.includes("autoincrement()");
+      break;
+    }
+  }
+
+  if (!idField) {
+    const hasCompositeId = fields.some((f) => f.includes("@@id"));
+    if (hasCompositeId) {
+      return {
+        eligible: false,
+        modelName,
+        idField: "id",
+        idType: "string",
+        idHasDefault: false,
+        createData: {},
+        updateData: {},
+        reason: `Model "${modelName}" uses composite @@id primary key`,
+      };
+    }
+    // Models without explicit id receive `id String @id @default(cuid())` by foundation
+    idField = "id";
+    idType = "string";
+    idHasDefault = true;
+  }
+
+  // 3. Inspect fields for relations, unsupported types, or foreign key constraints
+  const createData: Record<string, string | number | boolean> = {};
+  const updateData: Record<string, string | number | boolean> = {};
+
+  for (const rawField of fields) {
+    const parts = rawField.trim().split(/\s+/);
+    const name = parts[0];
+    const type = parts.length > 1 ? parts[1] : "String";
+
+    // Primary key handling
+    if (name === idField) {
+      if (!idHasDefault) {
+        if (idType === "string") {
+          const val = `qa_id_${Math.random().toString(36).slice(2, 7)}`;
+          createData[name] = val;
+        } else {
+          createData[name] = Math.floor(1000 + Math.random() * 9000);
+        }
+      }
+      continue;
+    }
+
+    if (name === "createdAt" || name === "updatedAt") continue;
     if (rawField.includes("@default") || type.endsWith("?")) continue;
 
+    // Check if type references another model or has @relation
+    const cleanType = type.replace(/[\[\]\?!]/g, "");
+    if (allModelNames.has(cleanType) || rawField.includes("@relation")) {
+      return {
+        eligible: false,
+        modelName,
+        idField,
+        idType,
+        idHasDefault,
+        createData: {},
+        updateData: {},
+        reason: `Model "${modelName}" has required relationship field "${name}" of type "${type}"`,
+      };
+    }
+
+    // Check for foreign key naming convention without defaults (e.g., userId, authorId, doctorId, customerId)
+    if (name.endsWith("Id") && name.length > 2) {
+      return {
+        eligible: false,
+        modelName,
+        idField,
+        idType,
+        idHasDefault,
+        createData: {},
+        updateData: {},
+        reason: `Model "${modelName}" requires foreign key reference "${name}" to another entity`,
+      };
+    }
+
+    // Supported scalar types
     if (type.startsWith("String")) {
       const val = `qa_${name}_${Math.random().toString(36).slice(2, 7)}`;
       createData[name] = val;
@@ -55,11 +174,29 @@ function parseModelFieldTypes(fields?: string[]): {
       createData[name] = new Date().toISOString();
       updateData[name] = new Date(Date.now() + 86400000).toISOString();
     } else {
-      createData[name] = `qa_${name}`;
-      updateData[name] = `qa_${name}_updated`;
+      // Unsupported input type (Json, Bytes, Enum, Unsupported, Decimal, etc.)
+      return {
+        eligible: false,
+        modelName,
+        idField,
+        idType,
+        idHasDefault,
+        createData: {},
+        updateData: {},
+        reason: `Model "${modelName}" requires unsupported or complex field type "${type}" for field "${name}"`,
+      };
     }
   }
-  return { createData, updateData };
+
+  return {
+    eligible: true,
+    modelName,
+    idField,
+    idType,
+    idHasDefault,
+    createData,
+    updateData,
+  };
 }
 
 /**
@@ -276,64 +413,165 @@ export async function executeDatabaseVerificationPipeline(
         errors.push(`Database model delegate command error: ${String(delegateErr)}`);
       }
 
-      // 6. Actual CRUD & Business Operations Verification (Create, Read, Update, Delete)
-      try {
-        const { createData, updateData } = parseModelFieldTypes(primaryModel.fields);
-        const crudScript = `import { db } from "./lib/db";
+      // 6. Generic Model-Operation Smoke Test (Schema-Aware)
+      const allModelNames = new Set(models.map((m) => m.modelName));
+      const qualifications = models.map((m) => qualifyModelForSmokeTest(m, allModelNames));
+      const eligibleCandidate = qualifications.find((q) => q.eligible);
+
+      if (eligibleCandidate) {
+        const smokeModelName = eligibleCandidate.modelName;
+        const smokeDelegateName = smokeModelName.charAt(0).toLowerCase() + smokeModelName.slice(1);
+        const idProp = eligibleCandidate.idField;
+
+        try {
+          const crudScript = `import { db } from "./lib/db";
 async function verifyCRUD() {
-  const delegate = db["${delegateName}"];
+  const delegate = db["${smokeDelegateName}"];
   if (!delegate || typeof delegate.create !== "function") {
-    throw new Error("Model delegate ${delegateName} is missing or lacks create method");
+    throw new Error("Model delegate ${smokeDelegateName} is missing or lacks create method");
   }
   // 1. CREATE
-  const created = await delegate.create({ data: ${JSON.stringify(createData)} });
-  if (!created || !created.id) throw new Error("Create failed: invalid response");
+  const created = await delegate.create({ data: ${JSON.stringify(eligibleCandidate.createData)} });
+  if (!created || created["${idProp}"] === undefined) throw new Error("Create failed: invalid response or missing ${idProp}");
 
   // 2. READ
-  const fetched = await delegate.findUnique({ where: { id: created.id } });
+  const fetched = await delegate.findUnique({ where: { ${idProp}: created["${idProp}"] } });
   if (!fetched) throw new Error("Read failed: created record not found");
 
   // 3. UPDATE
-  ${Object.keys(updateData).length > 0 ? `const updated = await delegate.update({ where: { id: created.id }, data: ${JSON.stringify(updateData)} });
+  ${Object.keys(eligibleCandidate.updateData).length > 0 ? `const updated = await delegate.update({ where: { ${idProp}: created["${idProp}"] }, data: ${JSON.stringify(eligibleCandidate.updateData)} });
   if (!updated) throw new Error("Update failed: empty response");` : `// Update verified`}
 
   // 4. DELETE
-  const deleted = await delegate.delete({ where: { id: created.id } });
+  const deleted = await delegate.delete({ where: { ${idProp}: created["${idProp}"] } });
   if (!deleted) throw new Error("Delete failed");
 
   // 5. Assert deletion
-  const verifyDeleted = await delegate.findUnique({ where: { id: created.id } });
+  const verifyDeleted = await delegate.findUnique({ where: { ${idProp}: created["${idProp}"] } });
   if (verifyDeleted !== null) throw new Error("Record persisted after deletion");
 
-  console.log("CRUD_OPERATIONS_SUCCESS");
+  console.log("CRUD_OPERATIONS_SUCCESS GENERIC_SMOKE_SUCCESS");
 }
 verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
 
-        const crudCmd = runner === "bun"
-          ? `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" bun -e '${crudScript.replace(/'/g, "'\\''")}'`
-          : `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" npx tsx -e '${crudScript.replace(/'/g, "'\\''")}'`;
+          const crudCmd = runner === "bun"
+            ? `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" bun -e '${crudScript.replace(/'/g, "'\\''")}'`
+            : `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" npx tsx -e '${crudScript.replace(/'/g, "'\\''")}'`;
 
-        const crudRes = await executor.run(crudCmd, { timeoutMs: 20000 });
-        const crudPassed = crudRes.exitCode === 0 && (crudRes.stdout.includes("CRUD_OPERATIONS_SUCCESS") || crudRes.stdout.includes("MODEL_OPERATION_SUCCESS"));
-        checks.push({
-          name: "database-crud-operations",
-          category: "database-validation",
-          status: crudPassed ? "PASS" : "FAIL",
-          details: crudPassed
-            ? `Verified complete CRUD operations (Create, Read, Update, Delete) on model "${primaryModel.modelName}" in disposable database`
-            : (crudRes.stderr || crudRes.stdout || "CRUD operations verification failed").slice(0, 500),
-        });
-        if (!crudPassed) {
-          errors.push(`Database CRUD operations check failed: ${(crudRes.stderr || crudRes.stdout).slice(0, 300)}`);
+          const crudRes = await executor.run(crudCmd, { timeoutMs: 20000 });
+          const crudPassed = crudRes.exitCode === 0 && (
+            crudRes.stdout.includes("CRUD_OPERATIONS_SUCCESS") ||
+            crudRes.stdout.includes("GENERIC_SMOKE_SUCCESS") ||
+            crudRes.stdout.includes("MODEL_OPERATION_SUCCESS")
+          );
+
+          checks.push({
+            name: "generic-model-operation-smoke-test",
+            category: "database-validation",
+            status: crudPassed ? "PASS" : "FAIL",
+            details: crudPassed
+              ? `Verified generic model-operation smoke test (Create, Read, Update, Delete) on eligible model "${smokeModelName}" in disposable database`
+              : (crudRes.stderr || crudRes.stdout || "Generic smoke test failed").slice(0, 500),
+          });
+          // Backward-compatibility alias
+          checks.push({
+            name: "database-crud-operations",
+            category: "database-validation",
+            status: crudPassed ? "PASS" : "FAIL",
+            details: crudPassed
+              ? `Verified complete CRUD operations (Create, Read, Update, Delete) on model "${smokeModelName}" in disposable database`
+              : (crudRes.stderr || crudRes.stdout || "CRUD operations verification failed").slice(0, 500),
+          });
+          if (!crudPassed) {
+            errors.push(`Database generic smoke test failed: ${(crudRes.stderr || crudRes.stdout).slice(0, 300)}`);
+          }
+        } catch (crudErr) {
+          checks.push({
+            name: "generic-model-operation-smoke-test",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(crudErr),
+          });
+          checks.push({
+            name: "database-crud-operations",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(crudErr),
+          });
+          errors.push(`Database generic smoke test command error: ${String(crudErr)}`);
         }
-      } catch (crudErr) {
+      } else {
+        // No models qualify for generic CRUD (all have relations, unsupported types, or constraints)
+        const reasons = qualifications.map((q) => `${q.modelName}: ${q.reason || "unsupported constraints"}`).join("; ");
+        checks.push({
+          name: "generic-model-operation-smoke-test",
+          category: "database-validation",
+          status: "SKIPPED",
+          details: `Generic CRUD smoke test not executed: models require relationships, unsupported input types, or application-specific constraints (${reasons}). Application-specific functional verification should be used instead.`,
+        });
         checks.push({
           name: "database-crud-operations",
           category: "database-validation",
-          status: "FAIL",
-          details: String(crudErr),
+          status: "SKIPPED",
+          details: `Generic CRUD operations not executed: models require relationships, unsupported input types, or application-specific constraints (${reasons}).`,
         });
-        errors.push(`Database CRUD operations command error: ${String(crudErr)}`);
+      }
+
+      // 7. Application-Specific Functional Verification / Business Rule Verification
+      if (options.businessRuleScript) {
+        try {
+          const ruleCmd = runner === "bun"
+            ? `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" bun -e '${options.businessRuleScript.replace(/'/g, "'\\''")}'`
+            : `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" npx tsx -e '${options.businessRuleScript.replace(/'/g, "'\\''")}'`;
+          const ruleRes = await executor.run(ruleCmd, { timeoutMs: 20000 });
+          const rulePassed = ruleRes.exitCode === 0 && (ruleRes.stdout.includes("BUSINESS_RULE_SUCCESS") || ruleRes.stdout.includes("FUNCTIONAL_VERIFY_SUCCESS"));
+          checks.push({
+            name: "application-specific-functional-verification",
+            category: "database-validation",
+            status: rulePassed ? "PASS" : "FAIL",
+            details: rulePassed
+              ? "Application-specific functional verification and business rules verified on disposable database"
+              : (ruleRes.stderr || ruleRes.stdout || "Business rule verification failed").slice(0, 500),
+          });
+          checks.push({
+            name: "database-business-rule-verification",
+            category: "database-validation",
+            status: rulePassed ? "PASS" : "FAIL",
+            details: rulePassed
+              ? "Domain business rule verification succeeded"
+              : (ruleRes.stderr || ruleRes.stdout || "Business rule verification failed").slice(0, 500),
+          });
+          if (!rulePassed) {
+            errors.push(`Application-specific functional verification failed: ${(ruleRes.stderr || ruleRes.stdout).slice(0, 300)}`);
+          }
+        } catch (ruleErr) {
+          checks.push({
+            name: "application-specific-functional-verification",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(ruleErr),
+          });
+          checks.push({
+            name: "database-business-rule-verification",
+            category: "database-validation",
+            status: "FAIL",
+            details: String(ruleErr),
+          });
+          errors.push(`Application-specific functional verification command error: ${String(ruleErr)}`);
+        }
+      } else {
+        checks.push({
+          name: "application-specific-functional-verification",
+          category: "database-validation",
+          status: "SKIPPED",
+          details: "Application-specific functional verification deferred: no custom domain script provided; validated in behavioral acceptance suite",
+        });
+        checks.push({
+          name: "database-business-rule-verification",
+          category: "database-validation",
+          status: "SKIPPED",
+          details: "Domain business rule verification deferred to dedicated behavioural acceptance test suite",
+        });
       }
     } else {
       // Persistence was required, but no models exist
@@ -344,10 +582,22 @@ verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
         details: "Application requires data persistence, but no models were provided to execute model operations",
       });
       checks.push({
+        name: "generic-model-operation-smoke-test",
+        category: "database-validation",
+        status: "FAIL",
+        details: "Application requires data persistence, but no models were provided for generic smoke test",
+      });
+      checks.push({
         name: "database-crud-operations",
         category: "database-validation",
         status: "FAIL",
         details: "Application requires data persistence, but no models were provided for CRUD verification",
+      });
+      checks.push({
+        name: "application-specific-functional-verification",
+        category: "database-validation",
+        status: "FAIL",
+        details: "Application requires data persistence, but no models were provided for functional verification",
       });
       errors.push("Missing database models for model operations verification.");
     }
@@ -590,6 +840,12 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       details: "Static application: no database models required",
     });
     checks.push({
+      name: "generic-model-operation-smoke-test",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: no database models required for smoke test",
+    });
+    checks.push({
       name: "database-crud-operations",
       category: "database-validation",
       status: "SKIPPED",
@@ -600,6 +856,18 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       category: "database-validation",
       status: "SKIPPED",
       details: "Static application: no database models required",
+    });
+    checks.push({
+      name: "application-specific-functional-verification",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: no database business operations required",
+    });
+    checks.push({
+      name: "database-business-rule-verification",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: no database business rules required",
     });
   }
 

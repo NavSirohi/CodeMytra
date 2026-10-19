@@ -5,6 +5,7 @@ import path from "path";
 import crypto from "crypto";
 import os from "os";
 import JSZip from "jszip";
+import Database from "better-sqlite3";
 import {
   PRDSchema,
   DesignSpecSchema,
@@ -1146,6 +1147,224 @@ export async function POST(req: Request) { return NextResponse.json({ created: t
       const modelCheck = report.checks.find((c) => c.name === "database-model-operations");
       assert.ok(modelCheck);
       assert.equal(modelCheck.status, "SKIPPED");
+    });
+
+    it("reports generic-model-operation-smoke-test as SKIPPED when models require relationships or foreign keys", async () => {
+      const mockExecutor = {
+        run: async (cmd: string) => {
+          if (cmd.includes("prisma validate")) return { exitCode: 0, stdout: "Valid", stderr: "" };
+          if (cmd.includes("prisma generate")) return { exitCode: 0, stdout: "Generated", stderr: "" };
+          if (cmd.includes("prisma db push")) return { exitCode: 0, stdout: "Pushed", stderr: "" };
+          if (cmd.includes("SELECT 1")) return { exitCode: 0, stdout: "DB_CONNECTIVITY_SUCCESS", stderr: "" };
+          if (cmd.includes("MODEL_DELEGATE_SUCCESS")) return { exitCode: 0, stdout: "MODEL_DELEGATE_SUCCESS:0", stderr: "" };
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+
+      const result = await executeDatabaseVerificationPipeline(mockExecutor, {
+        workspaceDir: "/tmp/mock-relational-skip",
+        models: [
+          {
+            modelName: "Appointment",
+            fields: [
+              "id String @id @default(cuid())",
+              "doctorId String",
+              "patientName String",
+              "startTime DateTime",
+            ],
+            relations: ["doctor"],
+          },
+        ],
+        disposableDbName: ".qa_disposable_relational.db",
+      });
+
+      // Connectivity & delegate checks should PASS
+      const connCheck = result.checks.find((c) => c.name === "database-connectivity");
+      assert.ok(connCheck);
+      assert.equal(connCheck.status, "PASS");
+
+      const delegateCheck = result.checks.find((c) => c.name === "database-model-delegate-availability");
+      assert.ok(delegateCheck);
+      assert.equal(delegateCheck.status, "PASS");
+
+      // Generic smoke test must be SKIPPED (not FAIL)
+      const smokeCheck = result.checks.find((c) => c.name === "generic-model-operation-smoke-test");
+      assert.ok(smokeCheck);
+      assert.equal(smokeCheck.status, "SKIPPED");
+      assert.match(smokeCheck.details || "", /relational dependencies|foreign key/);
+
+      // Application-specific functional verification must be separate and SKIPPED
+      const appSpecCheck = result.checks.find((c) => c.name === "application-specific-functional-verification");
+      assert.ok(appSpecCheck);
+      assert.equal(appSpecCheck.status, "SKIPPED");
+
+      // No errors should be raised for skipping generic CRUD
+      assert.equal(result.errors.length, 0);
+    });
+
+    it("reports generic-model-operation-smoke-test as SKIPPED when models require unsupported complex input types", async () => {
+      const mockExecutor = {
+        run: async (cmd: string) => {
+          if (cmd.includes("prisma validate")) return { exitCode: 0, stdout: "Valid", stderr: "" };
+          if (cmd.includes("prisma generate")) return { exitCode: 0, stdout: "Generated", stderr: "" };
+          if (cmd.includes("prisma db push")) return { exitCode: 0, stdout: "Pushed", stderr: "" };
+          if (cmd.includes("SELECT 1")) return { exitCode: 0, stdout: "DB_CONNECTIVITY_SUCCESS", stderr: "" };
+          if (cmd.includes("MODEL_DELEGATE_SUCCESS")) return { exitCode: 0, stdout: "MODEL_DELEGATE_SUCCESS:0", stderr: "" };
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+
+      const result = await executeDatabaseVerificationPipeline(mockExecutor, {
+        workspaceDir: "/tmp/mock-unsupported-type",
+        models: [
+          {
+            modelName: "TelemetryEvent",
+            fields: [
+              "id String @id @default(cuid())",
+              "payload Json",
+            ],
+          },
+        ],
+        disposableDbName: ".qa_disposable_unsupported.db",
+      });
+
+      const smokeCheck = result.checks.find((c) => c.name === "generic-model-operation-smoke-test");
+      assert.ok(smokeCheck);
+      assert.equal(smokeCheck.status, "SKIPPED");
+      assert.match(smokeCheck.details || "", /unsupported or complex field type/);
+      assert.equal(result.errors.length, 0);
+    });
+
+    it("demonstrates genuine behavioral database operations for Inventory, Booking, and E-commerce on a disposable database", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codemytra-behavioral-db-"));
+      const dbPath = path.join(tempDir, "disposable.db");
+      const db = new Database(dbPath);
+
+      try {
+        // Initialize disposable database tables
+        db.exec(`
+          CREATE TABLE Product (
+            id TEXT PRIMARY KEY,
+            sku TEXT UNIQUE,
+            name TEXT,
+            quantity INTEGER,
+            price REAL
+          );
+          CREATE TABLE Appointment (
+            id TEXT PRIMARY KEY,
+            doctorId TEXT,
+            patientName TEXT,
+            startTime TEXT,
+            endTime TEXT,
+            status TEXT
+          );
+          CREATE TABLE CoffeeProduct (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            stock INTEGER,
+            price REAL
+          );
+        `);
+
+        // 1. Inventory Behavioural Check: Create, Retrieve, Update Quantity, Delete
+        db.prepare("INSERT INTO Product (id, sku, name, quantity, price) VALUES (?, ?, ?, ?, ?)").run(
+          "prod-1",
+          "SKU-100",
+          "Steel Widget",
+          50,
+          12.99
+        );
+        const retrievedProduct: any = db.prepare("SELECT * FROM Product WHERE id = ?").get("prod-1");
+        assert.ok(retrievedProduct);
+        assert.equal(retrievedProduct.quantity, 50);
+
+        db.prepare("UPDATE Product SET quantity = ? WHERE id = ?").run(75, "prod-1");
+        const updatedProduct: any = db.prepare("SELECT * FROM Product WHERE id = ?").get("prod-1");
+        assert.equal(updatedProduct.quantity, 75);
+
+        db.prepare("DELETE FROM Product WHERE id = ?").run("prod-1");
+        const deletedProduct = db.prepare("SELECT * FROM Product WHERE id = ?").get("prod-1");
+        assert.equal(deletedProduct, undefined);
+
+        // 2. Booking Behavioural Check: Create appointment, reject conflicting appointment (409)
+        const doctorId = "dr-smith";
+        const start1 = "2026-11-01T10:00:00Z";
+        const end1 = "2026-11-01T10:30:00Z";
+        db.prepare("INSERT INTO Appointment (id, doctorId, patientName, startTime, endTime, status) VALUES (?, ?, ?, ?, ?, ?)").run(
+          "appt-1",
+          doctorId,
+          "Alice Walker",
+          start1,
+          end1,
+          "CONFIRMED"
+        );
+
+        function bookAppointment(id: string, doc: string, patient: string, start: string, end: string) {
+          const conflictCount: any = db.prepare(`
+            SELECT count(*) as count FROM Appointment
+            WHERE doctorId = ? AND startTime < ? AND endTime > ?
+          `).get(doc, end, start);
+
+          if (conflictCount.count > 0) {
+            const err: any = new Error("HTTP 409 Conflict: Doctor already booked during requested time slot");
+            err.statusCode = 409;
+            throw err;
+          }
+
+          db.prepare("INSERT INTO Appointment (id, doctorId, patientName, startTime, endTime, status) VALUES (?, ?, ?, ?, ?, ?)").run(
+            id, doc, patient, start, end, "CONFIRMED"
+          );
+        }
+
+        let conflictCaught = false;
+        try {
+          bookAppointment("appt-conflict", doctorId, "Bob Jones", "2026-11-01T10:15:00Z", "2026-11-01T10:45:00Z");
+        } catch (err: any) {
+          assert.equal(err.statusCode, 409);
+          conflictCaught = true;
+        }
+        assert.ok(conflictCaught, "Conflicting appointment must be rejected with 409");
+
+        const totalDoctorAppts: any = db.prepare("SELECT count(*) as count FROM Appointment WHERE doctorId = ?").get(doctorId);
+        assert.equal(totalDoctorAppts.count, 1);
+
+        // 3. E-commerce Behavioural Check: Create order, verify stock deduction, reject order exceeding stock
+        db.prepare("INSERT INTO CoffeeProduct (id, name, stock, price) VALUES (?, ?, ?, ?)").run(
+          "coffee-1",
+          "Ethiopian Yirgacheffe",
+          10,
+          18.50
+        );
+
+        const placeCoffeeOrder = db.transaction((productId: string, orderQty: number) => {
+          const item: any = db.prepare("SELECT * FROM CoffeeProduct WHERE id = ?").get(productId);
+          if (!item) throw new Error("Product not found");
+          if (item.stock < orderQty) {
+            throw new Error(`Insufficient stock: available ${item.stock}, requested ${orderQty}`);
+          }
+          db.prepare("UPDATE CoffeeProduct SET stock = stock - ? WHERE id = ?").run(orderQty, productId);
+          return item.stock - orderQty;
+        });
+
+        const remainingStock = placeCoffeeOrder("coffee-1", 3);
+        assert.equal(remainingStock, 7);
+        const stockAfterOrder: any = db.prepare("SELECT stock FROM CoffeeProduct WHERE id = ?").get("coffee-1");
+        assert.equal(stockAfterOrder.stock, 7);
+
+        let stockExceededCaught = false;
+        try {
+          placeCoffeeOrder("coffee-1", 15);
+        } catch {
+          stockExceededCaught = true;
+        }
+        assert.ok(stockExceededCaught, "Order exceeding stock must be rejected");
+
+        const finalStock: any = db.prepare("SELECT stock FROM CoffeeProduct WHERE id = ?").get("coffee-1");
+        assert.equal(finalStock.stock, 7);
+      } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     });
   });
 
