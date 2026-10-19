@@ -54,8 +54,110 @@ export class GenerationTimeoutError extends Error {
 }
 
 /**
+ * Persisted Run Deadline & Timeout Context.
+ *
+ * NOTE ON EXTERNAL PROVIDER NON-PREEMPTIVE CANCELLATION:
+ * External AI providers (e.g. Google Gemini API via SDK/HTTP) and sandbox subprocesses
+ * (e.g. npm install, next build inside E2B container) execute out-of-process.
+ * Standard cloud SDKs and child-process wrappers cannot be preemptively interrupted mid-flight
+ * without aborting underlying TCP sockets or killing entire containers.
+ *
+ * Timeout semantics in CodeMytra are therefore cooperative:
+ * 1. Deadlines are established from persisted run start timestamps (startedAt/createdAt) so retries
+ *    do not reset the allowed budget.
+ * 2. Stage boundaries and loop iterations check remaining time via `checkGenerationDeadline`.
+ * 3. Out-of-process calls are passed bounded timeouts via `boundOperationTimeout`.
+ * 4. Once an external call completes or fails, if the overall run deadline has passed,
+ *    subsequent work/repairs are aborted immediately, the run is finalized with
+ *    errorCode "GENERATION_TIMEOUT", and existing project revisions are strictly preserved.
+ */
+export interface RunDeadlineContext {
+  startedAtMs: number;
+  deadlineMs: number;
+  maxDurationMs: number;
+}
+
+/**
+ * Establishes a deterministic deadline from a persisted database timestamp (startedAt or createdAt).
+ * Preserves the overall deadline across Inngest step retries and prevents retries from resetting the clock.
+ */
+export function establishRunDeadline(
+  startedAtOrCreatedAt: Date | number,
+  maxDurationMs: number = GENERATION_LIMITS.maxGenerationDurationMs
+): RunDeadlineContext {
+  const startedAtMs =
+    startedAtOrCreatedAt instanceof Date
+      ? startedAtOrCreatedAt.getTime()
+      : typeof startedAtOrCreatedAt === "number"
+      ? startedAtOrCreatedAt
+      : Date.now();
+
+  return {
+    startedAtMs,
+    deadlineMs: startedAtMs + maxDurationMs,
+    maxDurationMs,
+  };
+}
+
+/**
+ * Returns remaining milliseconds before the deadline expires, floored at 0.
+ */
+export function getRemainingTimeMs(deadlineMs: number): number {
+  return Math.max(0, deadlineMs - Date.now());
+}
+
+/**
+ * Returns true if the deadline has passed.
+ */
+export function isPastDeadline(deadlineMs: number): boolean {
+  return Date.now() >= deadlineMs;
+}
+
+/**
+ * Validates that the generation has not exceeded its persisted deadline.
+ * Throws GenerationTimeoutError if expired.
+ */
+export function checkGenerationDeadline(
+  deadlineMs: number,
+  stageName: string,
+  maxDurationMs: number = GENERATION_LIMITS.maxGenerationDurationMs
+): void {
+  const remaining = getRemainingTimeMs(deadlineMs);
+  if (remaining <= 0) {
+    const elapsedMs = maxDurationMs + (Date.now() - deadlineMs);
+    throw new GenerationTimeoutError(
+      `Generation timed out before stage "${stageName}": elapsed ${elapsedMs}ms exceeds limit of ${maxDurationMs}ms`,
+      elapsedMs,
+      maxDurationMs
+    );
+  }
+}
+
+/**
+ * Bounds an individual operation timeout (e.g. sandbox command or SDK call)
+ * so it never requests more time than remaining before the run deadline.
+ * Throws GenerationTimeoutError if insufficient budget (< minFloorMs) remains.
+ */
+export function boundOperationTimeout(
+  deadlineMs: number,
+  maxOperationTimeoutMs: number,
+  minFloorMs = 5000,
+  stageName = "operation"
+): number {
+  const remainingMs = getRemainingTimeMs(deadlineMs);
+  if (remainingMs < minFloorMs) {
+    throw new GenerationTimeoutError(
+      `Generation timed out: insufficient budget (${remainingMs}ms < ${minFloorMs}ms) for ${stageName}`,
+      GENERATION_LIMITS.maxGenerationDurationMs - remainingMs,
+      GENERATION_LIMITS.maxGenerationDurationMs
+    );
+  }
+  return Math.min(maxOperationTimeoutMs, remainingMs);
+}
+
+/**
  * Checks whether the current generation run has exceeded its maximum configured duration.
- * Throws a GenerationTimeoutError if the limit is exceeded.
+ * Kept for backward compatibility.
  */
 export function checkGenerationTimeout(
   startedAtMs: number,

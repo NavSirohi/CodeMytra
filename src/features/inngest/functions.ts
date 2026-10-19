@@ -40,8 +40,12 @@ import {
   canBypassPlanningAndArchitecture,
   filterRelevantFiles,
   selectModelForStage,
-  checkGenerationTimeout,
   GenerationTimeoutError,
+  establishRunDeadline,
+  getRemainingTimeMs,
+  isPastDeadline,
+  checkGenerationDeadline,
+  GENERATION_LIMITS,
 } from "@/server/orchestration/stage-optimizer";
 
 export interface CodeAgentState {
@@ -121,7 +125,10 @@ export const codeAgentFunction = inngest.createFunction(
 
         const isTimeout =
           error instanceof GenerationTimeoutError ||
-          (typeof error?.message === "string" && error.message.includes("timed out"));
+          (typeof error?.message === "string" &&
+            (error.message.includes("timed out") ||
+             error.message.includes("GenerationTimeoutError"))) ||
+          (error instanceof Error && error.name === "GenerationTimeoutError");
         const errorCode = isTimeout ? "GENERATION_TIMEOUT" : "WORKFLOW_EXECUTION_FAILED";
 
         await finalizeGenerationFailure({
@@ -147,12 +154,32 @@ export const codeAgentFunction = inngest.createFunction(
     const runId = event.data.runId as string;
     const promptValue = event.data.value as string;
     const baseRevisionId = (event.data.baseRevisionId as string) || undefined;
-    const workflowStartTime = Date.now();
-
     // Enforce required persisted runId
     if (!runId) {
       throw new Error("Missing required persisted runId for generation execution");
     }
+
+    // Establish persisted start time and deterministic deadline across Inngest retries
+    const existingRun = await prisma.generationRun.findUnique({
+      where: { id: runId },
+      select: { startedAt: true, createdAt: true },
+    });
+
+    let persistedStart = existingRun?.startedAt ?? null;
+    if (!persistedStart) {
+      const now = new Date();
+      await prisma.generationRun
+        .update({
+          where: { id: runId },
+          data: { startedAt: now },
+        })
+        .catch((err) => console.warn("[Generation] Could not update startedAt:", err));
+      persistedStart = now;
+    }
+
+    const { deadlineMs, startedAtMs } = establishRunDeadline(
+      persistedStart || existingRun?.createdAt || Date.now()
+    );
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 0: RESOLVE BASE FILES & EXISTING SPECIFICATIONS
@@ -188,7 +215,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 1: REQUIREMENTS & PLANNING (Planner Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
     const prd = await step.run("planner-agent", async () => {
-      checkGenerationTimeout(workflowStartTime, "planning");
+      checkGenerationDeadline(deadlineMs, "planning");
       await transitionRun(runId, GenerationRunStatus.PLANNING);
       const stageStart = Date.now();
       const plannerModel = selectModelForStage("planning", { isComplexFullstack: false });
@@ -256,7 +283,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 2: DESIGN SPECIFICATION (Design Agent with Gemini 2.5 Flash)
     // ─────────────────────────────────────────────────────────────────────────
     const designSpec = await step.run("designer-agent", async () => {
-      checkGenerationTimeout(workflowStartTime, "design");
+      checkGenerationDeadline(deadlineMs, "design");
       await transitionRun(runId, GenerationRunStatus.DESIGNING);
       const stageStart = Date.now();
       const designerModel = selectModelForStage("design");
@@ -314,7 +341,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 3: ARCHITECTURE & CONTRACTS (Architecture Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
     const archSpec = await step.run("architect-agent", async () => {
-      checkGenerationTimeout(workflowStartTime, "architecture");
+      checkGenerationDeadline(deadlineMs, "architecture");
       await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
       const stageStart = Date.now();
       const architectModel = selectModelForStage("architecture");
@@ -388,7 +415,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     const sandboxId = await step.run("get-sandbox-id-and-restore", async () => {
-      checkGenerationTimeout(workflowStartTime, "sandbox-init");
+      checkGenerationDeadline(deadlineMs, "sandbox-init");
       const stageStart = Date.now();
       // 1. Validate manifest before restoring
       if (baseRev?.manifest) {
@@ -479,7 +506,7 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 5: IMPLEMENTATION (Authoritative Coding Agent Engine)
     // ─────────────────────────────────────────────────────────────────────────
-    checkGenerationTimeout(workflowStartTime, "coding");
+    checkGenerationDeadline(deadlineMs, "coding");
     const effectiveBaseFiles = Object.keys(baseFiles).length === 0
       ? getBaseProjectFiles({
           projectName: prd.projectName,
@@ -577,7 +604,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 7: QUALITY ASSURANCE, VERIFICATION & BOUNDED REPAIR
     // ─────────────────────────────────────────────────────────────────────────
     const qaResult = await step.run("qa-agent", async () => {
-      checkGenerationTimeout(workflowStartTime, "qa-and-repair");
+      checkGenerationDeadline(deadlineMs, "qa-and-repair");
       await transitionRun(runId, GenerationRunStatus.VALIDATING);
       await recordRunEvent(runId, "VALIDATING", "QA Agent", "Running comprehensive sandbox verification pipeline");
       const qaStageStart = Date.now();
@@ -601,6 +628,21 @@ export const codeAgentFunction = inngest.createFunction(
 
       // Bounded self-repair (1 repair iteration)
       if (!report.passed && report.repairNeeded) {
+        // Enforce timeout: stop scheduling new repair after deadline or with insufficient budget
+        if (isPastDeadline(deadlineMs) || getRemainingTimeMs(deadlineMs) < 15000) {
+          await recordRunEvent(
+            runId,
+            "VALIDATING",
+            "QA Agent",
+            `Generation deadline reached or insufficient time remaining (${getRemainingTimeMs(deadlineMs)}ms remaining). Skipping self-repair.`
+          );
+          throw new GenerationTimeoutError(
+            `Generation timed out: cannot initiate repair attempt with ${getRemainingTimeMs(deadlineMs)}ms remaining (deadline exceeded)`,
+            Date.now() - startedAtMs,
+            GENERATION_LIMITS.maxGenerationDurationMs
+          );
+        }
+
         repairAttempts++;
         await recordRunEvent(
           runId,
@@ -643,7 +685,8 @@ Conclude with an updated <task_summary>...</task_summary>.
           }
           repairModelUsed = repairResult.modelId || repairModel;
 
-          // Re-verify after repair attempt
+          // Re-verify after repair attempt, enforcing deadline
+          checkGenerationDeadline(deadlineMs, "qa-repair-verify");
           report = await runQAInspector({
             files: currentFiles,
             summary: currentSummary,
@@ -653,6 +696,9 @@ Conclude with an updated <task_summary>...</task_summary>.
             capabilities: prd.capabilities,
           });
         } catch (repairErr) {
+          if (repairErr instanceof GenerationTimeoutError) {
+            throw repairErr;
+          }
           console.error("[QA Repair] Repair loop execution failed:", repairErr);
         }
       }

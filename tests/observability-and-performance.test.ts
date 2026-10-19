@@ -15,6 +15,11 @@ import {
   checkGenerationTimeout,
   GenerationTimeoutError,
   GENERATION_LIMITS,
+  establishRunDeadline,
+  getRemainingTimeMs,
+  isPastDeadline,
+  checkGenerationDeadline,
+  boundOperationTimeout,
 } from "../src/server/orchestration/stage-optimizer";
 import { getGeminiModel } from "../src/server/providers/gemini";
 import { PRD, ArchitectureSpec } from "../src/server/agent-contracts/schemas";
@@ -616,6 +621,59 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
           maxConcurrentRunsPerUser: 3,
           maxInputFilesForContext: 30,
         })
+      );
+    });
+
+    it("establishes deterministic deadline from persisted start time and preserves it across retries", () => {
+      const persistedStart = new Date(1700000000000);
+      const ctx = establishRunDeadline(persistedStart, 300000);
+
+      assert.equal(ctx.startedAtMs, 1700000000000);
+      assert.equal(ctx.deadlineMs, 1700000000000 + 300000);
+      assert.equal(ctx.maxDurationMs, 300000);
+
+      // Simulating Inngest step retry 2 minutes later: deadline remains derived from persisted start
+      const retryCtx = establishRunDeadline(persistedStart, 300000);
+      assert.equal(retryCtx.deadlineMs, ctx.deadlineMs, "Deadline must be invariant across step retries");
+    });
+
+    it("detects expired deadline and throws GenerationTimeoutError with diagnostics", () => {
+      const expiredDeadline = Date.now() - 1000; // Expired 1 second ago
+
+      assert.equal(isPastDeadline(expiredDeadline), true);
+      assert.equal(getRemainingTimeMs(expiredDeadline), 0);
+
+      assert.throws(
+        () => checkGenerationDeadline(expiredDeadline, "qa-and-repair", 300000),
+        (err: any) => {
+          assert.ok(err instanceof GenerationTimeoutError);
+          assert.match(err.message, /timed out before stage "qa-and-repair"/);
+          assert.ok(err.durationMs >= 300000);
+          return true;
+        }
+      );
+    });
+
+    it("bounds individual operation timeouts and prevents scheduling when budget is insufficient", () => {
+      // 1. Adequate budget remaining: clamps operation timeout to maxOperationTimeoutMs
+      const generousDeadline = Date.now() + 60000; // 60s remaining
+      const bounded1 = boundOperationTimeout(generousDeadline, 15000);
+      assert.equal(bounded1, 15000);
+
+      // 2. Budget tighter than requested operation timeout: clamps to remaining budget
+      const tightDeadline = Date.now() + 10000; // 10s remaining
+      const bounded2 = boundOperationTimeout(tightDeadline, 30000);
+      assert.ok(bounded2 <= 10000 && bounded2 >= 9000);
+
+      // 3. Insufficient budget (< minFloorMs): aborts operation scheduling immediately
+      const exhaustedDeadline = Date.now() + 2000; // only 2s remaining (< 5s minFloor)
+      assert.throws(
+        () => boundOperationTimeout(exhaustedDeadline, 30000, 5000, "qa-repair"),
+        (err: any) => {
+          assert.ok(err instanceof GenerationTimeoutError);
+          assert.match(err.message, /insufficient budget/);
+          return true;
+        }
       );
     });
 

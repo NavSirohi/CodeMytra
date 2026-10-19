@@ -33,12 +33,20 @@ export const createMessage = async (value: string, projectId: string) => {
     throw new Error("Prompt exceeds maximum length of 4000 characters");
   }
 
-  // Database-level coordination: execute row lock and active run check atomically
+  // Database-level coordination: execute row locks and active run check atomically
   const { newMessage, outboxEvent } = await prisma.$transaction(async (tx) => {
-    // 1. Lock project row to serialize concurrent generation requests for this project
+    // 1. Lock user row to serialize concurrent run admissions per user across all projects
+    // In PostgreSQL / Prisma migrations, User model is mapped to "users" table, while in some test schemas it's "User".
+    const userTable = await tx.$queryRawUnsafe<Array<{ tablename: string }>>(
+      `SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('users', 'User') ORDER BY (tablename = 'User') DESC LIMIT 1`
+    ).catch(() => []);
+    const userTableName = userTable[0]?.tablename || "User";
+    await tx.$queryRawUnsafe(`SELECT id FROM "${userTableName}" WHERE id = $1 FOR UPDATE`, user.id);
+
+    // 2. Lock project row to serialize concurrent generation requests for this project
     await tx.$queryRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR UPDATE`, projectId);
 
-    // 2. Check project existence and ownership under lock
+    // 3. Check project existence and ownership under lock
     const project = await tx.project.findUnique({
       where: {
         id: projectId,
@@ -54,7 +62,7 @@ export const createMessage = async (value: string, projectId: string) => {
       throw new Error("Project not found");
     }
 
-    // 3. Concurrency check: Ensure no active run exists for this project
+    // 4. Concurrency check: Ensure no active run exists for this project
     const activeRun = await tx.generationRun.findFirst({
       where: {
         projectId,
@@ -76,7 +84,7 @@ export const createMessage = async (value: string, projectId: string) => {
       throw new Error("A generation run is already in progress for this project. Please wait for it to complete.");
     }
 
-    // 4. Enforce per-user concurrent run limit across all user projects
+    // 5. Enforce per-user concurrent run limit across all user projects under user row lock
     const userActiveRunsCount = await tx.generationRun.count({
       where: {
         userId: user.id,
