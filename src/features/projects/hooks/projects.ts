@@ -92,6 +92,10 @@ export const isGenerationActiveStatus = (status?: string | null): boolean => {
   );
 };
 
+export const getActiveRunPollInterval = (status?: string | null): number | false => {
+  return isGenerationActiveStatus(status) ? 2000 : false;
+};
+
 export const useGetActiveGenerationRun = (projectId: string) => {
   return useQuery({
     queryKey: ["active-generation-run", projectId],
@@ -101,8 +105,7 @@ export const useGetActiveGenerationRun = (projectId: string) => {
     },
     enabled: Boolean(projectId),
     refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      return isGenerationActiveStatus(status) ? 2000 : false;
+      return getActiveRunPollInterval(query.state.data?.status);
     },
   });
 };

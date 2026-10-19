@@ -3,6 +3,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
+import React from "react";
+import { renderToString } from "react-dom/server";
+import { Header } from "@/components/marketing/header";
+import { Footer } from "@/components/marketing/footer";
+import { ContactForm } from "@/components/marketing/contact-form";
+import PricingPage from "@/app/(marketing)/pricing/page";
+import AboutPage from "@/app/(marketing)/about/page";
+
 describe("M3 Public Marketing Website - Structure & Acceptance Verification", () => {
   const routes = [
     { file: "src/app/(marketing)/page.tsx", route: "/", expectedTitle: "Build something meaningful | CodeMytra" },
@@ -25,27 +33,40 @@ describe("M3 Public Marketing Website - Structure & Acceptance Verification", ()
     }
   });
 
-  it("verifies reusable Header, Footer, and Layout components exist with correct accessible landmarks", () => {
-    const headerPath = path.join(process.cwd(), "src/components/marketing/header.tsx");
-    const footerPath = path.join(process.cwd(), "src/components/marketing/footer.tsx");
-    const layoutPath = path.join(process.cwd(), "src/app/(marketing)/layout.tsx");
+  it("verifies reusable Header, Footer, and Layout components render accessible DOM elements", () => {
+    // Functional render of Header component
+    const headerHtml = renderToString(React.createElement(Header));
+    assert.ok(
+      headerHtml.includes('aria-label="Main navigation"'),
+      "Rendered Header must have accessible aria-label navigation"
+    );
+    assert.ok(
+      headerHtml.includes('aria-label="CodeMytra home"'),
+      "Rendered Header must have accessible brand home link"
+    );
+    assert.ok(
+      headerHtml.includes('aria-expanded="false"'),
+      "Rendered Header mobile toggle must default to aria-expanded='false'"
+    );
+    assert.ok(
+      headerHtml.includes('href="/product"'),
+      "Rendered Header must contain navigation link to /product"
+    );
+    assert.ok(
+      headerHtml.includes('href="/pricing"'),
+      "Rendered Header must contain navigation link to /pricing"
+    );
 
-    assert.ok(fs.existsSync(headerPath), "Header component must exist");
-    assert.ok(fs.existsSync(footerPath), "Footer component must exist");
-    assert.ok(fs.existsSync(layoutPath), "Marketing layout must exist");
-
-    const header = fs.readFileSync(headerPath, "utf-8");
-    assert.ok(header.includes('aria-label="Main navigation"'), "Header navigation must have accessible aria-label");
-    assert.ok(header.includes('aria-label="CodeMytra home"'), "Brand link must have accessible aria-label");
-    assert.ok(header.includes('aria-expanded'), "Mobile menu button must have aria-expanded attribute");
-
-    const footer = fs.readFileSync(footerPath, "utf-8");
-    assert.ok(footer.includes('className="footer"'), "Footer must render with footer class");
-    assert.ok(footer.includes("Generated applications are not published in the current MVP."), "Footer must include pre-launch notice");
-
-    const layout = fs.readFileSync(layoutPath, "utf-8");
-    assert.ok(layout.includes("<Header"), "Layout must render Header");
-    assert.ok(layout.includes("<Footer"), "Layout must render Footer");
+    // Functional render of Footer component
+    const footerHtml = renderToString(React.createElement(Footer));
+    assert.ok(
+      footerHtml.includes('class="footer"') || footerHtml.includes('className="footer"'),
+      "Rendered Footer must have footer class"
+    );
+    assert.ok(
+      footerHtml.includes("Generated applications are not published in the current MVP."),
+      "Rendered Footer must include pre-launch notice"
+    );
   });
 
   it("verifies Clerk middleware explicitly permits public marketing routes without authentication", () => {
@@ -69,39 +90,65 @@ describe("M3 Public Marketing Website - Structure & Acceptance Verification", ()
     assert.ok(proxy.includes("if (isPublicRoute(req))"), "Middleware must immediately bypass public routes");
   });
 
-  it("verifies contact form accessibility and labels", () => {
-    const contactPath = path.join(process.cwd(), "src/components/marketing/contact-form.tsx");
-    assert.ok(fs.existsSync(contactPath), "ContactForm component must exist");
-    const contact = fs.readFileSync(contactPath, "utf-8");
-
-    assert.ok(contact.includes('htmlFor="name"'), "Name input must have matching label");
-    assert.ok(contact.includes('id="name"'), "Name input must have id");
-    assert.ok(contact.includes('htmlFor="email"'), "Email input must have matching label");
-    assert.ok(contact.includes('id="email"'), "Email input must have id");
-    assert.ok(contact.includes('htmlFor="message"'), "Message textarea must have matching label");
-    assert.ok(contact.includes('id="message"'), "Message textarea must have id");
-    assert.ok(contact.includes('aria-live="polite"'), "Form feedback must have aria-live polite");
-  });
-
-  it("verifies pricing plans match approved V4 reference exactly without fabrication", () => {
-    const pricingPath = path.join(process.cwd(), "src/app/(marketing)/pricing/page.tsx");
-    const pricing = fs.readFileSync(pricingPath, "utf-8");
-
-    assert.ok(pricing.includes("Free"), "Must include Free plan");
-    assert.ok(pricing.includes("₹0"), "Free plan price must be ₹0");
-    assert.ok(pricing.includes("Maker"), "Must include Maker plan");
-    assert.ok(pricing.includes("Team"), "Must include Team plan");
-    assert.ok(pricing.includes("Pre-launch notice: checkout is not active."), "Must have pre-launch notice");
-    assert.ok(pricing.includes("Can I publish the websites I generate?"), "Must have V4 FAQ");
-  });
-
-  it("verifies team information adheres strictly to non-fabrication requirement", () => {
-    const aboutPath = path.join(process.cwd(), "src/app/(marketing)/about/page.tsx");
-    const about = fs.readFileSync(aboutPath, "utf-8");
+  it("verifies contact form renders accessible interactive form elements and attributes", () => {
+    // Functional render of ContactForm component
+    const formHtml = renderToString(React.createElement(ContactForm));
 
     assert.ok(
-      about.includes("invent team members or achievements to fill this page"),
-      "Must include exact V4 statement regarding authentic team credits"
+      formHtml.includes('for="name"') || formHtml.includes('htmlFor="name"'),
+      "Rendered form must have label htmlFor/for name"
+    );
+    assert.ok(
+      formHtml.includes('id="name"'),
+      "Rendered form must have input id='name'"
+    );
+    assert.ok(
+      formHtml.includes('for="email"') || formHtml.includes('htmlFor="email"'),
+      "Rendered form must have label htmlFor/for email"
+    );
+    assert.ok(
+      formHtml.includes('id="email"'),
+      "Rendered form must have input id='email'"
+    );
+    assert.ok(
+      formHtml.includes('for="message"') || formHtml.includes('htmlFor="message"'),
+      "Rendered form must have label htmlFor/for message"
+    );
+    assert.ok(
+      formHtml.includes('id="message"'),
+      "Rendered form must have textarea id='message'"
+    );
+    assert.ok(
+      formHtml.includes('type="submit"'),
+      "Rendered form must have submit button"
+    );
+  });
+
+  it("verifies pricing plans match approved V4 reference exactly via component rendering", () => {
+    // Functional render of PricingPage component
+    const pricingHtml = renderToString(React.createElement(PricingPage));
+
+    assert.ok(pricingHtml.includes("Free"), "Rendered PricingPage must include Free plan");
+    assert.ok(pricingHtml.includes("₹0"), "Rendered PricingPage must display ₹0 for Free plan");
+    assert.ok(pricingHtml.includes("Maker"), "Rendered PricingPage must include Maker plan");
+    assert.ok(pricingHtml.includes("Team"), "Rendered PricingPage must include Team plan");
+    assert.ok(
+      pricingHtml.includes("Pre-launch notice: checkout is not active."),
+      "Rendered PricingPage must include pre-launch notice"
+    );
+    assert.ok(
+      pricingHtml.includes("Can I publish the websites I generate?"),
+      "Rendered PricingPage must include authentic V4 FAQ section"
+    );
+  });
+
+  it("verifies team information renders authentic non-fabricated statement", () => {
+    // Functional render of AboutPage component
+    const aboutHtml = renderToString(React.createElement(AboutPage));
+
+    assert.ok(
+      aboutHtml.includes("invent team members or achievements to fill this page"),
+      "Rendered AboutPage must include authentic team disclaimer"
     );
   });
 

@@ -2,42 +2,22 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import JSZip from "jszip";
 import { QueryClient } from "@tanstack/react-query";
-import { isGenerationActiveStatus } from "@/features/projects/hooks/projects";
+import {
+  resolveMessagePollInterval,
+} from "@/features/messages/hooks/messages";
+import {
+  isGenerationActiveStatus,
+  getActiveRunPollInterval,
+} from "@/features/projects/hooks/projects";
 import { generateProjectZip } from "@/server/export/zip-export";
 import { prisma } from "@/lib/db";
 import { parseFragmentFiles, type ProjectFragment } from "@/features/projects/fragment-types";
 
 describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
   describe("Task 1: Conversation Polling & QueryClient Lifecycle", () => {
-    function computeMessagePollInterval(options: {
-      isGenerating: boolean;
-      messagesCount: number;
-      isActiveRunPending: boolean;
-      status: string | null;
-    }): number | false {
-      const { isGenerating, messagesCount, isActiveRunPending, status } = options;
-      const isTerminal = status === "COMPLETED" || status === "FAILED" || status === "CANCELLED";
-
-      // 1. While generation is queued or active, poll every 2.5s
-      if (isGenerating) {
-        return 2500;
-      }
-
-      // 2. Newly created project with no messages and activeRun pending: poll until settled
-      if (messagesCount === 0 && isActiveRunPending) {
-        return 2500;
-      }
-
-      // 3. Terminal state or idle -> do not poll
-      if (isTerminal || !isGenerating) {
-        return false;
-      }
-
-      return false;
-    }
-
     it("newly created project with no messages polls while activeRun is pending or queued", () => {
-      const pendingInterval = computeMessagePollInterval({
+      // Direct verification of actual Studio hook resolution logic
+      const pendingInterval = resolveMessagePollInterval({
         isGenerating: false,
         messagesCount: 0,
         isActiveRunPending: true,
@@ -45,13 +25,14 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       });
       assert.strictEqual(pendingInterval, 2500, "Should poll while initial run is resolving");
 
-      const queuedInterval = computeMessagePollInterval({
-        isGenerating: true,
+      const queuedInterval = resolveMessagePollInterval({
+        isGenerating: isGenerationActiveStatus("QUEUED"),
         messagesCount: 0,
         isActiveRunPending: false,
         status: "QUEUED",
       });
       assert.strictEqual(queuedInterval, 2500, "Should poll when initial run is queued");
+      assert.strictEqual(getActiveRunPollInterval("QUEUED"), 2000, "Active run should poll every 2000ms when queued");
     });
 
     it("polls during active multi-agent generation stages", () => {
@@ -62,7 +43,12 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
           true,
           `Stage ${stage} must be marked as active generation`
         );
-        const interval = computeMessagePollInterval({
+        assert.strictEqual(
+          getActiveRunPollInterval(stage),
+          2000,
+          `Active run stage ${stage} must poll every 2000ms`
+        );
+        const interval = resolveMessagePollInterval({
           isGenerating: isGenerationActiveStatus(stage),
           messagesCount: 1,
           isActiveRunPending: false,
@@ -72,67 +58,192 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       }
     });
 
-    it("initial assistant response appears after empty conversation and ceases continuous polling", () => {
+    it("verifies initial project creation and polling progression until first generation run becomes visible", () => {
       const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false } },
       });
-      const projectId = "proj-initial-test";
+      const projectId = "proj-lifecycle-e2e";
 
-      // 1. Initially empty conversation
+      // 1. Initial State: Project created, 0 messages, activeRun pending
       queryClient.setQueryData(["messages", projectId], []);
-      const initialMessages = queryClient.getQueryData<unknown[]>(["messages", projectId]);
-      assert.strictEqual(initialMessages?.length, 0);
+      assert.strictEqual(
+        resolveMessagePollInterval({
+          isGenerating: false,
+          messagesCount: 0,
+          isActiveRunPending: true,
+          status: null,
+        }),
+        2500,
+        "Phase 1: Must poll while active run is pending"
+      );
 
-      // Polling is active while initial run is resolving
-      const initialInterval = computeMessagePollInterval({
-        isGenerating: false,
-        messagesCount: initialMessages?.length ?? 0,
-        isActiveRunPending: true,
-        status: null,
+      // 2. Generation run becomes visible (QUEUED)
+      queryClient.setQueryData(["active-generation-run", projectId], {
+        id: "run-init-1",
+        status: "QUEUED",
       });
-      assert.strictEqual(initialInterval, 2500);
+      assert.strictEqual(
+        getActiveRunPollInterval("QUEUED"),
+        2000,
+        "Phase 2: Active run hook must poll every 2000ms"
+      );
+      assert.strictEqual(
+        resolveMessagePollInterval({
+          isGenerating: isGenerationActiveStatus("QUEUED"),
+          messagesCount: 0,
+          isActiveRunPending: false,
+          status: "QUEUED",
+        }),
+        2500,
+        "Phase 2: Messages hook must poll every 2500ms while queued"
+      );
 
-      // 2. Initial assistant response arrives
-      const newMessages = [
+      // 3. Multi-agent progression: ARCHITECTING -> RUNNING -> VALIDATING
+      const progressionStages = ["ARCHITECTING", "RUNNING", "VALIDATING"];
+      for (const stage of progressionStages) {
+        queryClient.setQueryData(["active-generation-run", projectId], {
+          id: "run-init-1",
+          status: stage,
+        });
+        assert.strictEqual(
+          getActiveRunPollInterval(stage),
+          2000,
+          `Phase 3: Active run in ${stage} must maintain 2000ms polling`
+        );
+        assert.strictEqual(
+          resolveMessagePollInterval({
+            isGenerating: isGenerationActiveStatus(stage),
+            messagesCount: 0,
+            isActiveRunPending: false,
+            status: stage,
+          }),
+          2500,
+          `Phase 3: Messages in ${stage} must maintain 2500ms polling`
+        );
+      }
+
+      // 4. First assistant response arrives with completed run
+      const generatedMessages = [
         {
-          id: "msg-user-1",
+          id: "msg-user-init",
           role: "USER",
-          content: "Create a SaaS landing page",
+          content: "Build a todo app",
           createdAt: new Date(),
         },
         {
-          id: "msg-assistant-1",
+          id: "msg-asst-init",
           role: "ASSISTANT",
-          content: "I have built the landing page with authentication and dark mode.",
-          createdAt: new Date(),
+          content: "Built the Todo app.",
           fragments: {
-            id: "frag-landing-1",
-            title: "Landing Page V1",
-            sandboxUrl: "https://preview-1.e2b.dev",
-            files: {
-              "app/page.tsx": "export default function Page() { return <h1>SaaS</h1>; }",
-            },
+            id: "frag-v1",
+            title: "Todo App V1",
+            files: { "app/page.tsx": "export default () => <div>Todo</div>" },
           },
-          generationRun: {
-            resultRevisionId: "rev-landing-1",
-          },
+          generationRun: { resultRevisionId: "rev-v1" },
         },
       ];
-      queryClient.setQueryData(["messages", projectId], newMessages);
-
-      const updatedMessages = queryClient.getQueryData<typeof newMessages>(["messages", projectId]);
-      assert.strictEqual(updatedMessages?.length, 2);
-      assert.strictEqual(updatedMessages?.[1]?.role, "ASSISTANT");
-      assert.strictEqual(updatedMessages?.[1]?.fragments?.title, "Landing Page V1");
-
-      // 3. Once completed, polling ceases immediately
-      const completedInterval = computeMessagePollInterval({
-        isGenerating: isGenerationActiveStatus("COMPLETED"),
-        messagesCount: updatedMessages?.length ?? 0,
-        isActiveRunPending: false,
+      queryClient.setQueryData(["messages", projectId], generatedMessages);
+      queryClient.setQueryData(["active-generation-run", projectId], {
+        id: "run-init-1",
         status: "COMPLETED",
       });
-      assert.strictEqual(completedInterval, false, "Must stop polling on COMPLETED");
+
+      // 5. Terminal COMPLETED state shuts down continuous polling
+      assert.strictEqual(
+        getActiveRunPollInterval("COMPLETED"),
+        false,
+        "Phase 5: Active run must cease polling on COMPLETED"
+      );
+      assert.strictEqual(
+        resolveMessagePollInterval({
+          isGenerating: isGenerationActiveStatus("COMPLETED"),
+          messagesCount: generatedMessages.length,
+          isActiveRunPending: false,
+          status: "COMPLETED",
+        }),
+        false,
+        "Phase 5: Messages must cease polling on COMPLETED"
+      );
+
+      queryClient.clear();
+    });
+
+    it("handles terminal states and executes failed-generation recovery cleanly", async () => {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const projectId = "proj-failed-recovery";
+
+      // 1. Generation fails
+      queryClient.setQueryData(["active-generation-run", projectId], {
+        id: "run-fail-1",
+        status: "FAILED",
+        error: "E2B Sandbox initialization timeout",
+      });
+      queryClient.setQueryData(["messages", projectId], [
+        { id: "m-user-1", role: "USER", content: "Build complex app" },
+        {
+          id: "m-asst-err",
+          role: "ASSISTANT",
+          content: "Generation failed: E2B Sandbox initialization timeout",
+          isError: true,
+        },
+      ]);
+
+      // 2. In terminal FAILED state, polling halts to avoid continuous network requests
+      assert.strictEqual(
+        getActiveRunPollInterval("FAILED"),
+        false,
+        "Must halt active-run polling on FAILED"
+      );
+      assert.strictEqual(
+        resolveMessagePollInterval({
+          isGenerating: isGenerationActiveStatus("FAILED"),
+          messagesCount: 2,
+          isActiveRunPending: false,
+          status: "FAILED",
+        }),
+        false,
+        "Must halt messages polling on FAILED"
+      );
+
+      // 3. User initiates recovery prompt: "Retry with simpler scaffold"
+      // Simulates useCreateMessage / recovery submission
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["messages", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["active-generation-run", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+      ]);
+
+      // State is marked invalidated/stale
+      assert.strictEqual(queryClient.getQueryState(["messages", projectId])?.isInvalidated, true);
+      assert.strictEqual(
+        queryClient.getQueryState(["active-generation-run", projectId])?.isInvalidated,
+        true
+      );
+
+      // 4. Recovery run is registered in cache as QUEUED
+      queryClient.setQueryData(["active-generation-run", projectId], {
+        id: "run-retry-2",
+        status: "QUEUED",
+      });
+
+      // 5. Polling resumes immediately for both active run and messages
+      assert.strictEqual(
+        getActiveRunPollInterval("QUEUED"),
+        2000,
+        "Polling must resume after recovery prompt submission"
+      );
+      assert.strictEqual(
+        resolveMessagePollInterval({
+          isGenerating: isGenerationActiveStatus("QUEUED"),
+          messagesCount: 3,
+          isActiveRunPending: false,
+          status: "QUEUED",
+        }),
+        2500,
+        "Message polling must resume after recovery prompt submission"
+      );
 
       queryClient.clear();
     });
@@ -269,6 +380,66 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       // Selection remains locked on historical revision V0
       assert.strictEqual(state.selectedFragment?.id, "rev-0", "Must NOT overwrite manual revision");
       assert.strictEqual(state.selectedFragment?.title, "Initial Scaffold V0");
+    });
+
+    it("preserves revision switching while background generation continues in parallel", () => {
+      // Simulates active studio state when background generation is actively running
+      const state = {
+        isManualSelection: false,
+        selectedFragment: null as ProjectFragment | null,
+        activeBackgroundRun: {
+          id: "run-bg-progress",
+          status: "RUNNING",
+          stage: "CODING",
+        },
+      };
+
+      const revisions = [
+        { id: "rev-v1", title: "Version 1.0 (Scaffold)", files: { "app/page.tsx": "v1 code" } },
+        { id: "rev-v2", title: "Version 2.0 (Cart Added)", files: { "app/page.tsx": "v2 code" } },
+      ];
+
+      function selectRevision(revId: string) {
+        state.isManualSelection = true;
+        const rev = revisions.find((r) => r.id === revId);
+        if (rev) {
+          state.selectedFragment = {
+            id: rev.id,
+            messageId: "historical",
+            sandboxUrl: "",
+            title: rev.title,
+            files: rev.files,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            selectionType: "historical-revision",
+            revisionId: rev.id,
+          };
+        }
+      }
+
+      // Background generation is active
+      assert.strictEqual(isGenerationActiveStatus(state.activeBackgroundRun.status), true);
+      assert.strictEqual(getActiveRunPollInterval(state.activeBackgroundRun.status), 2000);
+
+      // User switches to revision V1
+      selectRevision("rev-v1");
+      assert.strictEqual(state.isManualSelection, true);
+      assert.strictEqual(state.selectedFragment?.id, "rev-v1");
+      assert.strictEqual(state.selectedFragment?.title, "Version 1.0 (Scaffold)");
+
+      // Background run continues to stream events / polls
+      state.activeBackgroundRun.stage = "VALIDATING";
+      // Revision selection remains pinned on rev-v1
+      assert.strictEqual(state.selectedFragment?.id, "rev-v1");
+
+      // User switches to revision V2
+      selectRevision("rev-v2");
+      assert.strictEqual(state.isManualSelection, true);
+      assert.strictEqual(state.selectedFragment?.id, "rev-v2");
+      assert.strictEqual(state.selectedFragment?.title, "Version 2.0 (Cart Added)");
+
+      // Intermediate background generation tick arrives
+      assert.strictEqual(state.selectedFragment?.id, "rev-v2", "Background run must never clobber active manual revision");
     });
 
     it("View Latest deterministically restores the latest assistant fragment or current revision", () => {

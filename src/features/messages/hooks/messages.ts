@@ -31,6 +31,37 @@ export const prefetchMessages = async (
 };
 
 /**
+ * Resolves the message polling interval based on active generation state,
+ * conversation length, and active run resolution status.
+ */
+export function resolveMessagePollInterval(options: {
+  isGenerating: boolean;
+  messagesCount: number;
+  isActiveRunPending: boolean;
+  status?: string | null;
+}): number | false {
+  const { isGenerating, messagesCount, isActiveRunPending, status } = options;
+  const isTerminal = status === "COMPLETED" || status === "FAILED" || status === "CANCELLED";
+
+  // 1. While generation is queued or active, poll every 2.5s
+  if (isGenerating) {
+    return 2500;
+  }
+
+  // 2. Newly created project with no messages and activeRun pending: poll until settled
+  if (messagesCount === 0 && isActiveRunPending) {
+    return 2500;
+  }
+
+  // 3. Terminal state (COMPLETED, FAILED, CANCELLED) or idle -> do not poll
+  if (isTerminal || !isGenerating) {
+    return false;
+  }
+
+  return false;
+}
+
+/**
  * React Query hook that loads and live-polls a project's messages based on the generation lifecycle.
  *
  * - Polls while generation is actively running or queued (every 2.5s) so new projects receive
@@ -74,19 +105,13 @@ export const useGetMessages = (projectId: string) => {
     queryFn: () => getMessages(projectId),
     staleTime: 5_000,
     refetchInterval: (query) => {
-      // 1. While generation is queued or active, poll every 2.5s
-      if (isGenerating) {
-        return 2500;
-      }
-
-      // 2. Newly created project with no messages and activeRun pending: poll until settled
       const messagesCount = query.state.data?.length ?? 0;
-      if (messagesCount === 0 && isActiveRunPending) {
-        return 2500;
-      }
-
-      // 3. Terminal state (COMPLETED, FAILED, CANCELLED) or idle -> do not poll
-      return false;
+      return resolveMessagePollInterval({
+        isGenerating,
+        messagesCount,
+        isActiveRunPending,
+        status,
+      });
     },
     enabled: Boolean(projectId),
   });

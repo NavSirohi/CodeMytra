@@ -20,17 +20,17 @@ export interface DatabaseConfigValidation {
 export function validateDatabaseConfig(): DatabaseConfigValidation {
   const url = process.env.DATABASE_URL;
   const isProduction = process.env.NODE_ENV === "production";
-  const isBuilding =
-    process.env.NEXT_PHASE === "phase-production-build" ||
-    process.env.npm_lifecycle_event === "build";
+  // Next.js sets NEXT_PHASE to phase-production-build strictly during next build
+  const isNextProductionBuild = process.env.NEXT_PHASE === "phase-production-build";
 
   if (isProduction) {
     if (!url) {
-      if (isBuilding) {
-        // Next.js build step needs Prisma client types without live runtime queries
+      if (isNextProductionBuild) {
+        // Next.js build step needs Prisma client symbols for type-checking and route tracing
+        // without live runtime database queries.
         return {
           isValid: true,
-          connectionString: "postgresql://postgres:postgres@localhost:5432/codemytra",
+          connectionString: "postgresql://build-stub:build-stub@localhost:5432/build_stub_disabled",
           isProduction: true,
           isFallback: true,
         };
@@ -87,8 +87,32 @@ function createPrismaClient(): PrismaClient {
   if (!config.isValid) {
     throw new Error(config.error);
   }
+
   const adapter = new PrismaPg({ connectionString: config.connectionString });
-  return new PrismaClient({ adapter });
+  const client = new PrismaClient({ adapter });
+
+  // In production build phase with fallback, proxy the client to ensure no queries can execute
+  if (config.isProduction && config.isFallback) {
+    return new Proxy(client, {
+      get(target, prop, receiver) {
+        // Allow inspection and symbol access
+        if (typeof prop === "symbol" || prop === "then" || prop === "toString") {
+          return Reflect.get(target, prop, receiver);
+        }
+        // If a query delegate or query execution is attempted without real DATABASE_URL, fail immediately
+        if (typeof target[prop as keyof PrismaClient] === "function") {
+          return () => {
+            throw new Error(
+              "[Database Configuration] Cannot execute database queries during build or without a valid production DATABASE_URL. Implicit localhost fallback is blocked."
+            );
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  }
+
+  return client;
 }
 
 export const prisma = globalForPrisma.prisma ?? createPrismaClient();
