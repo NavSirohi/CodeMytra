@@ -39,23 +39,34 @@ export function resolveMessagePollInterval(options: {
   messagesCount: number;
   isActiveRunPending: boolean;
   status?: string | null;
+  dataUpdateCount?: number;
+  maxDiscoveryAttempts?: number;
 }): number | false {
-  const { isGenerating, messagesCount, isActiveRunPending, status } = options;
+  const {
+    isGenerating,
+    messagesCount,
+    isActiveRunPending,
+    status,
+    dataUpdateCount = 0,
+    maxDiscoveryAttempts = 5,
+  } = options;
   const isTerminal = status === "COMPLETED" || status === "FAILED" || status === "CANCELLED";
 
-  // 1. While generation is queued or active, poll every 2.5s
+  // 1. Terminal state -> do not poll
+  if (isTerminal) {
+    return false;
+  }
+
+  // 2. While generation is queued or active, poll every 2.5s
   if (isGenerating) {
     return 2500;
   }
 
-  // 2. Newly created project with no messages and activeRun pending: poll until settled
-  if (messagesCount === 0 && isActiveRunPending) {
-    return 2500;
-  }
-
-  // 3. Terminal state (COMPLETED, FAILED, CANCELLED) or idle -> do not poll
-  if (isTerminal || !isGenerating) {
-    return false;
+  // 3. Newly created project with no messages and activeRun pending or in discovery window
+  if (messagesCount === 0) {
+    if (isActiveRunPending || dataUpdateCount < maxDiscoveryAttempts) {
+      return 2500;
+    }
   }
 
   return false;
@@ -111,6 +122,7 @@ export const useGetMessages = (projectId: string) => {
         messagesCount,
         isActiveRunPending,
         status,
+        dataUpdateCount: query.state.dataUpdateCount,
       });
     },
     enabled: Boolean(projectId),

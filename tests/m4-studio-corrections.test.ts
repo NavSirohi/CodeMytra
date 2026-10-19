@@ -1,13 +1,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import JSZip from "jszip";
-import { QueryClient } from "@tanstack/react-query";
+import React from "react";
+import { renderToString } from "react-dom/server";
+import { QueryClient, QueryClientProvider, type Query } from "@tanstack/react-query";
 import {
   resolveMessagePollInterval,
 } from "@/features/messages/hooks/messages";
 import {
   isGenerationActiveStatus,
   getActiveRunPollInterval,
+  useGetActiveGenerationRun,
 } from "@/features/projects/hooks/projects";
 import { generateProjectZip } from "@/server/export/zip-export";
 import { prisma } from "@/lib/db";
@@ -284,6 +287,150 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       assert.strictEqual(runState?.isInvalidated, true, "active-generation-run must be invalidated");
       assert.strictEqual(projectState?.isInvalidated, true, "project must be invalidated");
       assert.strictEqual(revisionsState?.isInvalidated, true, "project-revisions must be invalidated");
+
+      queryClient.clear();
+    });
+
+    it("mounts actual useGetActiveGenerationRun React Query hook and verifies null-to-QUEUED discovery and bounded idle discovery", () => {
+      const queryClient = new QueryClient();
+      const projectId = "proj-hook-discovery-test";
+
+      // Test component mounting the actual useGetActiveGenerationRun hook
+      function ActiveRunMonitor() {
+        const runQuery = useGetActiveGenerationRun(projectId);
+        return React.createElement("div", { "data-testid": "run-status" }, runQuery.status);
+      }
+
+      // Mount hook inside QueryClientProvider
+      renderToString(
+        React.createElement(
+          QueryClientProvider,
+          { client: queryClient },
+          React.createElement(ActiveRunMonitor)
+        )
+      );
+
+      // Verify the query was instantiated and registered in the cache by the mounted hook
+      const query = queryClient
+        .getQueryCache()
+        .find({ queryKey: ["active-generation-run", projectId] }) as Query;
+      assert.ok(query, "Mounted hook must register query in cache");
+      const refetchIntervalFn = (query.options as unknown as { refetchInterval: (q: unknown) => number | false }).refetchInterval;
+      assert.strictEqual(typeof refetchIntervalFn, "function");
+
+      // 1. Initial Discovery: Before run record is visible in DB (data is undefined/null)
+      // Must NOT return false; must return discovery interval (1500ms)
+      assert.strictEqual(
+        refetchIntervalFn(query),
+        1500,
+        "Initial discovery attempt must poll at 1500ms when data is undefined"
+      );
+
+      // 2. Initial fetch completes with null (e.g. database lag during creation)
+      query.setData(null);
+      assert.strictEqual(
+        refetchIntervalFn(query),
+        1500,
+        "Must continue polling at 1500ms after initial null fetch to discover newly created run"
+      );
+
+      // 3. Newly created run becomes visible (transitions from null to QUEUED)
+      query.setData({ id: "run-discovered", status: "QUEUED" });
+      assert.strictEqual(
+        refetchIntervalFn(query),
+        2000,
+        "Must transition to active 2000ms polling once QUEUED run is discovered"
+      );
+
+      // 4. Bounded Discovery for Genuinely Idle Project:
+      // A project with no active generation must not poll indefinitely
+      const idleClient = new QueryClient();
+      const idleProjectId = "proj-idle-no-runs";
+      function IdleMonitor() {
+        useGetActiveGenerationRun(idleProjectId);
+        return null;
+      }
+      renderToString(
+        React.createElement(
+          QueryClientProvider,
+          { client: idleClient },
+          React.createElement(IdleMonitor)
+        )
+      );
+
+      const idleQuery = idleClient
+        .getQueryCache()
+        .find({ queryKey: ["active-generation-run", idleProjectId] }) as Query;
+      const idleIntervalFn = (idleQuery.options as unknown as { refetchInterval: (q: unknown) => number | false }).refetchInterval;
+
+      // Simulate consecutive null fetches
+      for (let i = 1; i <= 4; i++) {
+        idleQuery.setData(null);
+        assert.strictEqual(
+          idleIntervalFn(idleQuery),
+          1500,
+          `Discovery attempt ${i} must poll at 1500ms`
+        );
+      }
+
+      // On 5th attempt, maxDiscoveryAttempts is reached: polling halts
+      idleQuery.setData(null);
+      assert.strictEqual(idleQuery.state.dataUpdateCount, 5);
+      assert.strictEqual(
+        idleIntervalFn(idleQuery),
+        false,
+        "Must stop polling after 5 discovery attempts on genuinely idle project"
+      );
+
+      queryClient.clear();
+      idleClient.clear();
+    });
+
+    it("verifies FAILED, CANCELLED, and COMPLETED terminal behaviors halt polling on mounted hook", () => {
+      const queryClient = new QueryClient();
+      const projectId = "proj-terminal-states-test";
+
+      function TerminalMonitor() {
+        useGetActiveGenerationRun(projectId);
+        return null;
+      }
+
+      renderToString(
+        React.createElement(
+          QueryClientProvider,
+          { client: queryClient },
+          React.createElement(TerminalMonitor)
+        )
+      );
+
+      const query = queryClient
+        .getQueryCache()
+        .find({ queryKey: ["active-generation-run", projectId] }) as Query;
+      const refetchIntervalFn = (query.options as unknown as { refetchInterval: (q: unknown) => number | false }).refetchInterval;
+
+      // 1. Terminal COMPLETED
+      query.setData({ id: "run-term-1", status: "COMPLETED" });
+      assert.strictEqual(
+        refetchIntervalFn(query),
+        false,
+        "COMPLETED state must halt polling immediately"
+      );
+
+      // 2. Terminal FAILED
+      query.setData({ id: "run-term-2", status: "FAILED" });
+      assert.strictEqual(
+        refetchIntervalFn(query),
+        false,
+        "FAILED state must halt polling immediately"
+      );
+
+      // 3. Terminal CANCELLED
+      query.setData({ id: "run-term-3", status: "CANCELLED" });
+      assert.strictEqual(
+        refetchIntervalFn(query),
+        false,
+        "CANCELLED state must halt polling immediately"
+      );
 
       queryClient.clear();
     });

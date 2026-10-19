@@ -92,8 +92,56 @@ export const isGenerationActiveStatus = (status?: string | null): boolean => {
   );
 };
 
-export const getActiveRunPollInterval = (status?: string | null): number | false => {
-  return isGenerationActiveStatus(status) ? 2000 : false;
+export interface ActiveRunPollOptions {
+  status?: string | null;
+  dataUpdateCount?: number;
+  maxDiscoveryAttempts?: number;
+}
+
+export const DEFAULT_MAX_DISCOVERY_ATTEMPTS = 5;
+export const ACTIVE_RUN_POLL_INTERVAL_MS = 2000;
+export const INITIAL_DISCOVERY_POLL_INTERVAL_MS = 1500;
+
+export const getActiveRunPollInterval = (
+  statusOrOptions?: string | null | ActiveRunPollOptions,
+  legacyDataUpdateCount?: number
+): number | false => {
+  let status: string | null | undefined;
+  let dataUpdateCount = 0;
+  let maxDiscoveryAttempts = DEFAULT_MAX_DISCOVERY_ATTEMPTS;
+
+  if (typeof statusOrOptions === "object" && statusOrOptions !== null) {
+    status = statusOrOptions.status;
+    dataUpdateCount = statusOrOptions.dataUpdateCount ?? 0;
+    maxDiscoveryAttempts = statusOrOptions.maxDiscoveryAttempts ?? DEFAULT_MAX_DISCOVERY_ATTEMPTS;
+  } else {
+    status = statusOrOptions;
+    dataUpdateCount = legacyDataUpdateCount ?? 0;
+  }
+
+  // 1. Explicit terminal states -> STOP polling immediately
+  if (status === "COMPLETED" || status === "FAILED" || status === "CANCELLED") {
+    return false;
+  }
+
+  // 2. Active generation run -> poll every 2000ms
+  if (isGenerationActiveStatus(status)) {
+    return ACTIVE_RUN_POLL_INTERVAL_MS;
+  }
+
+  // 3. Initial discovery window when status is null or undefined:
+  // Studio may initially receive null if the generation run record is being created or delayed in the DB.
+  // Poll at 1500ms intervals up to maxDiscoveryAttempts (~7.5s) to discover the newly queued run.
+  // Once maxDiscoveryAttempts is reached without discovering an active run, stop polling to prevent
+  // unnecessary permanent polling on genuinely idle projects.
+  if (status === null || status === undefined) {
+    if (dataUpdateCount < maxDiscoveryAttempts) {
+      return INITIAL_DISCOVERY_POLL_INTERVAL_MS;
+    }
+    return false;
+  }
+
+  return false;
 };
 
 export const useGetActiveGenerationRun = (projectId: string) => {
@@ -105,7 +153,10 @@ export const useGetActiveGenerationRun = (projectId: string) => {
     },
     enabled: Boolean(projectId),
     refetchInterval: (query) => {
-      return getActiveRunPollInterval(query.state.data?.status);
+      return getActiveRunPollInterval({
+        status: query.state.data?.status ?? null,
+        dataUpdateCount: query.state.dataUpdateCount,
+      });
     },
   });
 };
