@@ -32,18 +32,26 @@ const STYLES = [
 
 const PENDING_BRIEF_STORAGE_KEY = "codemytra_pending_brief";
 
+function generateSubmissionId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `brief_${crypto.randomUUID()}`;
+  }
+  return `brief_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
 export function BriefBuilder() {
   const router = useRouter();
   const [selectedExample, setSelectedExample] = useState<string | null>(null);
   const [selectedStyle, setSelectedStyle] = useState("Calm & editorial");
   const [idea, setIdea] = useState("");
+  const [submissionId, setSubmissionId] = useState<string>(() => generateSubmissionId());
   const [brief, setBrief] = useState<string | null>(null);
   const [copyStatus, setCopyStatus] = useState("Copy brief");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  // Restore brief across authentication redirect without duplicate runs
+  // Restore brief and idempotency identifier across authentication redirect without duplicate runs
   useEffect(() => {
     try {
       const searchParams = new URLSearchParams(window.location.search);
@@ -57,6 +65,7 @@ export function BriefBuilder() {
             setIdea(saved.idea);
             if (saved.selectedStyle) setSelectedStyle(saved.selectedStyle);
             if (saved.selectedExample) setSelectedExample(saved.selectedExample);
+            if (saved.submissionId) setSubmissionId(saved.submissionId);
 
             const briefText = `CodeMytra project brief\nGoal: ${saved.idea}\nStyle: ${saved.selectedStyle || "Calm & editorial"}\nNext steps: requirements clarification, plan approval, design and architecture, implementation, integration and validation.`;
             setBrief(briefText);
@@ -76,7 +85,7 @@ export function BriefBuilder() {
                 setIsSubmitting(true);
 
                 const fullPrompt = `Goal: ${saved.idea}\nVisual Style: ${saved.selectedStyle || "Calm & editorial"}`;
-                createProject(fullPrompt)
+                createProject(fullPrompt, saved.submissionId)
                   .then((result) => {
                     if ("error" in result && result.error) {
                       setErrorMessage(result.error);
@@ -108,6 +117,7 @@ export function BriefBuilder() {
     setSelectedExample(ex.label);
     setIdea(ex.prompt);
     setErrorMessage(null);
+    setSubmissionId(generateSubmissionId());
   };
 
   const handleCreateBrief = () => {
@@ -137,19 +147,21 @@ export function BriefBuilder() {
     setIsSubmitting(true);
 
     const fullPrompt = `Goal: ${trimmed}\nVisual Style: ${selectedStyle}`;
+    const activeKey = submissionId || generateSubmissionId();
 
     try {
-      const result = await createProject(fullPrompt);
+      const result = await createProject(fullPrompt, activeKey);
 
       if ("error" in result && result.error) {
         if (result.error === "Unauthorized") {
-          // Preserve prompt in sessionStorage through authentication flow
+          // Preserve prompt and idempotency identifier in sessionStorage through auth redirect
           sessionStorage.setItem(
             PENDING_BRIEF_STORAGE_KEY,
             JSON.stringify({
               idea: trimmed,
               selectedStyle,
               selectedExample,
+              submissionId: activeKey,
               pendingSubmit: true,
               savedAt: Date.now(),
             })

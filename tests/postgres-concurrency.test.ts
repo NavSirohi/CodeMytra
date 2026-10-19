@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 
 /**
@@ -37,8 +38,26 @@ describe("PostgreSQL Concurrency & Database Operations", () => {
         "id" TEXT PRIMARY KEY,
         "name" TEXT NOT NULL,
         "userId" TEXT NOT NULL REFERENCES "User"("id"),
-        "currentRevisionId" TEXT
+        "currentRevisionId" TEXT,
+        "idempotencyKey" TEXT
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS "Project_userId_idempotencyKey_key" ON "Project"("userId", "idempotencyKey");
+
+      CREATE TABLE IF NOT EXISTS "Message" (
+        "id" TEXT PRIMARY KEY,
+        "projectId" TEXT NOT NULL REFERENCES "Project"("id"),
+        "content" TEXT NOT NULL,
+        "role" TEXT NOT NULL,
+        "type" TEXT NOT NULL,
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS "RateLimitRecord" (
+        "id" TEXT PRIMARY KEY,
+        "keyHash" TEXT NOT NULL,
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS "RateLimitRecord_keyHash_createdAt_idx" ON "RateLimitRecord"("keyHash", "createdAt");
 
       CREATE TABLE IF NOT EXISTS "ProjectRevision" (
         "id" TEXT PRIMARY KEY,
@@ -602,6 +621,186 @@ describe("PostgreSQL Concurrency & Database Operations", () => {
 
       const betaRun = await db.query(`SELECT id FROM "GenerationRun" WHERE "userId" = 'usr-B'`);
       assert.equal(betaRun.rows.length, 1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  // 10. Idempotent Project Creation with Client Submission Identifier
+  it("Scenario 10: Idempotent project creation with client submission identifier on real PostgreSQL", async () => {
+    const db = await setupDatabase();
+    try {
+      await db.query(`INSERT INTO "User" ("id", "name") VALUES ('usr-idem-1', 'User Idem 1'), ('usr-idem-2', 'User Idem 2');`);
+
+      const executeCreateProject = async (
+        userId: string,
+        prompt: string,
+        idempotencyKey: string,
+        reqId: string
+      ): Promise<{ project: any; created: boolean; raced: boolean }> => {
+        // 1. Initial check
+        const existing = await db.query(
+          `SELECT id, name, "userId", "idempotencyKey" FROM "Project" WHERE "userId" = $1 AND "idempotencyKey" = $2`,
+          [userId, idempotencyKey]
+        );
+        if (existing.rows.length > 0) {
+          return { project: existing.rows[0], created: false, raced: false };
+        }
+
+        try {
+          return await db.transaction(async (tx) => {
+            const pId = `prj-${reqId}`;
+            const runId = `run-${reqId}`;
+            const msgId = `msg-${reqId}`;
+            const evtId = `evt-${reqId}`;
+
+            // Insert project with unique (userId, idempotencyKey)
+            const pRes = await tx.query(
+              `INSERT INTO "Project" ("id", "name", "userId", "idempotencyKey")
+               VALUES ($1, $2, $3, $4)
+               RETURNING id, name, "userId", "idempotencyKey"`,
+              [pId, `Project ${reqId}`, userId, idempotencyKey]
+            );
+
+            await tx.query(
+              `INSERT INTO "Message" ("id", "projectId", "content", "role", "type")
+               VALUES ($1, $2, $3, 'USER', 'RESULT')`,
+              [msgId, pId, prompt]
+            );
+
+            await tx.query(
+              `INSERT INTO "GenerationRun" ("id", "projectId", "userId", "prompt", "status")
+               VALUES ($1, $2, $3, $4, 'QUEUED')`,
+              [runId, pId, userId, prompt]
+            );
+
+            await tx.query(
+              `INSERT INTO "OutboxEvent" ("id", "eventName", "payload")
+               VALUES ($1, 'code-agent/run', $2)`,
+              [evtId, JSON.stringify({ runId, projectId: pId, prompt })]
+            );
+
+            return { project: pRes.rows[0], created: true, raced: false };
+          });
+        } catch (err: any) {
+          // On unique constraint violation (code 23505), fetch committed project
+          if (err.code === "23505" || err.message.includes("unique")) {
+            const committed = await db.query(
+              `SELECT id, name, "userId", "idempotencyKey" FROM "Project" WHERE "userId" = $1 AND "idempotencyKey" = $2`,
+              [userId, idempotencyKey]
+            );
+            return { project: committed.rows[0], created: false, raced: true };
+          }
+          throw err;
+        }
+      };
+
+      // 1. Concurrent duplicate submissions with same idempotencyKey
+      const keyA = "client-sub-001";
+      const [res1, res2] = await Promise.all([
+        executeCreateProject('usr-idem-1', 'Build my bakery website', keyA, 'req-1'),
+        executeCreateProject('usr-idem-1', 'Build my bakery website', keyA, 'req-2'),
+      ]);
+
+      // Exactly one created, both returned the same project
+      assert.ok(res1.project && res2.project);
+      assert.equal(res1.project.id, res2.project.id, "Both requests must converge on the exact same project ID");
+      const createdCount = (res1.created ? 1 : 0) + (res2.created ? 1 : 0);
+      assert.equal(createdCount, 1, "Exactly one project must be created in database");
+
+      // Verify no duplicate messages, runs, or outbox events in database
+      const prjRows = await db.query(`SELECT id FROM "Project" WHERE "userId" = 'usr-idem-1'`);
+      assert.equal(prjRows.rows.length, 1);
+      const msgRows = await db.query(`SELECT id FROM "Message" WHERE "projectId" = $1`, [res1.project.id]);
+      assert.equal(msgRows.rows.length, 1, "Exactly 1 user message created");
+      const runRows = await db.query(`SELECT id FROM "GenerationRun" WHERE "projectId" = $1`, [res1.project.id]);
+      assert.equal(runRows.rows.length, 1, "Exactly 1 generation run queued");
+      const outRows = await db.query(`SELECT id FROM "OutboxEvent" WHERE payload->>'projectId' = $1`, [res1.project.id]);
+      assert.equal(outRows.rows.length, 1, "Exactly 1 outbox event queued");
+
+      // 2. Sequential repeated submission returns the existing project
+      const repeatRes = await executeCreateProject('usr-idem-1', 'Build my bakery website', keyA, 'req-3');
+      assert.equal(repeatRes.created, false);
+      assert.equal(repeatRes.project.id, res1.project.id, "Repeated submission returns existing project");
+
+      // 3. Failed submission remains recoverable
+      let failedThrew = false;
+      try {
+        await db.transaction(async (tx) => {
+          await tx.query(
+            `INSERT INTO "Project" ("id", "name", "userId", "idempotencyKey") VALUES ('prj-fail', 'Fail Prj', 'usr-idem-1', 'key-fail')`
+          );
+          throw new Error("Simulated transient error during run creation");
+        });
+      } catch {
+        failedThrew = true;
+      }
+      assert.ok(failedThrew);
+      const recoverRes = await executeCreateProject('usr-idem-1', 'Recoverable project', 'key-fail', 'req-rec');
+      assert.equal(recoverRes.created, true, "Failed submission must remain recoverable with same idempotency key");
+
+      // 4. Genuinely new user request receives a new identifier and creates a new project
+      const newKeyRes = await executeCreateProject('usr-idem-1', 'Another different app', 'client-sub-002', 'req-new');
+      assert.equal(newKeyRes.created, true);
+      assert.notEqual(newKeyRes.project.id, res1.project.id, "Different idempotency key creates new project");
+
+      // 5. Scoped to authenticated user: another user with the same key string gets their own project
+      const otherUserRes = await executeCreateProject('usr-idem-2', 'User 2 app', keyA, 'req-usr2');
+      assert.equal(otherUserRes.created, true);
+      assert.equal(otherUserRes.project.userId, 'usr-idem-2', "Idempotency key is scoped per user");
+    } finally {
+      await db.close();
+    }
+  });
+
+  // 11. Shared Database-Backed Rate Limiting Across Multiple Processes
+  it("Scenario 11: Shared database-backed rate limiting across multiple independent processes", async () => {
+    const db = await setupDatabase();
+    try {
+      const email = "contact-abuse@example.com";
+      const keyHash = crypto.createHash("sha256").update(email).digest("hex");
+
+      // Simulate Process A and Process B performing checks on the shared DB table
+      const simulateProcessCheck = async (procName: string, attemptNum: number) => {
+        const windowStart = new Date(Date.now() - 600000);
+        const countRes = await db.query(
+          `SELECT COUNT(*)::int as count FROM "RateLimitRecord" WHERE "keyHash" = $1 AND "createdAt" >= $2`,
+          [keyHash, windowStart]
+        );
+        const currentCount = (countRes.rows[0] as any).count;
+        if (currentCount >= 5) {
+          return { allowed: false, count: currentCount, procName };
+        }
+        await db.query(
+          `INSERT INTO "RateLimitRecord" ("id", "keyHash") VALUES ($1, $2)`,
+          [`rate-${procName}-${attemptNum}`, keyHash]
+        );
+        return { allowed: true, count: currentCount + 1, procName };
+      };
+
+      // Process A sends 3 requests
+      const a1 = await simulateProcessCheck("ProcessA", 1);
+      const a2 = await simulateProcessCheck("ProcessA", 2);
+      const a3 = await simulateProcessCheck("ProcessA", 3);
+      assert.equal(a1.allowed, true);
+      assert.equal(a2.allowed, true);
+      assert.equal(a3.allowed, true);
+
+      // Process B sends 2 requests (separate process, observes shared state)
+      const b1 = await simulateProcessCheck("ProcessB", 1);
+      const b2 = await simulateProcessCheck("ProcessB", 2);
+      assert.equal(b1.allowed, true);
+      assert.equal(b2.allowed, true);
+
+      // 6th request from Process A is blocked because shared database has 5 records
+      const a4 = await simulateProcessCheck("ProcessA", 4);
+      assert.equal(a4.allowed, false, "6th request across separate processes must be rejected");
+
+      // Verify no PII is stored in RateLimitRecord
+      const stored = await db.query(`SELECT "keyHash" FROM "RateLimitRecord" WHERE "keyHash" = $1`, [keyHash]);
+      assert.equal(stored.rows.length, 5);
+      const rawPii = await db.query(`SELECT * FROM "RateLimitRecord" WHERE "id" LIKE '%@%' OR "keyHash" LIKE '%@%'`);
+      assert.equal(rawPii.rows.length, 0, "No raw email or PII stored in RateLimitRecord");
     } finally {
       await db.close();
     }

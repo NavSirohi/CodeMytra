@@ -40,8 +40,10 @@ model Project {
   revisions      ProjectRevision[] @relation("ProjectRevisions")
   generationRuns GenerationRun[]
   specification  ProjectSpecification?
+  idempotencyKey String?
 
   @@index([userId, createdAt])
+  @@unique([userId, idempotencyKey])
 }
 
 enum MessageRole {
@@ -243,4 +245,12 @@ model ContactSubmission {
   createdAt DateTime @default(now())
 
   @@index([email, createdAt])
+}
+
+model RateLimitRecord {
+  id        String   @id @default(cuid())
+  keyHash   String
+  createdAt DateTime @default(now())
+
+  @@index([keyHash, createdAt])
 }

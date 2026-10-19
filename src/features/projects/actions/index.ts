@@ -7,7 +7,7 @@ import { prisma } from "@/lib/db";
 import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
 import { restoreHistoricalRevision } from "@/server/orchestration/revisions";
 
-export const createProject = async (value: string) => {
+export const createProject = async (value: string, idempotencyKey?: string) => {
   const user = await getCurrentUser();
 
   if (!user) {
@@ -28,12 +28,34 @@ export const createProject = async (value: string) => {
     };
   }
 
+  const cleanKey = idempotencyKey?.trim() || null;
+
+  // 1. If an idempotency key is provided, check for existing project for this user
+  if (cleanKey) {
+    try {
+      const existing = await prisma.project.findUnique({
+        where: {
+          userId_idempotencyKey: {
+            userId: user.id,
+            idempotencyKey: cleanKey,
+          },
+        },
+      });
+      if (existing) {
+        return existing;
+      }
+    } catch {
+      // Continue to creation if lookup fails
+    }
+  }
+
   try {
     const { project, outboxEvent } = await prisma.$transaction(async (tx) => {
       const newProject = await tx.project.create({
         data: {
           name: generateSlug(2, { format: "kebab" }),
           userId: user.id,
+          idempotencyKey: cleanKey,
           messages: {
             create: {
               content: trimmed,
@@ -73,7 +95,34 @@ export const createProject = async (value: string) => {
     await dispatchOutboxEvent(outboxEvent.id);
 
     return project;
-  } catch (error) {
+  } catch (error: unknown) {
+    // 2. Handle concurrent duplicate submission race condition:
+    // If a unique constraint violation occurs on userId_idempotencyKey, return the already created project
+    const err = error as { code?: string; message?: string; meta?: { target?: string[] } };
+    if (
+      cleanKey &&
+      (err?.code === "P2002" ||
+        err?.message?.includes("unique") ||
+        err?.code === "23505" ||
+        err?.meta?.target?.includes("idempotencyKey"))
+    ) {
+      try {
+        const existing = await prisma.project.findUnique({
+          where: {
+            userId_idempotencyKey: {
+              userId: user.id,
+              idempotencyKey: cleanKey,
+            },
+          },
+        });
+        if (existing) {
+          return existing;
+        }
+      } catch (lookupErr) {
+        console.error("❌ Error fetching existing project after race condition:", lookupErr);
+      }
+    }
+
     console.error("❌ Error creating project:", error);
     return {
       error: "Failed to create project",
