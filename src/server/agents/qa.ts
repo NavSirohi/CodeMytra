@@ -9,6 +9,213 @@ import path from "path";
 import { Sandbox } from "@e2b/code-interpreter";
 import { PROJECT_WORKSPACE_DIR } from "@/server/orchestration/workspace";
 
+export interface QACommandExecutor {
+  run(command: string, options?: { timeoutMs?: number }): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+}
+
+export interface DatabaseVerificationPipelineOptions {
+  workspaceDir: string;
+  models?: Array<{ modelName: string; fields?: string[]; relations?: string[] }>;
+  disposableDbName?: string;
+  runner?: "bun" | "npm";
+}
+
+/**
+ * Task 1 & Task 2: Safe database verification pipeline executing on an isolated disposable database.
+ * Strictly guarantees that existing development databases (dev.db) are NEVER overwritten or altered.
+ * Separates schema validation, client generation, disposable initialization, engine connectivity, and model operations.
+ */
+export async function executeDatabaseVerificationPipeline(
+  executor: QACommandExecutor,
+  options: DatabaseVerificationPipelineOptions
+): Promise<{ checks: QAReport["checks"]; errors: string[] }> {
+  const {
+    workspaceDir,
+    models = [],
+    disposableDbName = ".qa_disposable.db",
+    runner = "bun",
+  } = options;
+
+  const checks: QAReport["checks"] = [];
+  const errors: string[] = [];
+  const prismaCmd = runner === "bun" ? "bunx prisma" : "npx prisma";
+
+  // 1. Prisma schema live validation
+  try {
+    const valRes = await executor.run(
+      `cd "${workspaceDir}" && ${prismaCmd} validate`,
+      { timeoutMs: 30000 }
+    );
+    const valPassed = valRes.exitCode === 0;
+    checks.push({
+      name: "database-schema-live-validation",
+      category: "database-validation",
+      status: valPassed ? "PASS" : "FAIL",
+      details: valPassed
+        ? "Prisma schema validated successfully"
+        : (valRes.stderr || valRes.stdout || "Prisma schema validation failed").slice(0, 500),
+    });
+    if (!valPassed) {
+      errors.push(`Prisma schema validation failed: ${(valRes.stderr || valRes.stdout).slice(0, 300)}`);
+      return { checks, errors };
+    }
+  } catch (valErr) {
+    checks.push({
+      name: "database-schema-live-validation",
+      category: "database-validation",
+      status: "FAIL",
+      details: String(valErr),
+    });
+    errors.push(`Prisma schema validation command error: ${String(valErr)}`);
+    return { checks, errors };
+  }
+
+  // 2. Prisma client generation
+  try {
+    const genRes = await executor.run(
+      `cd "${workspaceDir}" && ${prismaCmd} generate`,
+      { timeoutMs: 30000 }
+    );
+    const genPassed = genRes.exitCode === 0;
+    checks.push({
+      name: "database-client-generation",
+      category: "database-validation",
+      status: genPassed ? "PASS" : "FAIL",
+      details: genPassed
+        ? "Prisma client generated successfully"
+        : (genRes.stderr || genRes.stdout || "Prisma client generation failed").slice(0, 500),
+    });
+    if (!genPassed) {
+      errors.push(`Prisma client generation failed: ${(genRes.stderr || genRes.stdout).slice(0, 300)}`);
+      return { checks, errors };
+    }
+  } catch (genErr) {
+    checks.push({
+      name: "database-client-generation",
+      category: "database-validation",
+      status: "FAIL",
+      details: String(genErr),
+    });
+    errors.push(`Prisma client generation command error: ${String(genErr)}`);
+    return { checks, errors };
+  }
+
+  // 3. Safe Database Initialization on DISPOSABLE database (strictly leaving dev.db untouched, NO --accept-data-loss)
+  try {
+    const pushRes = await executor.run(
+      `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" ${prismaCmd} db push`,
+      { timeoutMs: 30000 }
+    );
+    const pushPassed = pushRes.exitCode === 0;
+    checks.push({
+      name: "database-initialization",
+      category: "database-validation",
+      status: pushPassed ? "PASS" : "FAIL",
+      details: pushPassed
+        ? `Safe database schema synchronization succeeded on isolated disposable database (${disposableDbName})`
+        : (pushRes.stderr || pushRes.stdout || "Database push failed").slice(0, 500),
+    });
+    if (!pushPassed) {
+      errors.push(`Database initialization on disposable database failed: ${(pushRes.stderr || pushRes.stdout).slice(0, 300)}`);
+      return { checks, errors };
+    }
+  } catch (pushErr) {
+    checks.push({
+      name: "database-initialization",
+      category: "database-validation",
+      status: "FAIL",
+      details: String(pushErr),
+    });
+    errors.push(`Database initialization command error: ${String(pushErr)}`);
+    return { checks, errors };
+  }
+
+  // 4. Database Engine Connectivity check (SELECT 1 on disposable database)
+  try {
+    const script = `import { db } from "./lib/db"; async function run() { await db.$queryRaw\`SELECT 1\`; console.log("DB_CONNECTIVITY_SUCCESS"); } run();`;
+    const execCmd = runner === "bun"
+      ? `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" bun -e '${script}'`
+      : `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" npx tsx -e '${script}'`;
+
+    const connRes = await executor.run(execCmd, { timeoutMs: 15000 });
+    const connPassed = connRes.exitCode === 0 && connRes.stdout.includes("DB_CONNECTIVITY_SUCCESS");
+    checks.push({
+      name: "database-connectivity",
+      category: "database-validation",
+      status: connPassed ? "PASS" : "FAIL",
+      details: connPassed
+        ? "Database engine connectivity verified (SELECT 1 succeeded on disposable database)"
+        : (connRes.stderr || connRes.stdout || "Database connectivity check failed").slice(0, 500),
+    });
+    if (!connPassed) {
+      errors.push(`Database connectivity check failed: ${(connRes.stderr || connRes.stdout).slice(0, 300)}`);
+    }
+  } catch (connErr) {
+    checks.push({
+      name: "database-connectivity",
+      category: "database-validation",
+      status: "FAIL",
+      details: String(connErr),
+    });
+    errors.push(`Database connectivity command error: ${String(connErr)}`);
+  }
+
+  // 5. Real Model Operations Verification (distinct from connectivity!)
+  if (models && models.length > 0) {
+    const primaryModel = models[0];
+    const delegateName = primaryModel.modelName.charAt(0).toLowerCase() + primaryModel.modelName.slice(1);
+    try {
+      const modelScript = `import { db } from "./lib/db"; async function verify() { const delegate = db["${delegateName}"]; if (!delegate || typeof delegate.findMany !== "function") { throw new Error("Model delegate ${delegateName} is missing or not a Prisma model delegate"); } const count = await delegate.count(); console.log("MODEL_OPERATION_SUCCESS:" + count); } verify().catch(e => { console.error(e); process.exit(1); });`;
+      const modelCmd = runner === "bun"
+        ? `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" bun -e '${modelScript}'`
+        : `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" npx tsx -e '${modelScript}'`;
+
+      const modelRes = await executor.run(modelCmd, { timeoutMs: 15000 });
+      const modelPassed = modelRes.exitCode === 0 && modelRes.stdout.includes("MODEL_OPERATION_SUCCESS");
+      checks.push({
+        name: "database-model-operations",
+        category: "database-validation",
+        status: modelPassed ? "PASS" : "FAIL",
+        details: modelPassed
+          ? `Verified Prisma model delegate operations on model "${primaryModel.modelName}" in disposable database`
+          : (modelRes.stderr || modelRes.stdout || "Model operations verification failed").slice(0, 500),
+      });
+      if (!modelPassed) {
+        errors.push(`Database model operations check failed: ${(modelRes.stderr || modelRes.stdout).slice(0, 300)}`);
+      }
+    } catch (modelErr) {
+      checks.push({
+        name: "database-model-operations",
+        category: "database-validation",
+        status: "FAIL",
+        details: String(modelErr),
+      });
+      errors.push(`Database model operations command error: ${String(modelErr)}`);
+    }
+  } else {
+    // Persistence was required, but no models exist
+    checks.push({
+      name: "database-model-operations",
+      category: "database-validation",
+      status: "FAIL",
+      details: "Application requires data persistence, but no models were provided to execute model operations",
+    });
+    errors.push("Missing database models for model operations verification.");
+  }
+
+  // Cleanup disposable database files
+  try {
+    await executor.run(
+      `cd "${workspaceDir}" && rm -f "${disposableDbName}" "${disposableDbName}-journal" "${disposableDbName}-wal"`,
+      { timeoutMs: 10000 }
+    );
+  } catch {
+    // Ignore cleanup error
+  }
+
+  return { checks, errors };
+}
+
 export interface ValidateProjectOptions {
   files: Record<string, string>;
   summary: string;
@@ -16,6 +223,9 @@ export interface ValidateProjectOptions {
   runSandboxCommands: boolean;
   archSpec?: ArchitectureSpec;
   capabilities?: ApplicationCapability[];
+  customExecutor?: QACommandExecutor;
+  workspaceDir?: string;
+  runner?: "bun" | "npm";
 }
 
 /**
@@ -179,6 +389,18 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       status: "PASS",
       details: "Static application: clean architecture with no unwanted database overhead",
     });
+    checks.push({
+      name: "database-connectivity",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: database connectivity not required",
+    });
+    checks.push({
+      name: "database-model-operations",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: no database models required",
+    });
   }
 
   // 8. Capability-Adaptive API Route Validation
@@ -240,138 +462,64 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     });
   }
 
-  // 7. Live Sandbox Verification: TypeScript & Production Build (when sandbox active)
+  // 7. Live Sandbox / Custom Executor Verification: Database, TypeScript & Production Build
   let executedSandboxChecks = false;
-  if (sandboxId && runSandboxCommands) {
+  if ((sandboxId && runSandboxCommands) || options.customExecutor) {
     try {
-      const sandbox = await Sandbox.connect(sandboxId);
-      executedSandboxChecks = true;
+      let executor: QACommandExecutor;
+      let targetWorkspaceDir: string;
+      const runner = options.runner || (options.customExecutor ? "npm" : "bun");
 
-      checks.push({
-        name: "sandbox-connection",
-        category: "sandbox-connection",
-        status: "PASS",
-        details: `Connected to sandbox ${sandboxId}`,
-      });
+      if (options.customExecutor && options.workspaceDir) {
+        executor = options.customExecutor;
+        targetWorkspaceDir = options.workspaceDir;
+        executedSandboxChecks = true;
+        checks.push({
+          name: "sandbox-connection",
+          category: "sandbox-connection",
+          status: "PASS",
+          details: `Connected to verification executor (workspace: ${targetWorkspaceDir})`,
+        });
+      } else {
+        const sandbox = await Sandbox.connect(sandboxId);
+        executor = {
+          run: (cmd, opts) => sandbox.commands.run(cmd, opts),
+        };
+        targetWorkspaceDir = PROJECT_WORKSPACE_DIR;
+        executedSandboxChecks = true;
+        checks.push({
+          name: "sandbox-connection",
+          category: "sandbox-connection",
+          status: "PASS",
+          details: `Connected to sandbox ${sandboxId}`,
+        });
+      }
 
       // Executable Database Verification (only when application requires persistence)
       if (requiresDb && files["prisma/schema.prisma"]) {
-        // 1. Prisma validate
-        try {
-          const valRes = await sandbox.commands.run(
-            `cd "${PROJECT_WORKSPACE_DIR}" && bunx prisma validate`,
-            { timeoutMs: 30000 }
-          );
-          const valPassed = valRes.exitCode === 0;
-          checks.push({
-            name: "database-schema-live-validation",
-            category: "database-validation",
-            status: valPassed ? "PASS" : "FAIL",
-            details: valPassed
-              ? "Prisma schema validated successfully in sandbox"
-              : (valRes.stderr || valRes.stdout || "Prisma schema validation failed").slice(0, 500),
-          });
-          if (!valPassed) {
-            errors.push(`Prisma schema validation failed: ${(valRes.stderr || valRes.stdout).slice(0, 300)}`);
-          }
-        } catch (valErr) {
-          checks.push({
-            name: "database-schema-live-validation",
-            category: "database-validation",
-            status: "FAIL",
-            details: String(valErr),
-          });
-          errors.push(`Prisma schema validation command error: ${String(valErr)}`);
-        }
-
-        // 2. Prisma generate
-        try {
-          const genRes = await sandbox.commands.run(
-            `cd "${PROJECT_WORKSPACE_DIR}" && bunx prisma generate`,
-            { timeoutMs: 30000 }
-          );
-          const genPassed = genRes.exitCode === 0;
-          checks.push({
-            name: "database-client-generation",
-            category: "database-validation",
-            status: genPassed ? "PASS" : "FAIL",
-            details: genPassed
-              ? "Prisma client generated successfully"
-              : (genRes.stderr || genRes.stdout || "Prisma client generation failed").slice(0, 500),
-          });
-          if (!genPassed) {
-            errors.push(`Prisma client generation failed: ${(genRes.stderr || genRes.stdout).slice(0, 300)}`);
-          }
-        } catch (genErr) {
-          checks.push({
-            name: "database-client-generation",
-            category: "database-validation",
-            status: "FAIL",
-            details: String(genErr),
-          });
-          errors.push(`Prisma client generation command error: ${String(genErr)}`);
-        }
-
-        // 3. Database initialization / migration push
-        try {
-          const pushRes = await sandbox.commands.run(
-            `cd "${PROJECT_WORKSPACE_DIR}" && bunx prisma db push --accept-data-loss`,
-            { timeoutMs: 30000 }
-          );
-          const pushPassed = pushRes.exitCode === 0;
-          checks.push({
-            name: "database-initialization",
-            category: "database-validation",
-            status: pushPassed ? "PASS" : "FAIL",
-            details: pushPassed
-              ? "SQLite database schema synchronized successfully"
-              : (pushRes.stderr || pushRes.stdout || "Database push failed").slice(0, 500),
-          });
-          if (!pushPassed) {
-            errors.push(`Database push failed: ${(pushRes.stderr || pushRes.stdout).slice(0, 300)}`);
-          }
-        } catch (pushErr) {
-          checks.push({
-            name: "database-initialization",
-            category: "database-validation",
-            status: "FAIL",
-            details: String(pushErr),
-          });
-          errors.push(`Database initialization command error: ${String(pushErr)}`);
-        }
-
-        // 4. Executable database connectivity and query execution verification
-        try {
-          const connRes = await sandbox.commands.run(
-            `cd "${PROJECT_WORKSPACE_DIR}" && bun -e 'import { db } from "./lib/db"; async function run() { await db.$queryRaw\`SELECT 1\`; console.log("DB_QUERY_SUCCESS"); } run();'`,
-            { timeoutMs: 15000 }
-          );
-          const connPassed = connRes.exitCode === 0 && connRes.stdout.includes("DB_QUERY_SUCCESS");
-          checks.push({
-            name: "database-crud-verification",
-            category: "database-validation",
-            status: connPassed ? "PASS" : "FAIL",
-            details: connPassed
-              ? "Database query execution and SQLite connection verified"
-              : (connRes.stderr || connRes.stdout || "Database query failed").slice(0, 500),
-          });
-          if (!connPassed) {
-            errors.push(`Database query verification failed: ${(connRes.stderr || connRes.stdout).slice(0, 300)}`);
-          }
-        } catch (connErr) {
-          checks.push({
-            name: "database-crud-verification",
-            category: "database-validation",
-            status: "FAIL",
-            details: String(connErr),
-          });
-          errors.push(`Database query execution failed: ${String(connErr)}`);
-        }
+        const dbResult = await executeDatabaseVerificationPipeline(executor, {
+          workspaceDir: targetWorkspaceDir,
+          models: archSpec?.databaseModels,
+          runner,
+        });
+        checks.push(...dbResult.checks);
+        errors.push(...dbResult.errors);
+      } else if (requiresDb) {
+        checks.push({
+          name: "database-schema-live-validation",
+          category: "database-validation",
+          status: "FAIL",
+          details: "Application requires data persistence but prisma/schema.prisma is missing",
+        });
+        errors.push("Missing prisma/schema.prisma for database verification");
       }
 
       // TypeScript check
+      const tscCmd = runner === "bun"
+        ? `cd "${targetWorkspaceDir}" && bun run tsc --noEmit`
+        : `cd "${targetWorkspaceDir}" && npx tsc --noEmit`;
       try {
-        const tscResult = await sandbox.commands.run(`cd "${PROJECT_WORKSPACE_DIR}" && bun run tsc --noEmit`, { timeoutMs: 30000 });
+        const tscResult = await executor.run(tscCmd, { timeoutMs: 30000 });
         if (tscResult.exitCode === 0) {
           checks.push({
             name: "typescript-validation",
@@ -400,8 +548,11 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       }
 
       // Production build check
+      const buildCmd = runner === "bun"
+        ? `cd "${targetWorkspaceDir}" && bun run build`
+        : `cd "${targetWorkspaceDir}" && npm run build`;
       try {
-        const buildResult = await sandbox.commands.run(`cd "${PROJECT_WORKSPACE_DIR}" && bun run build`, { timeoutMs: 60000 });
+        const buildResult = await executor.run(buildCmd, { timeoutMs: 60000 });
         if (buildResult.exitCode === 0) {
           checks.push({
             name: "production-build",
@@ -433,16 +584,19 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
         name: "sandbox-connection",
         category: "sandbox-connection",
         status: "FAIL",
-        details: `Failed to connect to sandbox for verification: ${String(sandboxConnErr)}`,
+        details: `Failed to connect to verification environment: ${String(sandboxConnErr)}`,
       });
       errors.push(`Sandbox connection error: ${String(sandboxConnErr)}`);
     }
   }
 
-  // All mandatory checks must pass
-  const passed = checks.every((c) => c.status === "PASS");
-  const passedCount = checks.filter((c) => c.status === "PASS").length;
-  const score = Math.round((passedCount / checks.length) * 100);
+  // All checks must pass or be cleanly skipped (no FAILs allowed)
+  const passed = !checks.some((c) => c.status === "FAIL");
+  const applicableChecks = checks.filter((c) => c.status !== "SKIPPED");
+  const passedCount = applicableChecks.filter((c) => c.status === "PASS").length;
+  const score = applicableChecks.length > 0
+    ? Math.round((passedCount / applicableChecks.length) * 100)
+    : 100;
 
   const verificationMode = executedSandboxChecks ? "sandbox-verified" : "static-only";
 

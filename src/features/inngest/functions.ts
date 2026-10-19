@@ -29,7 +29,7 @@ import {
   initializeSandboxWorkspace,
   resolveWorkspacePath,
 } from "@/server/orchestration/workspace";
-import { getBaseProjectFiles } from "@/server/templates/foundation";
+import { getBaseProjectFiles, MissingDatabaseModelsError } from "@/server/templates/foundation";
 
 export interface CodeAgentState {
   sandboxId: string;
@@ -200,6 +200,13 @@ export const codeAgentFunction = inngest.createFunction(
         "Architecture Agent",
         `Configured ${spec.routeEndpoints.length} route endpoints with Next.js full-stack architecture`
       );
+
+      // Task 3: Reject architecture requiring database persistence but lacking database models
+      if (spec.requiresDatabase && (!spec.databaseModels || spec.databaseModels.length === 0)) {
+        throw new MissingDatabaseModelsError(
+          `Architecture specification for "${prd.projectName}" requires database persistence, but contains no database models.`
+        );
+      }
 
       return spec;
     });

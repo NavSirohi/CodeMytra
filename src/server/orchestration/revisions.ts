@@ -57,7 +57,7 @@ export function sanitizeProjectFiles(files: Record<string, string>): Record<stri
       segments.includes(".next") ||
       segments.includes(".git") ||
       segments.includes(".cache") ||
-      normalized.startsWith(".env") ||
+      (normalized.startsWith(".env") && normalized !== ".env.example") ||
       normalized.endsWith(".pem") ||
       normalized.endsWith(".key")
     ) {

@@ -1,16 +1,25 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import os from "os";
 import JSZip from "jszip";
 import {
   PRDSchema,
   DesignSpecSchema,
   ArchitectureSpecSchema,
 } from "../src/server/agent-contracts/schemas";
-import { runQAInspector } from "../src/server/agents/qa";
+import { runQAInspector, executeDatabaseVerificationPipeline } from "../src/server/agents/qa";
 import { buildContextEnhancedPrompt } from "../src/server/agents/coder";
 import { validateExportFiles } from "../src/server/export/zip-export";
 import { sanitizeProjectFiles } from "../src/server/orchestration/revisions";
-import { getBaseProjectFiles, FOUNDATION_VERSION } from "../src/server/templates/foundation";
+import {
+  getBaseProjectFiles,
+  buildPrismaSchema,
+  MissingDatabaseModelsError,
+  FOUNDATION_VERSION,
+} from "../src/server/templates/foundation";
 import { ArchitectureError } from "../src/server/agents/architect";
 
 describe("Milestone M2: Generic Full-Stack AI Application Generation", () => {
@@ -763,16 +772,35 @@ export async function DELETE(req: Request) {
   // ───────────────────────────────────────────────────────────────────────────
   describe("Scenario E: Standalone Exported ZIP Verification", () => {
     const testCases = [
-      { name: "Developer Portfolio (Static)", requiresDb: false },
-      { name: "Inventory Management (CRUD)", requiresDb: true },
-      { name: "Appointment Booking (Workflow)", requiresDb: true },
-      { name: "E-Commerce Coffee Store (Cart/Orders)", requiresDb: true },
+      { name: "Developer Portfolio (Static)", requiresDb: false, models: [] },
+      {
+        name: "Inventory Management (CRUD)",
+        requiresDb: true,
+        models: [{ modelName: "Product", fields: ["sku String @unique", "name String", "quantity Int"] }],
+      },
+      {
+        name: "Appointment Booking (Workflow)",
+        requiresDb: true,
+        models: [{ modelName: "Appointment", fields: ["customerName String", "serviceName String", "startTime DateTime"] }],
+      },
+      {
+        name: "E-Commerce Coffee Store (Cart/Orders)",
+        requiresDb: true,
+        models: [
+          { modelName: "Product", fields: ["name String", "price Float", "stock Int"] },
+          { modelName: "Order", fields: ["total Float", "status String"] },
+        ],
+      },
     ];
 
     for (const tc of testCases) {
       it(`verifies standalone ZIP export integrity for "${tc.name}"`, async () => {
         const slug = tc.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-        const baseFiles = getBaseProjectFiles({ projectName: slug, requiresDatabase: tc.requiresDb });
+        const baseFiles = getBaseProjectFiles({
+          projectName: slug,
+          requiresDatabase: tc.requiresDb,
+          models: tc.models,
+        });
 
         const projectFiles: Record<string, string> = {
           ...baseFiles,
@@ -909,6 +937,156 @@ export async function POST(req: Request) { return NextResponse.json({ created: t
       assert.match(err.message, /failed to generate a valid Architecture Specification/);
       assert.equal(err.rawOutput, "{ invalid json raw output }");
       assert.ok(err instanceof Error);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TASK 1 & TASK 2: Safe Database Verification & Model Operations
+  // ───────────────────────────────────────────────────────────────────────────
+  describe("Task 1 & Task 2: Safe Database Verification & Real Model Operations", () => {
+    it("proves that QA leaves an existing database unchanged when validation fails", async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "qa-db-preserve-"));
+      try {
+        // Create an existing dev.db with known user records
+        const devDbPath = path.join(tempDir, "dev.db");
+        const existingData = Buffer.from("SQLITE_HEADER_USER_PERSISTED_RECORDS_ABC_123_DO_NOT_ALTER");
+        fs.writeFileSync(devDbPath, existingData);
+        const originalHash = crypto.createHash("sha256").update(existingData).digest("hex");
+
+        // Write an invalid schema in tempDir to cause schema validation failure
+        fs.mkdirSync(path.join(tempDir, "prisma"), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, "prisma/schema.prisma"), "INVALID SYNTAX BROKEN");
+
+        // Track all executed commands
+        const executedCommands: string[] = [];
+        const mockExecutor = {
+          run: async (cmd: string) => {
+            executedCommands.push(cmd);
+            if (cmd.includes("prisma validate")) {
+              return { exitCode: 1, stdout: "", stderr: "Schema validation error: broken syntax" };
+            }
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+        };
+
+        const result = await executeDatabaseVerificationPipeline(mockExecutor, {
+          workspaceDir: tempDir,
+          models: [{ modelName: "Product", fields: ["sku String"] }],
+          disposableDbName: ".qa_disposable.db",
+        });
+
+        // Verification failed as expected
+        const valCheck = result.checks.find((c) => c.name === "database-schema-live-validation");
+        assert.ok(valCheck);
+        assert.equal(valCheck.status, "FAIL");
+
+        // PROVE: Existing dev.db was NEVER touched or altered
+        assert.ok(fs.existsSync(devDbPath), "Existing dev.db must still exist");
+        const currentData = fs.readFileSync(devDbPath);
+        const currentHash = crypto.createHash("sha256").update(currentData).digest("hex");
+        assert.equal(currentHash, originalHash, "Existing dev.db SHA-256 hash must be identical");
+        assert.deepEqual(currentData, existingData, "Existing dev.db bytes must be completely unchanged");
+
+        // Verify that commands never targeted dev.db
+        for (const cmd of executedCommands) {
+          assert.equal(cmd.includes("dev.db"), false, `Command should never directly target dev.db: ${cmd}`);
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("verifies real database connectivity and model operations are tested and reported distinctly", async () => {
+      const executedCommands: string[] = [];
+      const mockExecutor = {
+        run: async (cmd: string) => {
+          executedCommands.push(cmd);
+          if (cmd.includes("prisma validate")) return { exitCode: 0, stdout: "Valid", stderr: "" };
+          if (cmd.includes("prisma generate")) return { exitCode: 0, stdout: "Generated", stderr: "" };
+          if (cmd.includes("prisma db push")) return { exitCode: 0, stdout: "Pushed", stderr: "" };
+          if (cmd.includes("SELECT 1")) return { exitCode: 0, stdout: "DB_CONNECTIVITY_SUCCESS", stderr: "" };
+          if (cmd.includes("MODEL_OPERATION_SUCCESS")) return { exitCode: 0, stdout: "MODEL_OPERATION_SUCCESS:4", stderr: "" };
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+
+      const result = await executeDatabaseVerificationPipeline(mockExecutor, {
+        workspaceDir: "/tmp/mock",
+        models: [{ modelName: "InventoryItem", fields: ["name String"] }],
+        disposableDbName: ".qa_disposable.db",
+      });
+
+      // Verify separate checks
+      const connCheck = result.checks.find((c) => c.name === "database-connectivity");
+      assert.ok(connCheck, "database-connectivity check must exist");
+      assert.equal(connCheck.status, "PASS");
+      assert.match(connCheck.details || "", /SELECT 1/);
+
+      const modelCheck = result.checks.find((c) => c.name === "database-model-operations");
+      assert.ok(modelCheck, "database-model-operations check must exist");
+      assert.equal(modelCheck.status, "PASS");
+      assert.match(modelCheck.details || "", /InventoryItem/);
+
+      // Verify initialization command used disposable DB without --accept-data-loss
+      const pushCmd = executedCommands.find((c) => c.includes("db push"));
+      assert.ok(pushCmd);
+      assert.match(pushCmd, /DATABASE_URL="file:\.\/\.qa_disposable\.db"/);
+      assert.equal(pushCmd.includes("--accept-data-loss"), false, "Must NOT use --accept-data-loss");
+    });
+
+    it("reports database checks as SKIPPED for static applications without false passes", async () => {
+      const report = await runQAInspector({
+        files: { "app/page.tsx": "export default function () { return <div>Static</div>; }" },
+        summary: "Static portfolio without database",
+        sandboxId: "",
+        runSandboxCommands: false,
+        capabilities: ["pages-navigation"],
+      });
+
+      const connCheck = report.checks.find((c) => c.name === "database-connectivity");
+      assert.ok(connCheck);
+      assert.equal(connCheck.status, "SKIPPED");
+
+      const modelCheck = report.checks.find((c) => c.name === "database-model-operations");
+      assert.ok(modelCheck);
+      assert.equal(modelCheck.status, "SKIPPED");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TASK 3: Removal of Invented Database Models
+  // ───────────────────────────────────────────────────────────────────────────
+  describe("Task 3: Removal of Invented Database Models", () => {
+    it("throws MissingDatabaseModelsError when persistence is required but models is empty", () => {
+      assert.throws(
+        () => {
+          getBaseProjectFiles({
+            projectName: "no-models-app",
+            requiresDatabase: true,
+            models: [],
+          });
+        },
+        MissingDatabaseModelsError
+      );
+
+      assert.throws(
+        () => {
+          buildPrismaSchema([]);
+        },
+        MissingDatabaseModelsError
+      );
+    });
+
+    it("does not generate invented fallback Item model anywhere", () => {
+      const files = getBaseProjectFiles({
+        projectName: "booking-app",
+        requiresDatabase: true,
+        models: [{ modelName: "Booking", fields: ["date DateTime"] }],
+      });
+
+      assert.ok(files["prisma/schema.prisma"]);
+      assert.match(files["prisma/schema.prisma"], /model Booking/);
+      assert.equal(files["prisma/schema.prisma"].includes("model Item"), false);
     });
   });
 });

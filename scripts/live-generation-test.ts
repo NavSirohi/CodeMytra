@@ -62,9 +62,9 @@ loadEnv();
  */
 async function main() {
   console.log("=".repeat(80));
-  console.log(" CodeMytra Category 2: Live Generation Integration Test");
-  console.log(" Full 8-Step Lifecycle: Initial Gen -> Follow-up -> QA -> Fail Handling ->");
-  console.log("                        Recovery -> Restoration -> Export -> Standalone Build");
+  console.log(" CodeMytra M2: Live Acceptance Test Suite");
+  console.log(" 4 Generic Scenarios: Portfolio, Inventory, Booking, E-Commerce");
+  console.log(" Unified Pipeline: Initial Gen -> Follow-up -> QA -> Export -> Build");
   console.log("=".repeat(80));
 
   const e2bKey = process.env.E2B_API_KEY;
@@ -73,13 +73,18 @@ async function main() {
 
   if (!e2bKey || !e2bTemplate || !geminiKey) {
     console.log("\n" + "-".repeat(80));
-    console.log("STATUS: [SKIPPED] Missing credentials for live generation integration test");
+    console.log("STATUS: [SKIPPED] Missing credentials for live generation acceptance suite");
     console.log("-".repeat(80));
     console.log("The following environment variables are required for live cloud verification:");
     if (!e2bKey) console.log("  - E2B_API_KEY");
     if (!e2bTemplate) console.log("  - E2B_TEMPLATE_ID");
     if (!geminiKey) console.log("  - GEMINI_API_KEY");
     console.log("\nNote: Unit & database tests (npm test) provide offline deterministic proof.");
+    console.log("The suite verifies the 4 generic scenarios through the unified multi-agent engine:");
+    console.log("  1. Static Developer Portfolio (no DB, clean responsive UI, contact form)");
+    console.log("  2. CRUD Inventory Management (SQLite persistence, REST API routes)");
+    console.log("  3. Appointment Booking Workflow (business constraints, conflict prevention)");
+    console.log("  4. E-Commerce Coffee Store (catalogue, cart, orders, atomic stock deduction)");
     console.log("-".repeat(80));
     process.exit(0);
   }

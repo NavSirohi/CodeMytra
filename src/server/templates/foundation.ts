@@ -22,14 +22,27 @@ export function isDatabaseRequired(capabilities?: ApplicationCapability[]): bool
   return capabilities.some((c) => c === "data-persistence" || c === "crud-operations");
 }
 
+export class MissingDatabaseModelsError extends Error {
+  constructor(message = "Architecture specification requires database persistence but contains no database models") {
+    super(message);
+    this.name = "MissingDatabaseModelsError";
+  }
+}
+
 /**
  * Generates an isolated SQLite Prisma schema for the generated application.
  * Compatible with Prisma ORM v7 (no datasource URL in schema; configured in prisma.config.ts).
  * Never connects to or shares CodeMytra's internal platform database.
  */
 export function buildPrismaSchema(
-  models: Array<{ modelName: string; fields: string[]; relations?: string[] }> = []
+  models: Array<{ modelName: string; fields: string[]; relations?: string[] }>
 ): string {
+  if (!models || models.length === 0) {
+    throw new MissingDatabaseModelsError(
+      "Cannot generate Prisma schema: persistence is required but no database models were provided."
+    );
+  }
+
   let schema = `// Prisma schema for generated application (isolated SQLite)
 // CodeMytra Foundation v${FOUNDATION_VERSION}
 datasource db {
@@ -41,11 +54,7 @@ generator client {
 }
 `;
 
-  const modelsToGenerate = models.length > 0
-    ? models
-    : [{ modelName: "Item", fields: ["title String"] }];
-
-  for (const model of modelsToGenerate) {
+  for (const model of models) {
     schema += `\nmodel ${model.modelName} {\n`;
     const fields = model.fields || [];
 
@@ -291,6 +300,11 @@ export function cn(...inputs: ClassValue[]) {
   };
 
   if (needsDb) {
+    if (!models || models.length === 0) {
+      throw new MissingDatabaseModelsError(
+        `Persistence is required for project "${projectName}" but the ArchitectureSpec contains no valid database models.`
+      );
+    }
     baseFiles["prisma/schema.prisma"] = buildPrismaSchema(models);
     baseFiles["prisma.config.ts"] = `import "dotenv/config";
 import { defineConfig } from "prisma/config";
