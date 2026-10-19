@@ -74,9 +74,12 @@ export default function MessageContainer({
       lastAssistantMessage.id !== lastAutoSelectedMessageIdRef.current
     ) {
       lastAutoSelectedMessageIdRef.current = lastAssistantMessage.id;
+      const revId = (lastAssistantMessage as unknown as { generationRun?: { resultRevisionId?: string | null } }).generationRun?.resultRevisionId ?? null;
       onAutoSelectLatestFragment({
         ...lastAssistantMessage.fragments,
         files: parseFragmentFiles(lastAssistantMessage.fragments.files),
+        selectionType: "assistant-fragment",
+        revisionId: revId,
       });
     }
   }, [messages, isManualSelection, onAutoSelectLatestFragment]);
@@ -128,18 +131,22 @@ export default function MessageContainer({
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {messages.map((message) => (
-          <MessageCard
-            key={message.id}
-            content={message.content}
-            role={message.role}
-            fragment={message.fragments}
-            createdAt={message.createdAt}
-            isActiveFragment={activeFragment?.id === message.fragments?.id}
-            onFragmentClick={onManualSelectFragment}
-            type={message.type}
-          />
-        ))}
+        {messages.map((message) => {
+          const revId = (message as unknown as { generationRun?: { resultRevisionId?: string | null } }).generationRun?.resultRevisionId ?? null;
+          return (
+            <MessageCard
+              key={message.id}
+              content={message.content}
+              role={message.role}
+              fragment={message.fragments}
+              revisionId={revId}
+              createdAt={message.createdAt}
+              isActiveFragment={activeFragment?.id === message.fragments?.id}
+              onFragmentClick={onManualSelectFragment}
+              type={message.type}
+            />
+          );
+        })}
         {isLastMessageUser && <MessageLoading />}
         <div ref={bottomRef} />
       </div>

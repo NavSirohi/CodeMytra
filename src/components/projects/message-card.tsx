@@ -25,10 +25,12 @@ import { Chai0Mark } from "@/components/brand/chai0-logo";
  */
 function FragmentCard({
   fragment,
+  revisionId,
   isActiveFragment,
   onFragmentClick,
 }: {
   fragment: Fragment;
+  revisionId?: string | null;
   isActiveFragment: boolean;
   onFragmentClick: (fragment: ProjectFragment) => void;
 }) {
@@ -44,6 +46,8 @@ function FragmentCard({
         onFragmentClick({
           ...fragment,
           files: parseFragmentFiles(fragment.files),
+          selectionType: "assistant-fragment",
+          revisionId: revisionId ?? null,
         })
       }
     >
@@ -94,6 +98,7 @@ function UserMessage({ content }: { content: string }) {
 function AssistantMessage({
   content,
   fragment,
+  revisionId,
   createdAt,
   isActiveFragment,
   onFragmentClick,
@@ -101,6 +106,7 @@ function AssistantMessage({
 }: {
   content: string;
   fragment: Fragment | null;
+  revisionId?: string | null;
   createdAt: Date;
   isActiveFragment: boolean;
   onFragmentClick: (fragment: ProjectFragment) => void;
@@ -126,6 +132,7 @@ function AssistantMessage({
         {fragment && type === MessageType.RESULT && (
           <FragmentCard
             fragment={fragment}
+            revisionId={revisionId}
             isActiveFragment={isActiveFragment}
             onFragmentClick={onFragmentClick}
           />
@@ -142,6 +149,7 @@ function AssistantMessage({
  * @param content - The message text.
  * @param role - Who authored the message (USER or ASSISTANT).
  * @param fragment - Associated fragment, or `null`.
+ * @param revisionId - Optional ProjectRevision ID from generation run.
  * @param createdAt - When the message was created.
  * @param isActiveFragment - Whether this message's fragment is selected.
  * @param onFragmentClick - Called when the fragment card is clicked.
@@ -151,6 +159,7 @@ export default function MessageCard({
   content,
   role,
   fragment,
+  revisionId,
   createdAt,
   isActiveFragment,
   onFragmentClick,
@@ -159,6 +168,7 @@ export default function MessageCard({
   content: string;
   role: MessageRole;
   fragment: Fragment | null;
+  revisionId?: string | null;
   createdAt: Date;
   isActiveFragment: boolean;
   onFragmentClick: (fragment: ProjectFragment) => void;
@@ -169,6 +179,7 @@ export default function MessageCard({
       <AssistantMessage
         content={content}
         fragment={fragment}
+        revisionId={revisionId}
         createdAt={createdAt}
         isActiveFragment={isActiveFragment}
         onFragmentClick={onFragmentClick}

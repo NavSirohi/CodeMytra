@@ -184,6 +184,11 @@ export const getMessages = async (projectId: string) => {
     },
     include: {
       fragments: true,
+      generationRun: {
+        select: {
+          resultRevisionId: true,
+        },
+      },
     },
   });
 };

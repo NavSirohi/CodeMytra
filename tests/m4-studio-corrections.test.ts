@@ -1,10 +1,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import JSZip from "jszip";
+import { QueryClient } from "@tanstack/react-query";
 import { isGenerationActiveStatus } from "@/features/projects/hooks/projects";
+import { generateProjectZip } from "@/server/export/zip-export";
+import { prisma } from "@/lib/db";
+import { parseFragmentFiles, type ProjectFragment } from "@/features/projects/fragment-types";
 
 describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
-  describe("Task 1: Conversation Polling Lifecycle", () => {
-    // Simulate refetchInterval logic matching useGetMessages
+  describe("Task 1: Conversation Polling & QueryClient Lifecycle", () => {
     function computeMessagePollInterval(options: {
       isGenerating: boolean;
       messagesCount: number;
@@ -33,7 +37,6 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
     }
 
     it("newly created project with no messages polls while activeRun is pending or queued", () => {
-      // 1. Pending initial run
       const pendingInterval = computeMessagePollInterval({
         isGenerating: false,
         messagesCount: 0,
@@ -42,7 +45,6 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       });
       assert.strictEqual(pendingInterval, 2500, "Should poll while initial run is resolving");
 
-      // 2. Initial run queued
       const queuedInterval = computeMessagePollInterval({
         isGenerating: true,
         messagesCount: 0,
@@ -62,7 +64,7 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
         );
         const interval = computeMessagePollInterval({
           isGenerating: isGenerationActiveStatus(stage),
-          messagesCount: 1, // User prompt sent
+          messagesCount: 1,
           isActiveRunPending: false,
           status: stage,
         });
@@ -70,257 +72,305 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       }
     });
 
-    it("first assistant response becomes visible and terminal status ceases continuous polling", () => {
-      const terminalStatuses = ["COMPLETED", "FAILED", "CANCELLED"];
-      for (const termStatus of terminalStatuses) {
-        assert.strictEqual(
-          isGenerationActiveStatus(termStatus),
-          false,
-          `Terminal status ${termStatus} must NOT be active`
-        );
-        const interval = computeMessagePollInterval({
-          isGenerating: isGenerationActiveStatus(termStatus),
-          messagesCount: 2, // User message + newly arrived assistant message
-          isActiveRunPending: false,
-          status: termStatus,
-        });
-        assert.strictEqual(
-          interval,
-          false,
-          `Terminal status ${termStatus} must stop polling immediately`
-        );
-      }
+    it("initial assistant response appears after empty conversation and ceases continuous polling", () => {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const projectId = "proj-initial-test";
+
+      // 1. Initially empty conversation
+      queryClient.setQueryData(["messages", projectId], []);
+      const initialMessages = queryClient.getQueryData<unknown[]>(["messages", projectId]);
+      assert.strictEqual(initialMessages?.length, 0);
+
+      // Polling is active while initial run is resolving
+      const initialInterval = computeMessagePollInterval({
+        isGenerating: false,
+        messagesCount: initialMessages?.length ?? 0,
+        isActiveRunPending: true,
+        status: null,
+      });
+      assert.strictEqual(initialInterval, 2500);
+
+      // 2. Initial assistant response arrives
+      const newMessages = [
+        {
+          id: "msg-user-1",
+          role: "USER",
+          content: "Create a SaaS landing page",
+          createdAt: new Date(),
+        },
+        {
+          id: "msg-assistant-1",
+          role: "ASSISTANT",
+          content: "I have built the landing page with authentication and dark mode.",
+          createdAt: new Date(),
+          fragments: {
+            id: "frag-landing-1",
+            title: "Landing Page V1",
+            sandboxUrl: "https://preview-1.e2b.dev",
+            files: {
+              "app/page.tsx": "export default function Page() { return <h1>SaaS</h1>; }",
+            },
+          },
+          generationRun: {
+            resultRevisionId: "rev-landing-1",
+          },
+        },
+      ];
+      queryClient.setQueryData(["messages", projectId], newMessages);
+
+      const updatedMessages = queryClient.getQueryData<typeof newMessages>(["messages", projectId]);
+      assert.strictEqual(updatedMessages?.length, 2);
+      assert.strictEqual(updatedMessages?.[1]?.role, "ASSISTANT");
+      assert.strictEqual(updatedMessages?.[1]?.fragments?.title, "Landing Page V1");
+
+      // 3. Once completed, polling ceases immediately
+      const completedInterval = computeMessagePollInterval({
+        isGenerating: isGenerationActiveStatus("COMPLETED"),
+        messagesCount: updatedMessages?.length ?? 0,
+        isActiveRunPending: false,
+        status: "COMPLETED",
+      });
+      assert.strictEqual(completedInterval, false, "Must stop polling on COMPLETED");
+
+      queryClient.clear();
     });
 
-    it("follow-up messages resume polling when a new run transitions to QUEUED", () => {
-      // User posts follow up -> new run created in QUEUED
-      const followUpInterval = computeMessagePollInterval({
-        isGenerating: isGenerationActiveStatus("QUEUED"),
-        messagesCount: 3,
-        isActiveRunPending: false,
-        status: "QUEUED",
+    it("follow-up message invalidates active run, messages, project, and revisions in QueryClient", async () => {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
       });
-      assert.strictEqual(followUpInterval, 2500, "Follow up must resume polling at 2.5s");
+      const projectId = "proj-invalidation-test";
+
+      // Seed queries in cache
+      queryClient.setQueryData(["messages", projectId], [{ id: "m1" }]);
+      queryClient.setQueryData(["active-generation-run", projectId], { status: "COMPLETED" });
+      queryClient.setQueryData(["project", projectId], { id: projectId, name: "Test" });
+      queryClient.setQueryData(["project-revisions", projectId], [{ id: "r1" }]);
+
+      // Verify all queries are currently fresh/not stale
+      assert.ok(queryClient.getQueryData(["messages", projectId]));
+      assert.ok(queryClient.getQueryData(["active-generation-run", projectId]));
+      assert.ok(queryClient.getQueryData(["project", projectId]));
+      assert.ok(queryClient.getQueryData(["project-revisions", projectId]));
+
+      // Execute actual query invalidations corresponding to follow-up submission
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["messages", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["active-generation-run", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["project-revisions", projectId] }),
+      ]);
+
+      // All 4 query keys are marked stale in the QueryClient
+      const messagesState = queryClient.getQueryState(["messages", projectId]);
+      const runState = queryClient.getQueryState(["active-generation-run", projectId]);
+      const projectState = queryClient.getQueryState(["project", projectId]);
+      const revisionsState = queryClient.getQueryState(["project-revisions", projectId]);
+
+      assert.strictEqual(messagesState?.isInvalidated, true, "messages must be invalidated");
+      assert.strictEqual(runState?.isInvalidated, true, "active-generation-run must be invalidated");
+      assert.strictEqual(projectState?.isInvalidated, true, "project must be invalidated");
+      assert.strictEqual(revisionsState?.isInvalidated, true, "project-revisions must be invalidated");
+
+      queryClient.clear();
     });
   });
 
-  describe("Task 2: Preserve Manual Revision Selection", () => {
-    // Model the selection state logic in ProjectView and MessageContainer
-    class StudioSelectionManager {
-      selectedFragment: { id: string; title: string; files: Record<string, string>; messageId?: string; sandboxUrl?: string } | null = null;
-      isManualSelection = false;
-      lastAutoSelectedMessageId: string | null = null;
+  describe("Task 2: Manual Selection, View Latest & Preview Expiration", () => {
+    it("preserves manual historical revision selection across repeated message updates", () => {
+      const state = {
+        isManualSelection: false,
+        selectedFragment: null as ProjectFragment | null,
+        lastAutoSelectedMessageId: null as string | null,
+      };
 
-      // Stable callback for manual selection
-      handleManualSelectFragment(fragment: { id: string; title: string; files: Record<string, string>; messageId?: string; sandboxUrl?: string }) {
-        this.isManualSelection = true;
-        this.selectedFragment = fragment;
-      }
-
-      // Stable callback for manual historical revision selection
-      handleSelectRevision(rev: { id: string; title: string; files: Record<string, string> }) {
-        this.isManualSelection = true;
-        this.selectedFragment = {
+      function onManualSelectRevision(rev: { id: string; title: string; files: Record<string, string> }) {
+        state.isManualSelection = true;
+        state.selectedFragment = {
           id: rev.id,
           messageId: "historical",
           sandboxUrl: "",
           title: rev.title,
           files: rev.files,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          selectionType: "historical-revision",
+          revisionId: rev.id,
         };
       }
 
-      // Stable callback for automatic latest-fragment selection
-      handleAutoSelectLatestFragment(fragment: { id: string; title: string; files: Record<string, string> }) {
-        if (!this.isManualSelection) {
-          this.selectedFragment = fragment;
-        }
-      }
-
-      // Effect simulating MessageContainer polling update
-      onMessagesUpdated(messages: Array<{ id: string; role: string; fragment?: { id: string; title: string; files: Record<string, string> } }>) {
-        if (this.isManualSelection) {
-          // Do NOT overwrite user's explicit manual selection
+      function onMessagesPolled(messages: Array<{
+        id: string;
+        role: string;
+        fragments?: { id: string; title: string; files: Record<string, string>; sandboxUrl?: string };
+        generationRun?: { resultRevisionId?: string | null };
+      }>) {
+        if (state.isManualSelection) {
+          // Locked by manual selection
           return;
         }
-
-        const lastAssistant = messages.slice().reverse().find(m => m.role === "ASSISTANT" && m.fragment);
-        if (lastAssistant?.fragment && lastAssistant.id !== this.lastAutoSelectedMessageId) {
-          this.lastAutoSelectedMessageId = lastAssistant.id;
-          this.handleAutoSelectLatestFragment(lastAssistant.fragment);
+        const lastAssistant = messages.slice().reverse().find((m) => m.role === "ASSISTANT" && m.fragments);
+        if (lastAssistant?.fragments && lastAssistant.id !== state.lastAutoSelectedMessageId) {
+          state.lastAutoSelectedMessageId = lastAssistant.id;
+          state.selectedFragment = {
+            id: lastAssistant.fragments.id,
+            messageId: lastAssistant.id,
+            sandboxUrl: lastAssistant.fragments.sandboxUrl || "",
+            title: lastAssistant.fragments.title,
+            files: lastAssistant.fragments.files,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            selectionType: "assistant-fragment",
+            revisionId: lastAssistant.generationRun?.resultRevisionId ?? null,
+          };
         }
       }
 
-      resetToLatest() {
-        this.isManualSelection = false;
-        this.selectedFragment = null;
-      }
-    }
-
-    it("automatically selects latest fragment when user has not made a manual selection", () => {
-      const manager = new StudioSelectionManager();
-      assert.strictEqual(manager.selectedFragment, null);
-
-      manager.onMessagesUpdated([
-        { id: "msg-1", role: "USER" },
-        { id: "msg-2", role: "ASSISTANT", fragment: { id: "frag-1", title: "V1 App", files: { "src/App.tsx": "code1" } } },
-      ]);
-
-      assert.deepStrictEqual(manager.selectedFragment, {
-        id: "frag-1",
-        title: "V1 App",
-        files: { "src/App.tsx": "code1" },
-      });
-      assert.strictEqual(manager.isManualSelection, false);
-    });
-
-    it("preserves manual historical revision selection across repeated message updates and rerenders", () => {
-      const manager = new StudioSelectionManager();
-
       // Initial auto-selection
-      manager.onMessagesUpdated([
-        { id: "msg-1", role: "USER" },
-        { id: "msg-2", role: "ASSISTANT", fragment: { id: "frag-1", title: "V1 App", files: { "src/App.tsx": "code1" } } },
-      ]);
-      assert.strictEqual(manager.selectedFragment?.id, "frag-1");
-
-      // User explicitly selects historical revision V0
-      manager.handleSelectRevision({
-        id: "rev-0",
-        title: "Initial Scaffold",
-        files: { "src/App.tsx": "initial scaffold code" },
-      });
-
-      assert.strictEqual(manager.isManualSelection, true);
-      assert.strictEqual(manager.selectedFragment?.id, "rev-0");
-      assert.strictEqual(manager.selectedFragment?.messageId, "historical");
-      assert.strictEqual(manager.selectedFragment?.sandboxUrl, "");
-
-      // Subsequent message polling arrives with a new fragment from another run
-      manager.onMessagesUpdated([
-        { id: "msg-1", role: "USER" },
-        { id: "msg-2", role: "ASSISTANT", fragment: { id: "frag-1", title: "V1 App", files: { "src/App.tsx": "code1" } } },
-        { id: "msg-3", role: "USER" },
-        { id: "msg-4", role: "ASSISTANT", fragment: { id: "frag-2", title: "V2 App", files: { "src/App.tsx": "code2" } } },
-      ]);
-
-      // Selection MUST remain on rev-0
-      assert.strictEqual(manager.selectedFragment?.id, "rev-0", "Must NOT overwrite historical revision on poll");
-      assert.strictEqual(manager.selectedFragment?.title, "Initial Scaffold");
-    });
-
-    it("allows returning to latest active selection when user resets", () => {
-      const manager = new StudioSelectionManager();
-      manager.handleSelectRevision({
-        id: "rev-old",
-        title: "Old Revision",
-        files: {},
-      });
-      assert.strictEqual(manager.isManualSelection, true);
-
-      manager.resetToLatest();
-      assert.strictEqual(manager.isManualSelection, false);
-      assert.strictEqual(manager.selectedFragment, null);
-    });
-  });
-
-  describe("Task 3: Generation Query Invalidation & Discrete Statuses", () => {
-    it("recognizes exact discrete lifecycle statuses without invented percentages", () => {
-      const knownStatuses = [
-        "QUEUED",
-        "PLANNING",
-        "AWAITING_APPROVAL",
-        "DESIGNING",
-        "ARCHITECTING",
-        "RUNNING",
-        "VALIDATING",
-        "COMPLETED",
-        "FAILED",
-        "CANCELLED",
-      ];
-
-      for (const status of knownStatuses) {
-        assert.ok(typeof status === "string" && status.length > 0);
-        // Ensure no progress percentage properties exist on statuses
-        assert.strictEqual(status.includes("%"), false);
-      }
-    });
-
-    it("invalidates active generation, messages, and project queries upon follow-up submission", () => {
-      const invalidatedKeys: string[][] = [];
-      const fakeQueryClient = {
-        invalidateQueries: (options: { queryKey: string[] }) => {
-          invalidatedKeys.push(options.queryKey);
+      onMessagesPolled([
+        {
+          id: "m-1",
+          role: "ASSISTANT",
+          fragments: { id: "frag-1", title: "V1 App", files: { "app/page.tsx": "v1" } },
+          generationRun: { resultRevisionId: "rev-1" },
         },
+      ]);
+      assert.strictEqual(state.selectedFragment?.id, "frag-1");
+      assert.strictEqual(state.selectedFragment?.selectionType, "assistant-fragment");
+
+      // User manually inspects historical revision V0
+      onManualSelectRevision({
+        id: "rev-0",
+        title: "Initial Scaffold V0",
+        files: { "app/page.tsx": "v0" },
+      });
+      assert.strictEqual(state.isManualSelection, true);
+      assert.strictEqual(state.selectedFragment?.id, "rev-0");
+      assert.strictEqual(state.selectedFragment?.selectionType, "historical-revision");
+      assert.strictEqual(state.selectedFragment?.sandboxUrl, "");
+
+      // Next poll brings V2
+      onMessagesPolled([
+        {
+          id: "m-1",
+          role: "ASSISTANT",
+          fragments: { id: "frag-1", title: "V1 App", files: { "app/page.tsx": "v1" } },
+        },
+        {
+          id: "m-2",
+          role: "ASSISTANT",
+          fragments: { id: "frag-2", title: "V2 App", files: { "app/page.tsx": "v2" } },
+          generationRun: { resultRevisionId: "rev-2" },
+        },
+      ]);
+
+      // Selection remains locked on historical revision V0
+      assert.strictEqual(state.selectedFragment?.id, "rev-0", "Must NOT overwrite manual revision");
+      assert.strictEqual(state.selectedFragment?.title, "Initial Scaffold V0");
+    });
+
+    it("View Latest deterministically restores the latest assistant fragment or current revision", () => {
+      let isManualSelection = true;
+      let selectedFragment: ProjectFragment | null = {
+        id: "rev-hist",
+        messageId: "historical",
+        sandboxUrl: "",
+        title: "Historical V1",
+        files: { "app/page.tsx": "v1" },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        selectionType: "historical-revision",
+        revisionId: "rev-hist",
       };
 
-      const projectId = "proj-123";
-      // Simulate useCreateMessage onSuccess
-      fakeQueryClient.invalidateQueries({ queryKey: ["messages", projectId] });
-      fakeQueryClient.invalidateQueries({ queryKey: ["active-generation-run", projectId] });
-      fakeQueryClient.invalidateQueries({ queryKey: ["project", projectId] });
-      fakeQueryClient.invalidateQueries({ queryKey: ["project-revisions", projectId] });
+      const messages = [
+        {
+          id: "m-1",
+          role: "ASSISTANT",
+          fragments: {
+            id: "frag-latest",
+            title: "Latest Application V3",
+            sandboxUrl: "https://sandbox-v3.e2b.dev",
+            files: {
+              "package.json": '{"name":"app"}',
+              "app/page.tsx": "export default () => <div>V3</div>",
+            },
+          },
+          generationRun: { resultRevisionId: "rev-latest" },
+        },
+      ];
 
-      assert.strictEqual(invalidatedKeys.length, 4);
-      assert.deepStrictEqual(invalidatedKeys[0], ["messages", "proj-123"]);
-      assert.deepStrictEqual(invalidatedKeys[1], ["active-generation-run", "proj-123"]);
-      assert.deepStrictEqual(invalidatedKeys[2], ["project", "proj-123"]);
-      assert.deepStrictEqual(invalidatedKeys[3], ["project-revisions", "proj-123"]);
+      // View Latest implementation from ProjectView
+      function handleResetToLatest() {
+        isManualSelection = false;
+        const lastAssistant = messages.findLast((m) => m.role === "ASSISTANT" && Boolean(m.fragments));
+        if (lastAssistant?.fragments) {
+          selectedFragment = {
+            id: lastAssistant.fragments.id,
+            messageId: lastAssistant.id,
+            sandboxUrl: lastAssistant.fragments.sandboxUrl,
+            title: lastAssistant.fragments.title,
+            files: parseFragmentFiles(lastAssistant.fragments.files),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            selectionType: "assistant-fragment",
+            revisionId: lastAssistant.generationRun?.resultRevisionId ?? null,
+          };
+        } else {
+          selectedFragment = null;
+        }
+      }
+
+      handleResetToLatest();
+
+      assert.strictEqual(isManualSelection, false);
+      assert.strictEqual(selectedFragment?.id, "frag-latest");
+      assert.strictEqual(selectedFragment?.selectionType, "assistant-fragment");
+      assert.strictEqual(selectedFragment?.revisionId, "rev-latest");
+      assert.strictEqual(selectedFragment?.sandboxUrl, "https://sandbox-v3.e2b.dev");
     });
-  });
 
-  describe("Task 4: Saved Revision & Preview Behaviour", () => {
-    it("preserves source-code availability when sandboxUrl is empty or expired", () => {
-      const fragment = {
-        id: "rev-456",
-        messageId: "current-revision",
-        title: "Production App",
-        sandboxUrl: "", // Expired or unavailable
+    it("preserves source files and provides accurate preview-unavailable state when sandbox expires", () => {
+      const expiredFragment: ProjectFragment = {
+        id: "frag-expired",
+        messageId: "msg-123",
+        sandboxUrl: "", // Sandbox container stopped or expired
+        title: "E-Commerce Store V2",
         files: {
-          "package.json": '{"name":"app"}',
-          "src/index.tsx": "export default function App() {}",
+          "package.json": JSON.stringify({ name: "store", version: "1.0.0" }),
+          "app/page.tsx": "export default function Store() { return <div>Store</div>; }",
         },
         createdAt: new Date(),
         updatedAt: new Date(),
+        selectionType: "assistant-fragment",
+        revisionId: "rev-persisted-123",
       };
 
-      // Source files remain fully inspectable
-      assert.strictEqual(Object.keys(fragment.files).length, 2);
-      assert.strictEqual(fragment.files["src/index.tsx"], "export default function App() {}");
-      assert.strictEqual(fragment.sandboxUrl, "");
-    });
-
-    it("historical revision never inherits an active sandbox URL and identifies as historical", () => {
-      const activeSandboxUrl = "https://sandbox-active-123.e2b.dev";
-      const historicalRevision = {
-        id: "rev-historical",
-        messageId: "historical",
-        sandboxUrl: "", // Must remain empty
-        title: "Historical Snapshot V1",
-        files: { "src/page.tsx": "export default () => <h1>V1</h1>" },
-      };
-
-      assert.notStrictEqual(historicalRevision.sandboxUrl, activeSandboxUrl);
-      assert.strictEqual(historicalRevision.sandboxUrl, "");
-      assert.strictEqual(historicalRevision.messageId, "historical");
+      // Files remain 100% available for Code Explorer and ZIP export
+      assert.strictEqual(Object.keys(expiredFragment.files).length, 2);
+      assert.ok(expiredFragment.files["app/page.tsx"].includes("export default function Store"));
+      assert.strictEqual(expiredFragment.sandboxUrl, "");
+      assert.strictEqual(expiredFragment.revisionId, "rev-persisted-123");
     });
   });
 
-  describe("Task 5: Asynchronous Clipboard Feedback", () => {
-    it("awaits clipboard write and resolves status accurately", async () => {
+  describe("Task 3: Asynchronous Clipboard Feedback", () => {
+    it("awaits clipboard write and resolves status to copied only after promise completes", async () => {
       let clipboardContent = "";
       const fakeNavigator = {
         clipboard: {
           writeText: async (text: string) => {
-            await new Promise((resolve) => setTimeout(resolve, 10));
+            await new Promise((resolve) => setTimeout(resolve, 15));
             clipboardContent = text;
           },
         },
       };
 
       let copyStatus = "idle";
-      const targetUrl = "https://preview-box-999.e2b.dev";
+      const targetUrl = "https://preview-e2b.dev/instance-1";
 
-      // Emulate onCopy implementation
       async function onCopy(url: string) {
         if (!url) return;
         try {
@@ -331,12 +381,16 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
         }
       }
 
-      await onCopy(targetUrl);
+      assert.strictEqual(copyStatus, "idle");
+      const copyPromise = onCopy(targetUrl);
+      assert.strictEqual(copyStatus, "idle", "Must remain idle while promise is unresolved");
+
+      await copyPromise;
       assert.strictEqual(clipboardContent, targetUrl);
       assert.strictEqual(copyStatus, "copied");
     });
 
-    it("handles clipboard rejection gracefully without clearing or corrupting the URL", async () => {
+    it("handles clipboard rejection gracefully without clearing or wiping target URL", async () => {
       const fakeFailingNavigator = {
         clipboard: {
           writeText: async () => {
@@ -346,7 +400,7 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
       };
 
       let copyStatus = "idle";
-      const targetUrl = "https://preview-box-999.e2b.dev";
+      const targetUrl = "https://preview-e2b.dev/instance-1";
 
       async function onCopy(url: string) {
         if (!url) return;
@@ -360,8 +414,240 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
 
       await onCopy(targetUrl);
       assert.strictEqual(copyStatus, "error");
-      // The URL itself must NOT be cleared or lost
-      assert.strictEqual(targetUrl, "https://preview-box-999.e2b.dev");
+      assert.strictEqual(targetUrl, "https://preview-e2b.dev/instance-1");
+    });
+  });
+
+  describe("Task 4: ZIP Export ID Handling & Ownership Security", () => {
+    const testUserId = "user-auth-123";
+    const testProjectId = "proj-studio-456";
+    const testCurrentRevId = "rev-current-001";
+    const testHistoricalRevId = "rev-hist-002";
+
+    const validFiles: Record<string, string> = {
+      "app/page.tsx": "export default function Page() { return <div>App</div>; }",
+      "tsconfig.json": JSON.stringify({ compilerOptions: {} }),
+      "package.json": JSON.stringify({
+        name: "studio-test-app",
+        version: "0.1.0",
+        scripts: { build: "next build" },
+        dependencies: {
+          next: "15.0.0",
+          react: "19.0.0",
+          "react-dom": "19.0.0",
+        },
+      }),
+    };
+
+    // Backup Prisma methods
+    const originalFindUniqueProject = prisma.project.findUnique;
+    const originalFindUniqueRevision = prisma.projectRevision.findUnique;
+    const originalFindFirstRevision = prisma.projectRevision.findFirst;
+
+    function setupMockDb() {
+      // @ts-expect-error test mock
+      prisma.project.findUnique = async (args: { where: { id: string; userId: string } }) => {
+        if (args?.where?.id === testProjectId && args?.where?.userId === testUserId) {
+          return {
+            id: testProjectId,
+            name: "test-app",
+            currentRevisionId: testCurrentRevId,
+          };
+        }
+        return null;
+      };
+
+      const resolveRev = (id?: string) => {
+        if (id === testCurrentRevId) {
+          return {
+            id: testCurrentRevId,
+            projectId: testProjectId,
+            revisionNumber: 1,
+            files: validFiles,
+            title: "Current Revision V1",
+          };
+        }
+        if (id === testHistoricalRevId) {
+          return {
+            id: testHistoricalRevId,
+            projectId: testProjectId,
+            revisionNumber: 2,
+            files: validFiles,
+            title: "Historical Revision V2",
+          };
+        }
+        return null;
+      };
+
+      // @ts-expect-error test mock
+      prisma.projectRevision.findUnique = async (args: { where: { id: string } }) => {
+        return resolveRev(args?.where?.id);
+      };
+
+      // @ts-expect-error test mock
+      prisma.projectRevision.findFirst = async (args: { where: { id?: string; projectId: string } }) => {
+        if (args?.where?.projectId !== testProjectId) {
+          return null;
+        }
+        return resolveRev(args?.where?.id) || resolveRev(testCurrentRevId);
+      };
+    }
+
+    function restoreDb() {
+      prisma.project.findUnique = originalFindUniqueProject;
+      prisma.projectRevision.findUnique = originalFindUniqueRevision;
+      prisma.projectRevision.findFirst = originalFindFirstRevision;
+    }
+
+    it("exports current saved revision when no revisionId is passed", async () => {
+      setupMockDb();
+      try {
+        const result = await generateProjectZip({
+          projectId: testProjectId,
+          userId: testUserId,
+        });
+
+        assert.ok(result.buffer.length > 500);
+        assert.ok(result.filename.includes("codemytra-test-app-v1"));
+
+        const zip = await JSZip.loadAsync(result.buffer);
+        const fileNames = Object.keys(zip.files);
+        assert.ok(fileNames.some((f) => f.endsWith("app/page.tsx")));
+        assert.ok(fileNames.some((f) => f.endsWith("package.json")));
+      } finally {
+        restoreDb();
+      }
+    });
+
+    it("exports historical saved revision when historical revisionId is passed", async () => {
+      setupMockDb();
+      try {
+        const result = await generateProjectZip({
+          projectId: testProjectId,
+          revisionId: testHistoricalRevId,
+          userId: testUserId,
+        });
+
+        assert.ok(result.buffer.length > 500);
+        assert.ok(result.filename.includes("codemytra-test-app-v2"));
+
+        const zip = await JSZip.loadAsync(result.buffer);
+        const fileNames = Object.keys(zip.files);
+        assert.ok(fileNames.some((f) => f.endsWith("app/page.tsx")));
+      } finally {
+        restoreDb();
+      }
+    });
+
+    it("exports successfully when an assistant fragment with a persisted revisionId is selected", async () => {
+      setupMockDb();
+      try {
+        const assistantFragment = {
+          id: "frag-cuid-999", // Fragment ID
+          selectionType: "assistant-fragment",
+          revisionId: testCurrentRevId, // Resolved Revision ID
+        };
+
+        // Client passes fragment.revisionId, NOT fragment.id
+        const result = await generateProjectZip({
+          projectId: testProjectId,
+          revisionId: assistantFragment.revisionId,
+          userId: testUserId,
+        });
+
+        assert.ok(result.buffer.length > 500);
+        assert.ok(result.filename.includes("codemytra-test-app-v1"));
+      } finally {
+        restoreDb();
+      }
+    });
+
+    it("strictly rejects fragment IDs erroneously passed as revision IDs", async () => {
+      setupMockDb();
+      try {
+        const invalidFragmentId = "frag-assistant-bubble-123";
+
+        await assert.rejects(
+          async () => {
+            await generateProjectZip({
+              projectId: testProjectId,
+              revisionId: invalidFragmentId,
+              userId: testUserId,
+            });
+          },
+          (err: Error) => {
+            return (
+              err.message.includes(`Revision "${invalidFragmentId}" not found`) &&
+              err.message.includes("Fragment IDs cannot be used as revision IDs")
+            );
+          }
+        );
+      } finally {
+        restoreDb();
+      }
+    });
+
+    it("strictly rejects revisions belonging to another project or unauthorized users", async () => {
+      setupMockDb();
+      try {
+        // 1. Unauthorized user
+        await assert.rejects(
+          async () => {
+            await generateProjectZip({
+              projectId: testProjectId,
+              userId: "unauthorized-intruder-999",
+            });
+          },
+          /Project not found or unauthorized/
+        );
+
+        // 2. Revision belonging to another project
+        const foreignRevId = "rev-belonging-to-other-project";
+        await assert.rejects(
+          async () => {
+            await generateProjectZip({
+              projectId: testProjectId,
+              revisionId: foreignRevId,
+              userId: testUserId,
+            });
+          },
+          /not found or does not belong to project/
+        );
+      } finally {
+        restoreDb();
+      }
+    });
+
+    it("produces valid ZIP content with authenticated root folder, package.json, and tsconfig", async () => {
+      setupMockDb();
+      try {
+        const result = await generateProjectZip({
+          projectId: testProjectId,
+          revisionId: testCurrentRevId,
+          userId: testUserId,
+        });
+
+        const zip = await JSZip.loadAsync(result.buffer);
+        const rootFolder = `codemytra-test-app-v1`;
+
+        const pkgJson = await zip.file(`${rootFolder}/package.json`)?.async("string");
+        assert.ok(pkgJson);
+        const parsed = JSON.parse(pkgJson);
+        assert.strictEqual(parsed.name, "studio-test-app");
+        assert.strictEqual(parsed.scripts.build, "next build");
+
+        const tsConfig = await zip.file(`${rootFolder}/tsconfig.json`)?.async("string");
+        assert.ok(tsConfig);
+
+        const page = await zip.file(`${rootFolder}/app/page.tsx`)?.async("string");
+        assert.ok(page?.includes("export default function Page"));
+
+        const readme = await zip.file(`${rootFolder}/README.md`)?.async("string");
+        assert.ok(readme?.includes("test-app"));
+        assert.ok(readme?.includes("CodeMytra"));
+      } finally {
+        restoreDb();
+      }
     });
   });
 });

@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { ExternalLink, RefreshCcw, History, Code, Download, AlertTriangle } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Hint } from "@/components/ui/hint";
 import type { ProjectFragment } from "@/features/projects/fragment-types";
@@ -67,10 +68,37 @@ export default function FragmentWeb({
   }
 
   function handleExportRevision() {
-    const targetUrl = projectId
-      ? `/api/projects/${projectId}/export?revisionId=${encodeURIComponent(data.id)}`
-      : `/api/projects/export`;
-    window.open(targetUrl, "_blank");
+    if (!projectId) {
+      window.open(`/api/projects/export`, "_blank");
+      return;
+    }
+
+    if (data.selectionType === "assistant-fragment") {
+      if (!data.revisionId) {
+        toast.error(
+          "This preview fragment does not have a corresponding persisted revision to export. Please export a saved revision from Revision History."
+        );
+        return;
+      }
+      window.open(
+        `/api/projects/${projectId}/export?revisionId=${encodeURIComponent(data.revisionId)}`,
+        "_blank"
+      );
+      return;
+    }
+
+    if (data.selectionType === "historical-revision") {
+      const revId = data.revisionId || data.id;
+      window.open(
+        `/api/projects/${projectId}/export?revisionId=${encodeURIComponent(revId)}`,
+        "_blank"
+      );
+      return;
+    }
+
+    // Current revision or default
+    const revParam = data.revisionId ? `?revisionId=${encodeURIComponent(data.revisionId)}` : "";
+    window.open(`/api/projects/${projectId}/export${revParam}`, "_blank");
   }
 
   return (

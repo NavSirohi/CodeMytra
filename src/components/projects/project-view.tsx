@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { Code, EyeIcon, Download, Rocket, History } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Hint } from "@/components/ui/hint";
 import { cn } from "@/lib/utils";
@@ -12,7 +13,7 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Fragment } from "@/generated/prisma/client";
+import { MessageRole } from "@/generated/prisma/enums";
 import ProjectHeader from "./project-header";
 import MessageContainer from "./message-container";
 import FragmentWeb from "./fragment-web";
@@ -22,10 +23,13 @@ import { AgentTimeline } from "./agent-timeline";
 import { RevisionHistory } from "./revision-history";
 import { PRDViewer } from "./prd-viewer";
 import { useGetProjectById } from "@/features/projects/hooks/projects";
+import { useGetMessages } from "@/features/messages/hooks/messages";
+import {
+  parseFragmentFiles,
+  type ProjectFragment,
+} from "@/features/projects/fragment-types";
 
-export type ProjectFragment = Fragment & {
-  files: Record<string, string>;
-};
+export type { ProjectFragment };
 
 export function ProjectView({ projectId }: { projectId: string }) {
   const [selectedFragment, setSelectedFragment] = useState<ProjectFragment | null>(null);
@@ -34,22 +38,46 @@ export function ProjectView({ projectId }: { projectId: string }) {
   const [mobileView, setMobileView] = useState<"chat" | "workspace">("chat");
 
   const { data: project, isPending, isError, error } = useGetProjectById(projectId);
+  const { data: messages } = useGetMessages(projectId);
 
-  // Derive active fragment: explicitly selected fragment, or fallback to current revision
+  // Deterministically find latest assistant fragment from active conversation
+  const lastAssistantMessage = messages?.findLast(
+    (message) => message.role === MessageRole.ASSISTANT && Boolean(message.fragments)
+  );
+
+  const latestAssistantFragment: ProjectFragment | null = useMemo(() => {
+    if (!lastAssistantMessage?.fragments) return null;
+    return {
+      ...lastAssistantMessage.fragments,
+      files: parseFragmentFiles(lastAssistantMessage.fragments.files),
+      selectionType: "assistant-fragment",
+      revisionId:
+        (lastAssistantMessage as unknown as { generationRun?: { resultRevisionId?: string | null } })
+          .generationRun?.resultRevisionId ?? null,
+    };
+  }, [lastAssistantMessage]);
+
+  // Derive current revision fragment
   const currentRev = project?.currentRevision;
+  const currentRevFragment: ProjectFragment | null = useMemo(() => {
+    if (!currentRev) return null;
+    return {
+      id: currentRev.id,
+      messageId: "current-revision",
+      sandboxUrl: "",
+      title: currentRev.title,
+      files: (currentRev.files as Record<string, string>) || {},
+      createdAt: new Date(currentRev.createdAt),
+      updatedAt: new Date(currentRev.createdAt),
+      selectionType: "current-revision",
+      revisionId: currentRev.id,
+    };
+  }, [currentRev]);
+
+  // Active fragment: manual selection takes precedence; otherwise latest assistant fragment or current revision
   const activeFragment: ProjectFragment | null = selectedFragment
     ? selectedFragment
-    : currentRev
-    ? {
-        id: currentRev.id,
-        messageId: "current-revision",
-        sandboxUrl: "",
-        title: currentRev.title,
-        files: (currentRev.files as Record<string, string>) || {},
-        createdAt: new Date(currentRev.createdAt),
-        updatedAt: new Date(currentRev.createdAt),
-      }
-    : null;
+    : latestAssistantFragment || currentRevFragment;
 
   // Stable callback for explicit user selection of a fragment card in the chat
   const handleManualSelectFragment = useCallback((fragment: ProjectFragment) => {
@@ -59,7 +87,6 @@ export function ProjectView({ projectId }: { projectId: string }) {
 
   // Stable callback for automatic selection of the latest generated fragment
   const handleAutoSelectLatestFragment = useCallback((fragment: ProjectFragment) => {
-    // Only auto-select if user has not explicitly locked in a manual selection
     setIsManualSelection((prevIsManual) => {
       if (!prevIsManual) {
         setSelectedFragment(fragment);
@@ -80,21 +107,56 @@ export function ProjectView({ projectId }: { projectId: string }) {
       files: rev.files,
       createdAt: new Date(),
       updatedAt: new Date(),
+      selectionType: "historical-revision",
+      revisionId: rev.id,
     });
     setTabState("code");
     setMobileView("workspace");
   }, []);
 
-  // Switch back to latest active revision
+  // Switch back to latest intended active revision/fragment deterministically
   const handleResetToLatest = useCallback(() => {
     setIsManualSelection(false);
-    setSelectedFragment(null);
-  }, []);
+    setSelectedFragment(latestAssistantFragment || currentRevFragment);
+  }, [latestAssistantFragment, currentRevFragment]);
 
   const handleExport = () => {
-    // Downloads project ZIP from the server-authenticated export endpoint.
-    // If viewing a specific revision snapshot, passes its revisionId.
-    const revParam = activeFragment?.id ? `?revisionId=${encodeURIComponent(activeFragment.id)}` : "";
+    if (!activeFragment) {
+      window.open(`/api/projects/${projectId}/export`, "_blank");
+      return;
+    }
+
+    // 1. Assistant-generated fragment
+    if (activeFragment.selectionType === "assistant-fragment") {
+      if (!activeFragment.revisionId) {
+        toast.error(
+          "This preview fragment does not have a corresponding persisted revision to export. Please export a saved revision from Revision History."
+        );
+        return;
+      }
+      window.open(
+        `/api/projects/${projectId}/export?revisionId=${encodeURIComponent(activeFragment.revisionId)}`,
+        "_blank"
+      );
+      return;
+    }
+
+    // 2. Historical saved revision
+    if (activeFragment.selectionType === "historical-revision") {
+      const revId = activeFragment.revisionId || activeFragment.id;
+      window.open(
+        `/api/projects/${projectId}/export?revisionId=${encodeURIComponent(revId)}`,
+        "_blank"
+      );
+      return;
+    }
+
+    // 3. Current saved revision
+    const revParam = activeFragment.revisionId
+      ? `?revisionId=${encodeURIComponent(activeFragment.revisionId)}`
+      : project?.currentRevisionId
+      ? `?revisionId=${encodeURIComponent(project.currentRevisionId)}`
+      : "";
     window.open(`/api/projects/${projectId}/export${revParam}`, "_blank");
   };
 

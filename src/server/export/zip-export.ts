@@ -103,16 +103,46 @@ export async function generateProjectZip(options: GenerateProjectZipOptions) {
   }
 
   // 2. Resolve revision
-  const targetRevId = revisionId || project.currentRevisionId;
+  type RevisionRecord = {
+    id: string;
+    projectId: string;
+    revisionNumber: number;
+    files: unknown;
+    title?: string | null;
+    summary?: string | null;
+  };
+  let revision: RevisionRecord | null = null;
 
-  const revision = targetRevId
-    ? await prisma.projectRevision.findUnique({
-        where: { id: targetRevId, projectId },
-      })
-    : await prisma.projectRevision.findFirst({
-        where: { projectId },
-        orderBy: { revisionNumber: "desc" },
-      });
+  if (revisionId) {
+    // Explicit revision requested: verify it is a valid saved ProjectRevision belonging to this project
+    const specificRev = await prisma.projectRevision.findUnique({
+      where: { id: revisionId, projectId } as unknown as { id: string },
+    });
+
+    if (!specificRev || specificRev.projectId !== projectId) {
+      throw new Error(
+        `Revision "${revisionId}" not found or does not belong to project "${projectId}". Fragment IDs cannot be used as revision IDs.`
+      );
+    }
+    revision = specificRev as RevisionRecord;
+  } else if (project.currentRevisionId) {
+    const currentRev = await prisma.projectRevision.findUnique({
+      where: { id: project.currentRevisionId, projectId } as unknown as { id: string },
+    });
+    if (currentRev && currentRev.projectId === projectId) {
+      revision = currentRev as RevisionRecord;
+    }
+  }
+
+  if (!revision) {
+    const latestRev = await prisma.projectRevision.findFirst({
+      where: { projectId },
+      orderBy: { revisionNumber: "desc" },
+    });
+    if (latestRev && latestRev.projectId === projectId) {
+      revision = latestRev as RevisionRecord;
+    }
+  }
 
   if (!revision) {
     throw new Error("No revision available to export for this project");
