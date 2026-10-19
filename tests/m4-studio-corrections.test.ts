@@ -482,7 +482,7 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
 
         // The query state and observer receive the delayed run from the real query function
         assert.strictEqual(
-          (query.state.data as { status?: string })?.status,
+          ((query.state.data as unknown) as { status?: string } | null)?.status,
           "QUEUED",
           "Query state must resolve to QUEUED via actual query function execution"
         );
