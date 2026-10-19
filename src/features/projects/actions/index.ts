@@ -30,19 +30,60 @@ export const createProject = async (value: string, idempotencyKey?: string) => {
 
   const cleanKey = idempotencyKey?.trim() || null;
 
+  // Helper to fetch existing project and verify canonical prompt binding
+  const findExistingWithPromptCheck = async (key: string) => {
+    const existing = await prisma.project.findUnique({
+      where: {
+        userId_idempotencyKey: {
+          userId: user.id,
+          idempotencyKey: key,
+        },
+      },
+      include: {
+        generationRuns: {
+          orderBy: { createdAt: "asc" },
+          take: 1,
+          select: { prompt: true },
+        },
+        messages: {
+          where: { role: MessageRole.USER },
+          orderBy: { createdAt: "asc" },
+          take: 1,
+          select: { content: true },
+        },
+      },
+    });
+
+    if (!existing) return null;
+
+    // Compare canonicalized prompt
+    const existingPrompt =
+      existing.generationRuns?.[0]?.prompt?.trim() ??
+      existing.messages?.[0]?.content?.trim();
+
+    if (existingPrompt !== undefined && existingPrompt !== trimmed) {
+      return {
+        conflict: true as const,
+        error: "Idempotency conflict: key already used with different prompt",
+      };
+    }
+
+    const { id, name, userId, idempotencyKey, currentRevisionId, createdAt, updatedAt } = existing;
+    return {
+      conflict: false as const,
+      project: { id, name, userId, idempotencyKey, currentRevisionId, createdAt, updatedAt },
+    };
+  };
+
   // 1. If an idempotency key is provided, check for existing project for this user
   if (cleanKey) {
     try {
-      const existing = await prisma.project.findUnique({
-        where: {
-          userId_idempotencyKey: {
-            userId: user.id,
-            idempotencyKey: cleanKey,
-          },
-        },
-      });
-      if (existing) {
-        return existing;
+      const match = await findExistingWithPromptCheck(cleanKey);
+      if (match) {
+        if (match.conflict) {
+          return { error: match.error };
+        }
+        return match.project;
       }
     } catch {
       // Continue to creation if lookup fails
@@ -107,16 +148,12 @@ export const createProject = async (value: string, idempotencyKey?: string) => {
         err?.meta?.target?.includes("idempotencyKey"))
     ) {
       try {
-        const existing = await prisma.project.findUnique({
-          where: {
-            userId_idempotencyKey: {
-              userId: user.id,
-              idempotencyKey: cleanKey,
-            },
-          },
-        });
-        if (existing) {
-          return existing;
+        const match = await findExistingWithPromptCheck(cleanKey);
+        if (match) {
+          if (match.conflict) {
+            return { error: match.error };
+          }
+          return match.project;
         }
       } catch (lookupErr) {
         console.error("❌ Error fetching existing project after race condition:", lookupErr);

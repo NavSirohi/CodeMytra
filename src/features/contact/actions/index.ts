@@ -54,6 +54,7 @@ export async function submitContactMessage(
   if (!rateLimit.allowed) {
     return {
       success: false,
+      fallbackToClipboard: rateLimit.status === "unconfigured",
       rateLimitStatus: rateLimit.status,
       message: rateLimit.message || "Too many submissions received. Please wait a few minutes before trying again.",
     };

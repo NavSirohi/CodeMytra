@@ -210,6 +210,7 @@ describe("Phase 2: Builder & Contact Integration", () => {
         name: "warm-bakery",
         userId: testUserId,
         idempotencyKey: "brief-key-existing",
+        generationRuns: [{ prompt: "Goal: Build bakery app" }],
       };
 
       // Mock findUnique to return existing project
@@ -225,6 +226,34 @@ describe("Phase 2: Builder & Contact Integration", () => {
       assert.ok(!("error" in result));
       assert.equal((result as any).id, "prj-already-created");
       assert.equal(txCalled, false, "Transaction must not run for already existing idempotencyKey");
+    });
+
+    it("returns idempotency-conflict error when same key is submitted with different prompt", async () => {
+      process.env.ALLOW_INSECURE_DEV_AUTH = "true";
+      (process.env as any).NODE_ENV = "test";
+
+      const testUserId = "usr-builder-123";
+      prisma.user.upsert = (async () => ({
+        id: testUserId,
+        email: "builder@example.com",
+        name: "Builder User",
+        clerkId: "dev-user-local",
+      })) as any;
+
+      const existingProject = {
+        id: "prj-already-created",
+        name: "warm-bakery",
+        userId: testUserId,
+        idempotencyKey: "brief-key-existing",
+        generationRuns: [{ prompt: "Goal: Build bakery app" }],
+      };
+
+      prisma.project.findUnique = (async () => existingProject) as any;
+
+      const result = await createProject("Goal: Build an entirely different CRM app", "brief-key-existing");
+
+      assert.ok("error" in result);
+      assert.equal(result.error, "Idempotency conflict: key already used with different prompt");
     });
 
     it("safely handles race condition when concurrent insert throws unique constraint error", async () => {
@@ -369,6 +398,21 @@ describe("Phase 2: Builder & Contact Integration", () => {
       assert.ok(result.message?.includes("not configured"));
     });
 
+    it("fails closed when abuse protection is required and backend is unconfigured", async () => {
+      delete process.env.DATABASE_URL;
+      delete process.env.DATABASE_URL_DIRECT;
+
+      const result = await checkContactRateLimit({
+        identifier: "abuse-check@example.com",
+        requireProtection: true,
+      });
+
+      assert.equal(result.configured, false);
+      assert.equal(result.allowed, false, "Must fail closed when protection is required");
+      assert.equal(result.status, "unconfigured");
+      assert.ok(result.message?.includes("unconfigured"));
+    });
+
     it("records attempts and enforces limit in shared store without storing plaintext PII", async () => {
       process.env.DATABASE_URL = "postgres://fake:fake@localhost:5432/fake";
 
@@ -380,6 +424,8 @@ describe("Phase 2: Builder & Contact Integration", () => {
           return { id: `rl-${attempts.length}`, ...args.data };
         },
       };
+
+      prisma.$transaction = (async (cb: any) => cb(prisma)) as any;
 
       const testEmail = "AbuseUser@Domain.COM";
 

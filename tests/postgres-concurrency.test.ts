@@ -637,14 +637,34 @@ describe("PostgreSQL Concurrency & Database Operations", () => {
         prompt: string,
         idempotencyKey: string,
         reqId: string
-      ): Promise<{ project: any; created: boolean; raced: boolean }> => {
+      ): Promise<{ project?: any; error?: string; created: boolean; raced: boolean; conflict: boolean }> => {
+        // Helper to check existing with prompt comparison
+        const findExisting = async () => {
+          const res = await db.query(
+            `SELECT p.id, p.name, p."userId", p."idempotencyKey",
+                    (SELECT prompt FROM "GenerationRun" WHERE "projectId" = p.id ORDER BY "createdAt" ASC LIMIT 1) as "existingPrompt"
+             FROM "Project" p
+             WHERE p."userId" = $1 AND p."idempotencyKey" = $2`,
+            [userId, idempotencyKey]
+          );
+          if (res.rows.length === 0) return null;
+          const row = res.rows[0] as any;
+          if (row.existingPrompt && row.existingPrompt.trim() !== prompt.trim()) {
+            return {
+              conflict: true,
+              error: "Idempotency conflict: key already used with different prompt",
+            };
+          }
+          return { conflict: false, project: row };
+        };
+
         // 1. Initial check
-        const existing = await db.query(
-          `SELECT id, name, "userId", "idempotencyKey" FROM "Project" WHERE "userId" = $1 AND "idempotencyKey" = $2`,
-          [userId, idempotencyKey]
-        );
-        if (existing.rows.length > 0) {
-          return { project: existing.rows[0], created: false, raced: false };
+        const initialMatch = await findExisting();
+        if (initialMatch) {
+          if (initialMatch.conflict) {
+            return { error: initialMatch.error, created: false, raced: false, conflict: true };
+          }
+          return { project: initialMatch.project, created: false, raced: false, conflict: false };
         }
 
         try {
@@ -680,16 +700,18 @@ describe("PostgreSQL Concurrency & Database Operations", () => {
               [evtId, JSON.stringify({ runId, projectId: pId, prompt })]
             );
 
-            return { project: pRes.rows[0], created: true, raced: false };
+            return { project: pRes.rows[0], created: true, raced: false, conflict: false };
           });
         } catch (err: any) {
-          // On unique constraint violation (code 23505), fetch committed project
+          // On unique constraint violation (code 23505), fetch committed project and verify prompt
           if (err.code === "23505" || err.message.includes("unique")) {
-            const committed = await db.query(
-              `SELECT id, name, "userId", "idempotencyKey" FROM "Project" WHERE "userId" = $1 AND "idempotencyKey" = $2`,
-              [userId, idempotencyKey]
-            );
-            return { project: committed.rows[0], created: false, raced: true };
+            const raceMatch = await findExisting();
+            if (raceMatch) {
+              if (raceMatch.conflict) {
+                return { error: raceMatch.error, created: false, raced: true, conflict: true };
+              }
+              return { project: raceMatch.project, created: false, raced: true, conflict: false };
+            }
           }
           throw err;
         }
@@ -718,10 +740,17 @@ describe("PostgreSQL Concurrency & Database Operations", () => {
       const outRows = await db.query(`SELECT id FROM "OutboxEvent" WHERE payload->>'projectId' = $1`, [res1.project.id]);
       assert.equal(outRows.rows.length, 1, "Exactly 1 outbox event queued");
 
-      // 2. Sequential repeated submission returns the existing project
+      // 2. Sequential repeated submission with same prompt returns the existing project
       const repeatRes = await executeCreateProject('usr-idem-1', 'Build my bakery website', keyA, 'req-3');
       assert.equal(repeatRes.created, false);
+      assert.equal(repeatRes.conflict, false);
       assert.equal(repeatRes.project.id, res1.project.id, "Repeated submission returns existing project");
+
+      // 2b. Repeated submission with same idempotencyKey but DIFFERENT prompt returns conflict error
+      const conflictRes = await executeCreateProject('usr-idem-1', 'Completely different prompt for photography', keyA, 'req-conflict');
+      assert.equal(conflictRes.conflict, true);
+      assert.equal(conflictRes.created, false);
+      assert.equal(conflictRes.error, "Idempotency conflict: key already used with different prompt");
 
       // 3. Failed submission remains recoverable
       let failedThrew = false;
@@ -753,52 +782,58 @@ describe("PostgreSQL Concurrency & Database Operations", () => {
     }
   });
 
-  // 11. Shared Database-Backed Rate Limiting Across Multiple Processes
-  it("Scenario 11: Shared database-backed rate limiting across multiple independent processes", async () => {
+  // 11. Shared Database-Backed Rate Limiting with PostgreSQL Atomic Admission
+  it("Scenario 11: Shared database-backed rate limiting with PostgreSQL atomic admission and concurrency", async () => {
     const db = await setupDatabase();
     try {
       const email = "contact-abuse@example.com";
       const keyHash = crypto.createHash("sha256").update(email).digest("hex");
 
-      // Simulate Process A and Process B performing checks on the shared DB table
-      const simulateProcessCheck = async (procName: string, attemptNum: number) => {
-        const windowStart = new Date(Date.now() - 600000);
-        const countRes = await db.query(
-          `SELECT COUNT(*)::int as count FROM "RateLimitRecord" WHERE "keyHash" = $1 AND "createdAt" >= $2`,
-          [keyHash, windowStart]
-        );
-        const currentCount = (countRes.rows[0] as any).count;
-        if (currentCount >= 5) {
-          return { allowed: false, count: currentCount, procName };
-        }
-        await db.query(
-          `INSERT INTO "RateLimitRecord" ("id", "keyHash") VALUES ($1, $2)`,
-          [`rate-${procName}-${attemptNum}`, keyHash]
-        );
-        return { allowed: true, count: currentCount + 1, procName };
+      // Atomic admission function using transaction + advisory lock
+      const atomicRateLimitCheck = async (clientTag: string, attemptIdx: number) => {
+        return await db.transaction(async (tx) => {
+          // Transaction-level advisory lock serializes checks for the same identifier hash
+          await tx.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [keyHash]);
+
+          const windowStart = new Date(Date.now() - 600000);
+          const countRes = await tx.query(
+            `SELECT COUNT(*)::int as count FROM "RateLimitRecord" WHERE "keyHash" = $1 AND "createdAt" >= $2`,
+            [keyHash, windowStart]
+          );
+          const currentCount = (countRes.rows[0] as any).count;
+          if (currentCount >= 5) {
+            return { allowed: false, count: currentCount, clientTag, attemptIdx };
+          }
+
+          await tx.query(
+            `INSERT INTO "RateLimitRecord" ("id", "keyHash") VALUES ($1, $2)`,
+            [`rate-${clientTag}-${attemptIdx}`, keyHash]
+          );
+          return { allowed: true, count: currentCount + 1, clientTag, attemptIdx };
+        });
       };
 
-      // Process A sends 3 requests
-      const a1 = await simulateProcessCheck("ProcessA", 1);
-      const a2 = await simulateProcessCheck("ProcessA", 2);
-      const a3 = await simulateProcessCheck("ProcessA", 3);
-      assert.equal(a1.allowed, true);
-      assert.equal(a2.allowed, true);
-      assert.equal(a3.allowed, true);
+      // Concurrent test: 10 concurrent requests arrive simultaneously across processes
+      const concurrentAttempts = await Promise.all(
+        Array.from({ length: 10 }).map((_, idx) =>
+          atomicRateLimitCheck(idx % 2 === 0 ? "ProcessA" : "ProcessB", idx)
+        )
+      );
 
-      // Process B sends 2 requests (separate process, observes shared state)
-      const b1 = await simulateProcessCheck("ProcessB", 1);
-      const b2 = await simulateProcessCheck("ProcessB", 2);
-      assert.equal(b1.allowed, true);
-      assert.equal(b2.allowed, true);
+      const allowedCount = concurrentAttempts.filter((r) => r.allowed).length;
+      const blockedCount = concurrentAttempts.filter((r) => !r.allowed).length;
 
-      // 6th request from Process A is blocked because shared database has 5 records
-      const a4 = await simulateProcessCheck("ProcessA", 4);
-      assert.equal(a4.allowed, false, "6th request across separate processes must be rejected");
+      assert.equal(allowedCount, 5, "Atomic admission must strictly allow exactly 5 submissions");
+      assert.equal(blockedCount, 5, "Atomic admission must strictly reject all 5 excess submissions");
+
+      // Verify database record count is exactly 5
+      const totalStored = await db.query(
+        `SELECT COUNT(*)::int as count FROM "RateLimitRecord" WHERE "keyHash" = $1`,
+        [keyHash]
+      );
+      assert.equal((totalStored.rows[0] as any).count, 5, "Database must contain exactly 5 records, never exceeding limit");
 
       // Verify no PII is stored in RateLimitRecord
-      const stored = await db.query(`SELECT "keyHash" FROM "RateLimitRecord" WHERE "keyHash" = $1`, [keyHash]);
-      assert.equal(stored.rows.length, 5);
       const rawPii = await db.query(`SELECT * FROM "RateLimitRecord" WHERE "id" LIKE '%@%' OR "keyHash" LIKE '%@%'`);
       assert.equal(rawPii.rows.length, 0, "No raw email or PII stored in RateLimitRecord");
     } finally {
