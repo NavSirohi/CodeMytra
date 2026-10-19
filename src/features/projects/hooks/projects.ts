@@ -30,12 +30,23 @@ async function unwrapActionResult<T>(result: T | { error: string }): Promise<T> 
   return result;
 }
 
+export interface CreateProjectMutationParams {
+  value: string;
+  modelPreference?: string;
+  idempotencyKey?: string;
+}
+
 export const useCreateProject = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (value: string) =>
-      unwrapActionResult(await createProject(value)),
+    mutationFn: async (input: string | CreateProjectMutationParams) => {
+      const result =
+        typeof input === "string"
+          ? await createProject(input)
+          : await createProject(input);
+      return unwrapActionResult(result);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["projects"] });
     },

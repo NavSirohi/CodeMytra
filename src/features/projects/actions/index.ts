@@ -6,8 +6,23 @@ import { generateSlug } from "random-word-slugs";
 import { prisma } from "@/lib/db";
 import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
 import { restoreHistoricalRevision } from "@/server/orchestration/revisions";
+import {
+  ModelPreference,
+  isValidModelPreference,
+  AVAILABLE_MODEL_IDS,
+} from "@/lib/models";
 
-export const createProject = async (value: string, idempotencyKey?: string) => {
+export interface CreateProjectInput {
+  value: string;
+  idempotencyKey?: string;
+  modelPreference?: string;
+}
+
+export const createProject = async (
+  inputOrValue: string | CreateProjectInput,
+  legacyIdempotencyKey?: string,
+  legacyModelPreference?: string
+) => {
   const session = await getAuthSessionState();
 
   if (session.status !== "authenticated" || !session.user) {
@@ -17,6 +32,19 @@ export const createProject = async (value: string, idempotencyKey?: string) => {
   }
 
   const user = session.user;
+
+  const value =
+    typeof inputOrValue === "object" && inputOrValue !== null
+      ? inputOrValue.value
+      : inputOrValue;
+  const idempotencyKey =
+    typeof inputOrValue === "object" && inputOrValue !== null
+      ? inputOrValue.idempotencyKey
+      : legacyIdempotencyKey;
+  const rawModelPreference =
+    typeof inputOrValue === "object" && inputOrValue !== null
+      ? inputOrValue.modelPreference
+      : legacyModelPreference;
 
   const trimmed = value?.trim();
   if (!trimmed || trimmed.length < 3) {
@@ -28,6 +56,21 @@ export const createProject = async (value: string, idempotencyKey?: string) => {
     return {
       error: "Prompt exceeds maximum length of 4000 characters",
     };
+  }
+
+  // Validate model selection server-side
+  let modelPreference: ModelPreference = "auto";
+  if (
+    rawModelPreference !== undefined &&
+    rawModelPreference !== null &&
+    rawModelPreference !== ""
+  ) {
+    if (!isValidModelPreference(rawModelPreference)) {
+      return {
+        error: `Invalid model selection "${rawModelPreference}". Supported models are: ${AVAILABLE_MODEL_IDS.join(", ")}`,
+      };
+    }
+    modelPreference = rawModelPreference;
   }
 
   const cleanKey = idempotencyKey?.trim() || null;
@@ -130,9 +173,22 @@ export const createProject = async (value: string, idempotencyKey?: string) => {
             projectId: newProject.id,
             prompt: trimmed,
             baseRevisionId: null,
+            modelPreference,
           },
         },
       });
+
+      if (tx.runEvent?.create) {
+        await tx.runEvent.create({
+          data: {
+            runId: run.id,
+            stage: "QUEUED",
+            agentRole: "Orchestrator",
+            message: `Generation queued with model selection: ${modelPreference}`,
+            payload: { modelPreference },
+          },
+        });
+      }
 
       return { project: newProject, outboxEvent: event };
     });

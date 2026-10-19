@@ -7,6 +7,7 @@ export interface GenerationEventPayload {
   projectId: string;
   prompt: string;
   baseRevisionId: string | null;
+  modelPreference?: string;
 }
 
 export const MAX_OUTBOX_ATTEMPTS = 5;
@@ -98,6 +99,7 @@ export async function executeClaimedEvent(
         projectId: payload.projectId,
         value: payload.prompt,
         baseRevisionId: payload.baseRevisionId,
+        modelPreference: payload.modelPreference,
       },
     });
 

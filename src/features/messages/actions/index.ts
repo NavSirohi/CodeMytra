@@ -5,6 +5,12 @@ import { prisma } from "@/lib/db";
 import { MessageRole, MessageType, GenerationRunStatus } from "@/generated/prisma/client";
 import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
 import { GENERATION_LIMITS } from "@/server/orchestration/stage-optimizer";
+import {
+  ModelPreference,
+  isValidModelPreference,
+  normalizeModelPreference,
+  AVAILABLE_MODEL_IDS,
+} from "@/lib/models";
 
 /**
  * Create a new user message in a project and kick off a durable agent run.
@@ -14,10 +20,15 @@ import { GENERATION_LIMITS } from "@/server/orchestration/stage-optimizer";
  *
  * @param value - The message content typed by the user.
  * @param projectId - The project the message belongs to.
+ * @param modelPreference - Optional model override; inherits previous run's model preference if omitted.
  * @returns The newly created message record.
  * @throws If the user is unauthorized or the project is not found.
  */
-export const createMessage = async (value: string, projectId: string) => {
+export const createMessage = async (
+  value: string,
+  projectId: string,
+  modelPreference?: string
+) => {
   const user = await getCurrentUser();
 
   if (!user) {
@@ -108,6 +119,33 @@ export const createMessage = async (value: string, projectId: string) => {
       );
     }
 
+    // Determine model preference: explicitly requested or inherited from project's previous run
+    let effectiveModelPreference: ModelPreference = "auto";
+    if (modelPreference !== undefined && modelPreference !== null && modelPreference !== "") {
+      if (!isValidModelPreference(modelPreference)) {
+        throw new Error(
+          `Invalid model selection "${modelPreference}". Supported models are: ${AVAILABLE_MODEL_IDS.join(", ")}`
+        );
+      }
+      effectiveModelPreference = modelPreference;
+    } else {
+      // Inherit from latest runEvent or default to auto
+      const latestRun = await tx.generationRun.findFirst({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: {
+          events: {
+            where: { stage: "QUEUED" },
+            take: 1,
+          },
+        },
+      });
+      const previousPayload = latestRun?.events?.[0]?.payload as Record<string, unknown> | null;
+      if (previousPayload && typeof previousPayload.modelPreference === "string") {
+        effectiveModelPreference = normalizeModelPreference(previousPayload.modelPreference);
+      }
+    }
+
     const message = await tx.message.create({
       data: {
         projectId,
@@ -135,9 +173,22 @@ export const createMessage = async (value: string, projectId: string) => {
           projectId,
           prompt: trimmed,
           baseRevisionId: project.currentRevisionId,
+          modelPreference: effectiveModelPreference,
         },
       },
     });
+
+    if (tx.runEvent?.create) {
+      await tx.runEvent.create({
+        data: {
+          runId: run.id,
+          stage: "QUEUED",
+          agentRole: "Orchestrator",
+          message: `Generation queued with model selection: ${effectiveModelPreference}`,
+          payload: { modelPreference: effectiveModelPreference },
+        },
+      });
+    }
 
     return { newMessage: message, outboxEvent: event };
   });

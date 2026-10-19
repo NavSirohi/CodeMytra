@@ -25,34 +25,32 @@ import {
   promptTemplateCategories,
 } from "@/components/home/prompt-templates";
 import { useCreateProject } from "@/features/projects/hooks/projects";
+import {
+  MODEL_REGISTRY,
+  ModelPreference,
+  AVAILABLE_MODEL_IDS,
+} from "@/lib/models";
 
-const AVAILABLE_MODELS = [
-  {
-    id: "auto",
-    name: "CodeMytra Auto",
-    badge: "Recommended",
-    icon: Sparkles,
-    description: "Adaptive multi-agent routing (Flash for fast specs & code, Pro for complex architecture)",
-  },
-  {
-    id: "gemini-2.5-pro",
-    name: "Gemini 2.5 Pro",
-    badge: "Reasoning",
-    icon: Cpu,
-    description: "Deep reasoning for complex fullstack apps, relational models, and business logic",
-  },
-  {
-    id: "gemini-2.5-flash",
-    name: "Gemini 2.5 Flash",
-    badge: "Ultra-Fast",
-    icon: Zap,
-    description: "Low-latency generation for rapid prototypes, components, and quick iterations",
-  },
-] as const;
+const MODEL_ICONS = {
+  Sparkles,
+  Cpu,
+  Zap,
+} as const;
+
+const AVAILABLE_MODELS = AVAILABLE_MODEL_IDS.map((id) => {
+  const def = MODEL_REGISTRY[id];
+  return {
+    id: def.id,
+    name: def.name,
+    badge: def.badge,
+    icon: MODEL_ICONS[def.iconName],
+    description: def.description,
+  };
+});
 
 export function PromptInput() {
   const [prompt, setPrompt] = useState("");
-  const [selectedModelId, setSelectedModelId] = useState<string>("auto");
+  const [selectedModelId, setSelectedModelId] = useState<ModelPreference>("auto");
   const router = useRouter();
   const { mutate: createProject, isPending } = useCreateProject();
 
@@ -60,14 +58,20 @@ export function PromptInput() {
     AVAILABLE_MODELS.find((m) => m.id === selectedModelId) || AVAILABLE_MODELS[0];
 
   function handleSubmit() {
-    createProject(prompt, {
-      onSuccess: (project) => {
-        router.push(`/projects/${project.id}`);
+    createProject(
+      {
+        value: prompt,
+        modelPreference: selectedModelId,
       },
-      onError: (error) => {
-        toast.error(error.message);
-      },
-    });
+      {
+        onSuccess: (project) => {
+          router.push(`/projects/${project.id}`);
+        },
+        onError: (error) => {
+          toast.error(error.message);
+        },
+      }
+    );
   }
 
   function applySuggestion(nextPrompt: string) {

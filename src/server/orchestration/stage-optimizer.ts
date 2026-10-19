@@ -1,5 +1,6 @@
 import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
 import { GeminiModelTier } from "@/server/providers/gemini";
+import { ModelPreference } from "@/lib/models";
 
 /**
  * Configurable generation limits to prevent runaway loops and runaway costs.
@@ -18,13 +19,29 @@ export const GENERATION_LIMITS: GenerationLimits = {
   maxInputFilesForContext: Math.max(5, parseInt(process.env.MAX_INPUT_FILES_FOR_CONTEXT || "30", 10)),
 };
 
+export interface SelectModelOptions {
+  isComplexFullstack?: boolean;
+  isRepairAttempt?: boolean;
+  modelPreference?: ModelPreference;
+}
+
 /**
- * Strategy for selecting economical vs capable models based on stage and complexity.
+ * Strategy for selecting economical vs capable models based on stage, complexity,
+ * and user-selected model preference.
  */
 export function selectModelForStage(
   stage: "planning" | "design" | "architecture" | "coding" | "repair",
-  options?: { isComplexFullstack?: boolean; isRepairAttempt?: boolean }
+  options?: SelectModelOptions
 ): GeminiModelTier {
+  // Explicit user preference overrides adaptive routing
+  if (options?.modelPreference === "gemini-2.5-pro") {
+    return "gemini-2.5-pro";
+  }
+  if (options?.modelPreference === "gemini-2.5-flash") {
+    return "gemini-2.5-flash";
+  }
+
+  // Default / "auto" adaptive model routing:
   // Economical model by default for fast, lightweight stages
   if (stage === "design") {
     return "gemini-2.5-flash";

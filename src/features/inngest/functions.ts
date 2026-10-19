@@ -8,6 +8,10 @@ import { FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
 import { agentOutputText, connectSandbox } from "./utils";
 import { transitionRun } from "@/server/orchestration/state-machine";
 import {
+  ModelPreference,
+  normalizeModelPreference,
+} from "@/lib/models";
+import {
   resolveBaseRevision,
   validateRevisionManifest,
   RestorationError,
@@ -205,6 +209,8 @@ export const codeAgentFunction = inngest.createFunction(
     const runId = event.data.runId as string;
     const promptValue = event.data.value as string;
     const baseRevisionId = (event.data.baseRevisionId as string) || undefined;
+    const rawModelPreference = event.data.modelPreference;
+    const modelPreference: ModelPreference = normalizeModelPreference(rawModelPreference);
 
     // Enforce required persisted runId
     if (!runId) {
@@ -252,7 +258,7 @@ export const codeAgentFunction = inngest.createFunction(
       checkGenerationDeadline(deadlineMs, "planning");
       await transitionRun(runId, GenerationRunStatus.PLANNING);
       const stageStart = Date.now();
-      const plannerModel = selectModelForStage("planning", { isComplexFullstack: false });
+      const plannerModel = selectModelForStage("planning", { isComplexFullstack: false, modelPreference });
 
       if (bypassDecision.canBypass && existingSpec.prd) {
         await recordRunEvent(
@@ -268,7 +274,7 @@ export const codeAgentFunction = inngest.createFunction(
           modelId: plannerModel,
           startedAt: stageStart,
           finishedAt: Date.now(),
-          details: { bypassed: true, reason: bypassDecision.reason },
+          details: { bypassed: true, reason: bypassDecision.reason, modelPreference },
         });
         return existingSpec.prd;
       }
@@ -307,7 +313,7 @@ export const codeAgentFunction = inngest.createFunction(
         finishedAt: Date.now(),
         promptTokens: plannerUsage?.promptTokens,
         completionTokens: plannerUsage?.completionTokens,
-        details: { bypassed: false, pagesCount: generatedPRD.pages.length },
+        details: { bypassed: false, pagesCount: generatedPRD.pages.length, modelPreference },
       });
 
       return generatedPRD;
@@ -320,7 +326,7 @@ export const codeAgentFunction = inngest.createFunction(
       checkGenerationDeadline(deadlineMs, "design");
       await transitionRun(runId, GenerationRunStatus.DESIGNING);
       const stageStart = Date.now();
-      const designerModel = selectModelForStage("design");
+      const designerModel = selectModelForStage("design", { modelPreference });
 
       if (bypassDecision.canBypass && existingSpec.designSpec) {
         await recordRunEvent(
@@ -336,7 +342,7 @@ export const codeAgentFunction = inngest.createFunction(
           modelId: designerModel,
           startedAt: stageStart,
           finishedAt: Date.now(),
-          details: { bypassed: true },
+          details: { bypassed: true, modelPreference },
         });
         return existingSpec.designSpec;
       }
@@ -365,7 +371,7 @@ export const codeAgentFunction = inngest.createFunction(
         finishedAt: Date.now(),
         promptTokens: designerUsage?.promptTokens,
         completionTokens: designerUsage?.completionTokens,
-        details: { bypassed: false, theme: spec.aestheticTheme },
+        details: { bypassed: false, theme: spec.aestheticTheme, modelPreference },
       });
 
       return spec;
@@ -378,7 +384,7 @@ export const codeAgentFunction = inngest.createFunction(
       checkGenerationDeadline(deadlineMs, "architecture");
       await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
       const stageStart = Date.now();
-      const architectModel = selectModelForStage("architecture");
+      const architectModel = selectModelForStage("architecture", { modelPreference });
 
       if (bypassDecision.canBypass && existingSpec.architectureSpec) {
         await recordRunEvent(
@@ -394,7 +400,7 @@ export const codeAgentFunction = inngest.createFunction(
           modelId: architectModel,
           startedAt: stageStart,
           finishedAt: Date.now(),
-          details: { bypassed: true },
+          details: { bypassed: true, modelPreference },
         });
         return existingSpec.architectureSpec;
       }
@@ -434,6 +440,7 @@ export const codeAgentFunction = inngest.createFunction(
           bypassed: false,
           routesCount: spec.routeEndpoints.length,
           requiresDatabase: spec.requiresDatabase,
+          modelPreference,
         },
       });
 
@@ -551,7 +558,10 @@ export const codeAgentFunction = inngest.createFunction(
       : baseFiles;
 
     const relevantBaseFiles = filterRelevantFiles(effectiveBaseFiles, promptValue);
-    const coderModel = selectModelForStage("coding", { isComplexFullstack: archSpec.requiresDatabase });
+    const coderModel = selectModelForStage("coding", {
+      isComplexFullstack: archSpec.requiresDatabase,
+      modelPreference,
+    });
     const codingStageStart = Date.now();
 
     const { summary, files, usage: codingUsage, modelId: coderModelUsed } = await runCodingAgent({
@@ -578,6 +588,7 @@ export const codeAgentFunction = inngest.createFunction(
       completionTokens: codingUsage?.completionTokens,
       details: {
         filesCount: Object.keys(files || {}).length,
+        modelPreference,
       },
     });
 
@@ -709,7 +720,7 @@ Conclude with an updated <task_summary>...</task_summary>.
 `;
         try {
           const repairBaseFiles = filterRelevantFiles(currentFiles, repairPrompt);
-          const repairModel = selectModelForStage("repair", { isRepairAttempt: true });
+          const repairModel = selectModelForStage("repair", { isRepairAttempt: true, modelPreference });
           const repairResult = await runCodingAgent({
             sandboxId,
             prompt: repairPrompt,
