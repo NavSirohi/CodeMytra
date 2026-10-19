@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import Link from "next/link";
-import { Code, EyeIcon, Download, Rocket } from "lucide-react";
+import { Code, EyeIcon, Download, Rocket, History } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Hint } from "@/components/ui/hint";
 import { cn } from "@/lib/utils";
@@ -29,12 +29,13 @@ export type ProjectFragment = Fragment & {
 
 export function ProjectView({ projectId }: { projectId: string }) {
   const [selectedFragment, setSelectedFragment] = useState<ProjectFragment | null>(null);
+  const [isManualSelection, setIsManualSelection] = useState<boolean>(false);
   const [tabState, setTabState] = useState<"preview" | "code">("preview");
   const [mobileView, setMobileView] = useState<"chat" | "workspace">("chat");
 
   const { data: project, isPending, isError, error } = useGetProjectById(projectId);
 
-  // Derive active fragment: explicitly selected fragment or fallback to current revision
+  // Derive active fragment: explicitly selected fragment, or fallback to current revision
   const currentRev = project?.currentRevision;
   const activeFragment: ProjectFragment | null = selectedFragment
     ? selectedFragment
@@ -50,17 +51,28 @@ export function ProjectView({ projectId }: { projectId: string }) {
       }
     : null;
 
-  const setActiveFragment = (fragment: ProjectFragment | null) => {
+  // Stable callback for explicit user selection of a fragment card in the chat
+  const handleManualSelectFragment = useCallback((fragment: ProjectFragment) => {
+    setIsManualSelection(true);
     setSelectedFragment(fragment);
-  };
+  }, []);
 
-  const handleExport = () => {
-    // Downloads project ZIP from the server-authenticated export endpoint
-    window.open(`/api/projects/${projectId}/export`, "_blank");
-  };
+  // Stable callback for automatic selection of the latest generated fragment
+  const handleAutoSelectLatestFragment = useCallback((fragment: ProjectFragment) => {
+    // Only auto-select if user has not explicitly locked in a manual selection
+    setIsManualSelection((prevIsManual) => {
+      if (!prevIsManual) {
+        setSelectedFragment(fragment);
+      }
+      return prevIsManual;
+    });
+  }, []);
 
-  const handleSelectRevision = (rev: { id: string; title: string; files: Record<string, string> }) => {
-    setActiveFragment({
+  // Stable callback for explicit user selection of a historical revision
+  const handleSelectRevision = useCallback((rev: { id: string; title: string; files: Record<string, string> }) => {
+    setIsManualSelection(true);
+    // Explicit historical revision: Never associate with an unrelated live sandbox URL
+    setSelectedFragment({
       id: rev.id,
       messageId: "historical",
       sandboxUrl: "",
@@ -71,6 +83,19 @@ export function ProjectView({ projectId }: { projectId: string }) {
     });
     setTabState("code");
     setMobileView("workspace");
+  }, []);
+
+  // Switch back to latest active revision
+  const handleResetToLatest = useCallback(() => {
+    setIsManualSelection(false);
+    setSelectedFragment(null);
+  }, []);
+
+  const handleExport = () => {
+    // Downloads project ZIP from the server-authenticated export endpoint.
+    // If viewing a specific revision snapshot, passes its revisionId.
+    const revParam = activeFragment?.id ? `?revisionId=${encodeURIComponent(activeFragment.id)}` : "";
+    window.open(`/api/projects/${projectId}/export${revParam}`, "_blank");
   };
 
   // 1. Loading State
@@ -177,7 +202,9 @@ export function ProjectView({ projectId }: { projectId: string }) {
               <MessageContainer
                 projectId={projectId}
                 activeFragment={activeFragment}
-                setActiveFragment={setActiveFragment}
+                onManualSelectFragment={handleManualSelectFragment}
+                onAutoSelectLatestFragment={handleAutoSelectLatestFragment}
+                isManualSelection={isManualSelection}
               />
             </ResizablePanel>
 
@@ -209,6 +236,23 @@ export function ProjectView({ projectId }: { projectId: string }) {
                       <span>Code Explorer</span>
                     </TabsTrigger>
                   </TabsList>
+
+                  {/* Active Historical Selection Indicator */}
+                  {isManualSelection && activeFragment?.messageId === "historical" && (
+                    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-500/10 border border-blue-500/20 text-blue-400 text-xs">
+                      <History className="size-3 shrink-0" />
+                      <span className="font-mono text-[11px] truncate max-w-[130px]">
+                        {activeFragment.title || "Historical"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleResetToLatest}
+                        className="ml-1 text-[10px] text-blue-300 underline hover:text-white cursor-pointer font-medium"
+                      >
+                        View Latest
+                      </button>
+                    </div>
+                  )}
 
                   <div className="ml-auto flex items-center gap-x-2">
                     {/* PRD & Multi-Agent Specifications Viewer */}
@@ -262,7 +306,11 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden bg-[#17201a]"
                 >
                   {activeFragment ? (
-                    <FragmentWeb data={activeFragment} />
+                    <FragmentWeb
+                      data={activeFragment}
+                      onViewCode={() => setTabState("code")}
+                      projectId={projectId}
+                    />
                   ) : (
                     <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
                       <div className="size-12 rounded-xl bg-[#202d24] border border-[#2e3e33] flex items-center justify-center text-[#c75c35]">
@@ -308,7 +356,9 @@ export function ProjectView({ projectId }: { projectId: string }) {
               <MessageContainer
                 projectId={projectId}
                 activeFragment={activeFragment}
-                setActiveFragment={setActiveFragment}
+                onManualSelectFragment={handleManualSelectFragment}
+                onAutoSelectLatestFragment={handleAutoSelectLatestFragment}
+                isManualSelection={isManualSelection}
               />
             </div>
           ) : (
@@ -351,7 +401,11 @@ export function ProjectView({ projectId }: { projectId: string }) {
               <div className="flex-1 min-h-0">
                 {tabState === "preview" ? (
                   activeFragment ? (
-                    <FragmentWeb data={activeFragment} />
+                    <FragmentWeb
+                      data={activeFragment}
+                      onViewCode={() => setTabState("code")}
+                      projectId={projectId}
+                    />
                   ) : (
                     <div className="flex h-full items-center justify-center text-xs text-[#8a9a8e] p-6 text-center">
                       Preview Initializing

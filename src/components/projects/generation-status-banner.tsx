@@ -13,7 +13,8 @@ export function GenerationStatusBanner({ projectId }: { projectId: string }) {
 
   if (status === "COMPLETED") return null;
 
-  const isPlanning = status === "PLANNING" || status === "QUEUED";
+  const isQueued = status === "QUEUED";
+  const isPlanning = status === "PLANNING";
   const isDesigning = status === "DESIGNING";
   const isArchitecting = status === "ARCHITECTING";
   const isRunning = status === "RUNNING";
@@ -24,7 +25,7 @@ export function GenerationStatusBanner({ projectId }: { projectId: string }) {
     <div
       className={cn(
         "flex items-center gap-2 border-b px-3 py-1.5 text-xs font-medium transition-colors backdrop-blur-xs",
-        isPlanning && "bg-[#202822] text-[#8a9a8e] border-[#2e3e33]",
+        (isQueued || isPlanning) && "bg-[#202822] text-[#8a9a8e] border-[#2e3e33]",
         isDesigning && "bg-[#c75c35]/15 text-[#e4835d] border-[#c75c35]/30",
         isArchitecting && "bg-[#dcba69]/15 text-[#e2c77d] border-[#dcba69]/30",
         isRunning && "bg-[#284938]/30 text-[#81aa80] border-[#284938]/40",
@@ -32,9 +33,16 @@ export function GenerationStatusBanner({ projectId }: { projectId: string }) {
         isFailed && "bg-destructive/15 text-red-400 border-destructive/30"
       )}
     >
+      {isQueued && (
+        <>
+          <Loader2 className="size-3.5 animate-spin text-[#8a9a8e]" />
+          <span>Planner Agent: Generation queued in durable runner...</span>
+        </>
+      )}
+
       {isPlanning && (
         <>
-          <Loader2 className="size-3.5 animate-spin" />
+          <Loader2 className="size-3.5 animate-spin text-[#81aa80]" />
           <span>Planner Agent: Analyzing requirements and drafting PRD...</span>
         </>
       )}

@@ -31,15 +31,19 @@ import MessageLoading from "./message-loader";
 export default function MessageContainer({
   projectId,
   activeFragment,
-  setActiveFragment,
+  onManualSelectFragment,
+  onAutoSelectLatestFragment,
+  isManualSelection,
 }: {
   projectId: string;
   activeFragment: ProjectFragment | null;
-  setActiveFragment: (fragment: ProjectFragment | null) => void;
+  onManualSelectFragment: (fragment: ProjectFragment) => void;
+  onAutoSelectLatestFragment: (fragment: ProjectFragment) => void;
+  isManualSelection: boolean;
 }) {
   const queryClient = useQueryClient();
   const bottomRef = useRef<HTMLDivElement>(null);
-  const lastAssistantMessageIdRef = useRef<string | null>(null);
+  const lastAutoSelectedMessageIdRef = useRef<string | null>(null);
 
   const {
     data: messages,
@@ -54,22 +58,28 @@ export default function MessageContainer({
     }
   }, [projectId, queryClient]);
 
+  // Automatic selection: only select the latest generated fragment when the user
+  // has NOT made an explicit manual selection of a historical revision or fragment.
   useEffect(() => {
+    if (isManualSelection) {
+      return;
+    }
+
     const lastAssistantMessage = messages?.findLast(
-      (message) => message.role === MessageRole.ASSISTANT
+      (message) => message.role === MessageRole.ASSISTANT && Boolean(message.fragments)
     );
 
     if (
       lastAssistantMessage?.fragments &&
-      lastAssistantMessage.id !== lastAssistantMessageIdRef.current
+      lastAssistantMessage.id !== lastAutoSelectedMessageIdRef.current
     ) {
-      setActiveFragment({
+      lastAutoSelectedMessageIdRef.current = lastAssistantMessage.id;
+      onAutoSelectLatestFragment({
         ...lastAssistantMessage.fragments,
         files: parseFragmentFiles(lastAssistantMessage.fragments.files),
       });
-      lastAssistantMessageIdRef.current = lastAssistantMessage.id;
     }
-  }, [messages, setActiveFragment]);
+  }, [messages, isManualSelection, onAutoSelectLatestFragment]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -126,7 +136,7 @@ export default function MessageContainer({
             fragment={message.fragments}
             createdAt={message.createdAt}
             isActiveFragment={activeFragment?.id === message.fragments?.id}
-            onFragmentClick={setActiveFragment}
+            onFragmentClick={onManualSelectFragment}
             type={message.type}
           />
         ))}

@@ -1,9 +1,14 @@
+import { useEffect, useRef } from "react";
 import {
   useMutation,
   useQuery,
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
+import {
+  useGetActiveGenerationRun,
+  isGenerationActiveStatus,
+} from "@/features/projects/hooks/projects";
 import { createMessage, getMessages } from "../actions";
 
 /**
@@ -26,21 +31,62 @@ export const prefetchMessages = async (
 };
 
 /**
- * React Query hook that loads and live-polls a project's messages.
+ * React Query hook that loads and live-polls a project's messages based on the generation lifecycle.
  *
- * Polls every 5s while there are messages (to surface agent responses as they
- * arrive) and stops polling when the list is empty. Disabled without a
- * `projectId`.
+ * - Polls while generation is actively running or queued (every 2.5s) so new projects receive
+ *   their initial assistant response and follow-ups stream in reliably.
+ * - Detects transitions to terminal states (COMPLETED / FAILED) to immediately invalidate
+ *   and refetch final messages and revisions.
+ * - Stops polling once the generation run reaches a terminal state, preventing unnecessary continuous polling.
  *
  * @param projectId - The project whose messages to fetch.
  */
 export const useGetMessages = (projectId: string) => {
+  const queryClient = useQueryClient();
+  const { data: activeRun, isPending: isActiveRunPending } = useGetActiveGenerationRun(projectId);
+  const status = activeRun?.status;
+  const isGenerating = isGenerationActiveStatus(status);
+  const prevStatusRef = useRef<string | null>(null);
+
+  // When active generation transitions from running to terminal (COMPLETED or FAILED),
+  // immediately invalidate messages, project revision, and revisions list to surface changes instantly.
+  useEffect(() => {
+    const currentStatus = status ?? null;
+    if (prevStatusRef.current && prevStatusRef.current !== currentStatus) {
+      const wasActive = isGenerationActiveStatus(prevStatusRef.current);
+      const isTerminal =
+        currentStatus === "COMPLETED" ||
+        currentStatus === "FAILED" ||
+        currentStatus === "CANCELLED";
+
+      if (wasActive && isTerminal) {
+        void queryClient.invalidateQueries({ queryKey: ["messages", projectId] });
+        void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+        void queryClient.invalidateQueries({ queryKey: ["project-revisions", projectId] });
+        void queryClient.invalidateQueries({ queryKey: ["project-specification", projectId] });
+      }
+    }
+    prevStatusRef.current = currentStatus;
+  }, [status, projectId, queryClient]);
+
   return useQuery({
     queryKey: ["messages", projectId],
     queryFn: () => getMessages(projectId),
-    staleTime: 10_000,
+    staleTime: 5_000,
     refetchInterval: (query) => {
-      return query.state.data?.length ? 5000 : false;
+      // 1. While generation is queued or active, poll every 2.5s
+      if (isGenerating) {
+        return 2500;
+      }
+
+      // 2. Newly created project with no messages and activeRun pending: poll until settled
+      const messagesCount = query.state.data?.length ?? 0;
+      if (messagesCount === 0 && isActiveRunPending) {
+        return 2500;
+      }
+
+      // 3. Terminal state (COMPLETED, FAILED, CANCELLED) or idle -> do not poll
+      return false;
     },
     enabled: Boolean(projectId),
   });
@@ -49,7 +95,8 @@ export const useGetMessages = (projectId: string) => {
 /**
  * React Query mutation hook for sending a new message to a project.
  *
- * Invalidates the project's messages query on success so the list refetches.
+ * Invalidates messages, active generation run, and project queries on success
+ * so the conversation, active timeline, and composer locks update immediately.
  *
  * @param projectId - The project the new message belongs to.
  */
@@ -59,7 +106,11 @@ export const useCreateMessage = (projectId: string) => {
   return useMutation({
     mutationFn: (value: string) => createMessage(value, projectId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["messages", projectId] });
+      // Invalidate messages, active generation run, and project queries immediately
+      void queryClient.invalidateQueries({ queryKey: ["messages", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["active-generation-run", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["project-revisions", projectId] });
     },
   });
 };

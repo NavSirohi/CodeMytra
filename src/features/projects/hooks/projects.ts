@@ -80,25 +80,30 @@ export const useRestoreProjectRevision = (projectId: string) => {
   });
 };
 
+export const isGenerationActiveStatus = (status?: string | null): boolean => {
+  return (
+    status === "QUEUED" ||
+    status === "PLANNING" ||
+    status === "AWAITING_APPROVAL" ||
+    status === "DESIGNING" ||
+    status === "ARCHITECTING" ||
+    status === "RUNNING" ||
+    status === "VALIDATING"
+  );
+};
+
 export const useGetActiveGenerationRun = (projectId: string) => {
   return useQuery({
     queryKey: ["active-generation-run", projectId],
-    queryFn: async () => getActiveGenerationRun(projectId),
+    queryFn: async () => {
+      const run = await getActiveGenerationRun(projectId);
+      return run;
+    },
     enabled: Boolean(projectId),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      // Poll every 2.5 seconds while a generation is in progress
-      const isActive =
-        status === "QUEUED" ||
-        status === "PLANNING" ||
-        status === "DESIGNING" ||
-        status === "ARCHITECTING" ||
-        status === "RUNNING" ||
-        status === "VALIDATING";
-
-      return isActive ? 2500 : false;
+      return isGenerationActiveStatus(status) ? 2000 : false;
     },
-
   });
 };
 
