@@ -113,6 +113,30 @@ export function BriefBuilder() {
     }
   }, [router]);
 
+  // Continuously persist entered prompt in sessionStorage so auth redirect or page navigation never loses input
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (idea.trim()) {
+      try {
+        const existingRaw = sessionStorage.getItem(PENDING_BRIEF_STORAGE_KEY);
+        const existing = existingRaw ? JSON.parse(existingRaw) : {};
+        sessionStorage.setItem(
+          PENDING_BRIEF_STORAGE_KEY,
+          JSON.stringify({
+            ...existing,
+            idea,
+            selectedStyle,
+            selectedExample,
+            submissionId,
+            savedAt: Date.now(),
+          })
+        );
+      } catch {
+        // Ignore storage errors in restricted contexts
+      }
+    }
+  }, [idea, selectedStyle, selectedExample, submissionId]);
+
   const handleSelectExample = (ex: (typeof EXAMPLES)[number]) => {
     setSelectedExample(ex.label);
     setIdea(ex.prompt);

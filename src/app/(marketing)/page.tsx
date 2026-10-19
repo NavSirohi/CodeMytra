@@ -25,6 +25,9 @@ export default function HomePage() {
               <Link className="btn" href="/builder">
                 Start with your idea <span aria-hidden="true">↗</span>
               </Link>
+              <Link className="btn alt" href="/sign-in">
+                Sign In / Sign Up
+              </Link>
               <Link className="btn alt" href="/how-it-works">
                 See how it works <span aria-hidden="true">↗</span>
               </Link>

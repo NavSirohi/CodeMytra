@@ -41,7 +41,9 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={cn("h-full", "antialiased", geistSans.variable, geistMono.variable, "font-sans", inter.variable)}
+      suppressHydrationWarning
+      className={cn("dark", "h-full", "antialiased", geistSans.variable, geistMono.variable, "font-sans", inter.variable)}
+      style={{ colorScheme: "dark" }}
     >
       <body className="min-h-full flex flex-col">
         {process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ? (

@@ -30,16 +30,16 @@ export function evaluateAuthRouting(
     allowInsecureDevAuth: process.env.ALLOW_INSECURE_DEV_AUTH,
   }
 ): { action: "public" | "delegate_to_clerk" | "allow_dev_insecure" | "fail_closed"; response?: NextResponse } {
-  if (isPublicRoute(req)) {
-    return { action: "public", response: NextResponse.next() };
-  }
-
   const hasClerkKeys = Boolean(env.clerkPublishableKey && env.clerkSecretKey);
   if (hasClerkKeys) {
     return { action: "delegate_to_clerk" };
   }
 
   // If Clerk keys are missing:
+  if (isPublicRoute(req)) {
+    return { action: "public", response: NextResponse.next() };
+  }
+
   const isExplicitDevAuthAllowed =
     env.nodeEnv !== "production" && env.allowInsecureDevAuth === "true";
 
@@ -66,19 +66,29 @@ export function evaluateAuthRouting(
   };
 }
 
-export default function middleware(req: NextRequest, evt: NextFetchEvent) {
+const clerkHandler = clerkMiddleware(
+  async (auth, request) => {
+    if (!isPublicRoute(request)) {
+      await auth.protect();
+    }
+  },
+  {
+    signInUrl: "/sign-in",
+    signUpUrl: "/sign-in",
+  }
+);
+
+export async function proxy(req: NextRequest, evt: NextFetchEvent) {
   const result = evaluateAuthRouting(req);
 
   if (result.action !== "delegate_to_clerk") {
     return result.response!;
   }
 
-  return clerkMiddleware(async (auth, request) => {
-    if (!isPublicRoute(request)) {
-      await auth.protect();
-    }
-  })(req, evt);
+  return clerkHandler(req, evt);
 }
+
+export default proxy;
 
 export const config = {
   matcher: [
