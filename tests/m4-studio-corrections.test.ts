@@ -412,32 +412,45 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
         .getQueryCache()
         .find({ queryKey: ["active-generation-run", projectId] }) as Query;
 
+      // Ensure dataUpdateCount stability: await the QueryObserver's initial automatic mount fetch to settle
+      if (query.promise) {
+        await query.promise;
+      }
+
       try {
-        // Stage 1 (Fast Discovery): attempts 0 through 4 (dataUpdateCount < 5) poll at 1500ms (~7.5s)
+        // Initial automatic fetch on subscription settled: dataUpdateCount is exactly 1 (attempt 1)
+        assert.strictEqual(query.state.dataUpdateCount, 1);
+        assert.strictEqual(getActiveRunPollInterval(query), 1500);
+        assert.strictEqual(query.state.data, null);
+
+        // Stage 1 (Fast Discovery): attempts 2 through 4 (dataUpdateCount < 5) poll at 1500ms (~7.5s)
         // Each attempt executes the actual query function rather than query.setData()
-        for (let i = 0; i < 5; i++) {
+        for (let i = 2; i <= 4; i++) {
+          await query.fetch();
+          assert.strictEqual(query.state.dataUpdateCount, i);
           assert.strictEqual(
             getActiveRunPollInterval(query),
             1500,
-            `Fast discovery attempt ${i + 1} must poll at 1500ms`
+            `Fast discovery attempt ${i} must poll at 1500ms`
           );
-          await query.fetch();
           assert.strictEqual(query.state.data, null);
         }
 
-        // Stage 2 (Extended Recovery Window): attempts 5 through 11 back off to 5000ms (~35s)
+        // Stage 2 (Extended Recovery Window): attempts 5 through 11 (dataUpdateCount 5..11) back off to 5000ms (~35s)
         // Each attempt executes the actual query function rather than query.setData()
-        for (let i = 5; i < 12; i++) {
+        for (let i = 5; i <= 11; i++) {
+          await query.fetch();
+          assert.strictEqual(query.state.dataUpdateCount, i);
           assert.strictEqual(
             getActiveRunPollInterval(query),
             5000,
-            `Extended recovery attempt ${i + 1} must poll at 5000ms backoff`
+            `Extended recovery attempt ${i} must poll at 5000ms backoff`
           );
-          await query.fetch();
           assert.strictEqual(query.state.data, null);
         }
 
         // Stage 3 (Cessation): On attempt 12 (dataUpdateCount >= 12), polling halts
+        await query.fetch();
         assert.strictEqual(query.state.dataUpdateCount, 12);
         assert.strictEqual(
           getActiveRunPollInterval(query),
