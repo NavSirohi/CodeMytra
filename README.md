@@ -22,35 +22,35 @@ You describe what you want to build. CodeMytra's orchestrated team of specialise
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
+| Layer              | Technology                              |
+| ------------------ | --------------------------------------- |
 | Frontend + Backend | Next.js 16 (App Router, Server Actions) |
-| Database | Neon PostgreSQL + Prisma 7 |
-| Authentication | Clerk |
-| AI Orchestration | Inngest + Google Gemini |
-| Code Sandboxes | E2B |
-| Hosting | Vercel |
-| Version Control | GitHub |
+| Database           | Neon PostgreSQL + Prisma 7              |
+| Authentication     | Clerk                                   |
+| AI Orchestration   | Inngest + Google Gemini                 |
+| Code Sandboxes     | E2B                                     |
+| Hosting            | Vercel                                  |
+| Version Control    | GitHub                                  |
 
 ---
 
 ## Feature Status
 
-| Feature | Status |
-|---|---|
-| User authentication (Clerk) | ✅ Working |
-| Project creation and listing | ✅ Working |
-| Single-agent code generation | ✅ Working |
-| Sandbox file persistence | ✅ Working |
-| Code viewer + iframe preview | ✅ Working |
-| Hardcoded credentials removed | ✅ Fixed |
-| Project revision snapshots | 🔧 In Progress |
-| Multi-agent orchestration | 🔧 In Progress |
-| PRD review and approval flow | 📋 Planned |
-| Full-stack template (with DB) | 📋 Planned |
-| ZIP export | 📋 Planned |
-| Credit metering + billing | 📋 Planned (Razorpay) |
-| Customer app deployment | ⏸ Deferred (Coming Soon) |
+| Feature                       | Status                   |
+| ----------------------------- | ------------------------ |
+| User authentication (Clerk)   | ✅ Working               |
+| Project creation and listing  | ✅ Working               |
+| Single-agent code generation  | ✅ Working               |
+| Sandbox file persistence      | ✅ Working               |
+| Code viewer + iframe preview  | ✅ Working               |
+| Hardcoded credentials removed | ✅ Fixed                 |
+| Project revision snapshots    | 🔧 In Progress           |
+| Multi-agent orchestration     | 🔧 In Progress           |
+| PRD review and approval flow  | 📋 Planned               |
+| Full-stack template (with DB) | 📋 Planned               |
+| ZIP export                    | 📋 Planned               |
+| Credit metering + billing     | 📋 Planned (Razorpay)    |
+| Customer app deployment       | ⏸ Deferred (Coming Soon) |
 
 ---
 
@@ -106,6 +106,7 @@ See `.env.example` for all required variables and where to get them.
 ## Development
 
 See [DEVELOPMENT.md](./DEVELOPMENT.md) for:
+
 - The full architecture breakdown
 - Which code is inherited vs original
 - Database migration strategy

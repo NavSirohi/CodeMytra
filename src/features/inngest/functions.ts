@@ -30,6 +30,11 @@ import {
   resolveWorkspacePath,
 } from "@/server/orchestration/workspace";
 import { getBaseProjectFiles, MissingDatabaseModelsError } from "@/server/templates/foundation";
+import { GenerationMetricsCollector } from "@/server/observability/metrics";
+import {
+  canBypassPlanningAndArchitecture,
+  filterRelevantFiles,
+} from "@/server/orchestration/stage-optimizer";
 
 export interface CodeAgentState {
   sandboxId: string;
@@ -124,13 +129,32 @@ export const codeAgentFunction = inngest.createFunction(
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 0: RESOLVE BASE FILES & EXISTING CONTEXT
+    // STAGE 0: RESOLVE BASE FILES & EXISTING SPECIFICATIONS
     // ─────────────────────────────────────────────────────────────────────────
-    const { baseFiles, baseRev } = await step.run("resolve-base-files", async () => {
+    const { baseFiles, baseRev, bypassDecision, existingSpec } = await step.run("resolve-base-files", async () => {
       const rev = await resolveBaseRevision(projectId, baseRevisionId);
+      const existing = await prisma.projectSpecification.findUnique({
+        where: { projectId },
+      });
+      const parsedPRD = (existing?.prd as unknown as PRD) || null;
+      const parsedDesign = (existing?.designSpec as unknown as DesignSpec) || null;
+      const parsedArch = (existing?.architectureSpec as unknown as ArchitectureSpec) || null;
+
+      const bypass = canBypassPlanningAndArchitecture(promptValue, {
+        prd: parsedPRD,
+        designSpec: parsedDesign,
+        architectureSpec: parsedArch,
+      });
+
       return {
         baseFiles: (rev?.files as Record<string, string>) || {},
         baseRev: rev,
+        bypassDecision: bypass,
+        existingSpec: {
+          prd: parsedPRD,
+          designSpec: parsedDesign,
+          architectureSpec: parsedArch,
+        },
       };
     });
 
@@ -139,16 +163,23 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     const prd = await step.run("planner-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.PLANNING);
+
+      if (bypassDecision.canBypass && existingSpec.prd) {
+        await recordRunEvent(
+          runId,
+          "PLANNING",
+          "Planner Agent",
+          `Reusing approved PRD for ${existingSpec.prd.projectName} (${bypassDecision.reason})`
+        );
+        return existingSpec.prd;
+      }
+
       await recordRunEvent(runId, "PLANNING", "Planner Agent", "Analyzing requirements and drafting product specification");
 
-      const existingSpec = await prisma.projectSpecification.findUnique({
-        where: { projectId },
-      });
-
       const generatedPRD = await runPlannerAgent(promptValue, {
-        existingPRD: (existingSpec?.prd as unknown as PRD) || null,
-        existingDesignSpec: (existingSpec?.designSpec as unknown as DesignSpec) || null,
-        existingArchitectureSpec: (existingSpec?.architectureSpec as unknown as ArchitectureSpec) || null,
+        existingPRD: existingSpec.prd,
+        existingDesignSpec: existingSpec.designSpec,
+        existingArchitectureSpec: existingSpec.architectureSpec,
         existingFiles: baseFiles,
       });
 
@@ -169,6 +200,17 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     const designSpec = await step.run("designer-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.DESIGNING);
+
+      if (bypassDecision.canBypass && existingSpec.designSpec) {
+        await recordRunEvent(
+          runId,
+          "DESIGNING",
+          "Design Agent",
+          `Reusing approved design specification (${existingSpec.designSpec.aestheticTheme} theme)`
+        );
+        return existingSpec.designSpec;
+      }
+
       await recordRunEvent(runId, "DESIGNING", "Design Agent", "Creating accessible color palette, typography, and component styling");
 
       const spec = await runDesignAgent(prd);
@@ -189,6 +231,17 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     const archSpec = await step.run("architect-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
+
+      if (bypassDecision.canBypass && existingSpec.architectureSpec) {
+        await recordRunEvent(
+          runId,
+          "ARCHITECTING",
+          "Architecture Agent",
+          `Reusing approved full-stack architecture specification (${existingSpec.architectureSpec.routeEndpoints.length} routes)`
+        );
+        return existingSpec.architectureSpec;
+      }
+
       await recordRunEvent(runId, "ARCHITECTING", "Architecture Agent", "Establishing route contracts and file ownership boundaries");
 
       const spec = await runArchitectureAgent(prd, designSpec);
@@ -305,13 +358,15 @@ export const codeAgentFunction = inngest.createFunction(
         })
       : baseFiles;
 
+    const relevantBaseFiles = filterRelevantFiles(effectiveBaseFiles, promptValue);
+
     const { summary, files } = await runCodingAgent({
       sandboxId,
       prompt: promptValue,
       prd,
       designSpec,
       architectureSpec: archSpec,
-      baseFiles: effectiveBaseFiles,
+      baseFiles: relevantBaseFiles,
       previousMessages,
       step,
       stepPrefix: "initial-coding",
@@ -383,13 +438,14 @@ Ensure all TypeScript and Next.js compiler errors are resolved.
 Conclude with an updated <task_summary>...</task_summary>.
 `;
         try {
+          const repairBaseFiles = filterRelevantFiles(currentFiles, repairPrompt);
           const repairResult = await runCodingAgent({
             sandboxId,
             prompt: repairPrompt,
             prd,
             designSpec,
             architectureSpec: archSpec,
-            baseFiles: currentFiles,
+            baseFiles: repairBaseFiles,
             previousMessages: [
               { role: "user", content: promptValue },
               { role: "assistant", content: currentSummary },
@@ -455,6 +511,19 @@ Conclude with an updated <task_summary>...</task_summary>.
     });
 
     const finalizationResult = await step.run("save-result", async () => {
+      // Record lightweight performance & cost metrics
+      const collector = new GenerationMetricsCollector(runId, projectId);
+      collector.startStage("workflow-execution");
+      collector.endStage("workflow-execution", {
+        details: {
+          passed: qaReport.passed,
+          score: qaReport.score,
+          filesCount: Object.keys(finalFiles || {}).length,
+          verificationMode: qaReport.verificationMode,
+        },
+      });
+      await collector.persist(qaReport.passed && qaReport.verificationMode !== "static-only" ? "COMPLETED" : "FAILED");
+
       if (!qaReport.passed || qaReport.verificationMode === "static-only") {
         const failureReason = qaReport.verificationMode === "static-only"
           ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
