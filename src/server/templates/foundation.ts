@@ -130,8 +130,8 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
       ...(needsDb
         ? {
             "@prisma/client": "^7.8.0",
-            "@prisma/adapter-better-sqlite3": "^7.8.0",
-            "better-sqlite3": "^11.8.1",
+            "@prisma/adapter-better-sqlite3": "^7.10.1",
+            "better-sqlite3": "^13.0.3",
           }
         : {}),
     },
@@ -149,7 +149,7 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
         ? {
             prisma: "^7.8.0",
             dotenv: "^16.4.7",
-            "@types/better-sqlite3": "^7.6.12",
+            "@types/better-sqlite3": "^9.6.0",
           }
         : {}),
     },

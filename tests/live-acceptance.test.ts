@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { spawnSync } from "child_process";
 import JSZip from "jszip";
 import { Sandbox } from "@e2b/code-interpreter";
 import { runPlannerAgent } from "../src/server/agents/planner";
@@ -117,6 +118,7 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
         });
 
         // 1. Unified Specification Pipeline
+        // 1. Unified Specification Pipeline & Planner Capability Verification
         const prd1 = await runPlannerAgent(scenario.initialPrompt, {
           existingPRD: null,
           existingDesignSpec: null,
@@ -125,6 +127,19 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
         });
         assert.ok(prd1.projectName, "PRD must define projectName");
 
+        // Verify the planner produces appropriate capabilities
+        for (const cap of scenario.expectedCapabilities) {
+          const capCovered =
+            prd1.capabilities.includes(cap as any) ||
+            prd1.coreFeatures.some(
+              (f) =>
+                f.name.toLowerCase().includes(cap.replace(/-/g, " ")) ||
+                f.description.toLowerCase().includes(cap.replace(/-/g, " "))
+            );
+          assert.ok(capCovered, `Planner PRD should cover expected capability "${cap}" for ${scenario.name}`);
+        }
+
+        // 2. Assert Generated Architecture Matches Capabilities
         const design1 = await runDesignAgent(prd1);
         const arch1 = await runArchitectureAgent(prd1, design1);
         assert.equal(
@@ -132,8 +147,14 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
           scenario.requiresPersistence,
           `Architecture requiresDatabase mismatch for ${scenario.name}`
         );
+        for (const cap of scenario.expectedCapabilities) {
+          assert.ok(
+            arch1.capabilities.includes(cap as any),
+            `Architecture capabilities should include "${cap}" for ${scenario.name}`
+          );
+        }
 
-        // 2. Foundation Provisioning
+        // Foundation Provisioning
         const baseFiles = getBaseProjectFiles({
           projectName: prd1.projectName,
           capabilities: arch1.capabilities,
@@ -141,7 +162,7 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
           models: arch1.databaseModels,
         });
 
-        // 3. Sandbox Initialization
+        // Sandbox Initialization
         sandbox = await Sandbox.create({ template: process.env.E2B_TEMPLATE_ID! });
         await initializeSandboxWorkspace(sandbox);
 
@@ -150,7 +171,7 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
           await sandbox.files.write(target, content);
         }
 
-        // 4. Initial Implementation (V1)
+        // 3. Authoritative Coding Engine Execution (V1)
         const initialRunId = `run_acc_1_${timestamp}`;
         await prisma.generationRun.create({
           data: {
@@ -172,7 +193,7 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
           stepPrefix: `acc-init-${scenario.id}`,
         });
 
-        // 5. Real QA Inspection (V1)
+        // 4. Real QA Inspection (V1)
         const qa1 = await runQAInspector({
           files: codeResult1.files,
           summary: codeResult1.summary,
@@ -183,6 +204,7 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
         });
         assert.equal(qa1.passed, true, `Initial QA failed for ${scenario.name}: ${qa1.repairInstructions}`);
 
+        // 5. Persist V1
         const snapshot1 = await captureSandboxSnapshot(sandbox.sandboxId);
         const finalization1 = await finalizeGenerationSuccess({
           projectId: testProjectId,
@@ -195,7 +217,16 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
         });
         assert.equal(finalization1.revision.revisionNumber, 1);
 
-        // 6. Follow-Up Modification (V2)
+        // 6. Re-Run Modification-Aware Planning for the Follow-Up Prompt
+        const prd2 = await runPlannerAgent(scenario.followUpPrompt, {
+          existingPRD: prd1,
+          existingDesignSpec: design1,
+          existingArchitectureSpec: arch1,
+          existingFiles: snapshot1.files,
+        });
+        const design2 = await runDesignAgent(prd2);
+        const arch2 = await runArchitectureAgent(prd2, design2);
+
         const followUpRunId = `run_acc_2_${timestamp}`;
         await prisma.generationRun.create({
           data: {
@@ -211,9 +242,9 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
         const codeResult2 = await runCodingAgent({
           sandboxId: sandbox.sandboxId,
           prompt: scenario.followUpPrompt,
-          prd: prd1,
-          designSpec: design1,
-          architectureSpec: arch1,
+          prd: prd2,
+          designSpec: design2,
+          architectureSpec: arch2,
           baseFiles: snapshot1.files,
           previousMessages: [
             { role: "user", content: scenario.initialPrompt },
@@ -222,18 +253,35 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
           stepPrefix: `acc-follow-${scenario.id}`,
         });
 
-        // 7. Follow-up QA (V2)
+        // 7. Generate and Verify V2
         const qa2 = await runQAInspector({
           files: codeResult2.files,
           summary: codeResult2.summary,
           sandboxId: sandbox.sandboxId,
           runSandboxCommands: true,
-          archSpec: arch1,
-          capabilities: arch1.capabilities,
+          archSpec: arch2,
+          capabilities: arch2.capabilities,
         });
         assert.equal(qa2.passed, true, `Follow-up QA failed for ${scenario.name}: ${qa2.repairInstructions}`);
 
         const snapshot2 = await captureSandboxSnapshot(sandbox.sandboxId);
+
+        // 8. Assert Previous Required Functionality Survives
+        for (const v1Path of Object.keys(snapshot1.files)) {
+          if (
+            v1Path === "app/page.tsx" ||
+            v1Path === "prisma/schema.prisma" ||
+            v1Path === "lib/db.ts" ||
+            v1Path.startsWith("app/api/")
+          ) {
+            assert.ok(
+              snapshot2.files[v1Path] !== undefined,
+              `Previous essential file "${v1Path}" must survive in V2 generation for ${scenario.name}`
+            );
+          }
+        }
+
+        // 9. Export the Resulting Revision
         const finalization2 = await finalizeGenerationSuccess({
           projectId: testProjectId,
           generationRunId: followUpRunId,
@@ -245,13 +293,12 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
         });
         assert.equal(finalization2.revision.revisionNumber, 2);
 
-        // 8. ZIP Export & Reproducibility Verification
         const exportZip = await generateProjectZip({
           projectId: testProjectId,
           revisionId: finalization2.revision.id,
           userId: testUserId,
         });
-        assert.ok(exportZip.buffer.length > 1000);
+        assert.ok(exportZip.buffer.length > 1000, "Export ZIP buffer must be non-empty");
 
         tempExtractDir = fs.mkdtempSync(path.join(os.tmpdir(), `acc-export-${scenario.id}-`));
         const zip = await JSZip.loadAsync(exportZip.buffer);
@@ -260,6 +307,76 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
           const out = path.join(tempExtractDir, p);
           fs.mkdirSync(path.dirname(out), { recursive: true });
           fs.writeFileSync(out, await file.async("nodebuffer"));
+        }
+
+        let appDir = tempExtractDir;
+        if (!fs.existsSync(path.join(appDir, "package.json"))) {
+          const entries = fs.readdirSync(tempExtractDir);
+          for (const entry of entries) {
+            const cand = path.join(tempExtractDir, entry);
+            if (fs.statSync(cand).isDirectory() && fs.existsSync(path.join(cand, "package.json"))) {
+              appDir = cand;
+              break;
+            }
+          }
+        }
+
+        // 10. Install and Build the Exported Application Independently
+        const installRes = spawnSync("npm", ["install", "--no-audit", "--prefer-offline"], {
+          cwd: appDir,
+          encoding: "utf8",
+          timeout: 120000,
+          env: { ...process.env, CI: "true" },
+        });
+        assert.equal(installRes.status, 0, `Exported npm install failed: ${installRes.stderr || installRes.stdout}`);
+
+        if (scenario.requiresPersistence) {
+          fs.copyFileSync(path.join(appDir, ".env.example"), path.join(appDir, ".env"));
+          const pushRes = spawnSync("npx", ["prisma", "db", "push"], {
+            cwd: appDir,
+            encoding: "utf8",
+            timeout: 30000,
+          });
+          assert.equal(pushRes.status, 0, `Exported prisma db push failed: ${pushRes.stderr || pushRes.stdout}`);
+        }
+
+        const tscRes = spawnSync("npx", ["tsc", "--noEmit"], {
+          cwd: appDir,
+          encoding: "utf8",
+          timeout: 60000,
+        });
+        assert.equal(tscRes.status, 0, `Exported TypeScript check failed: ${tscRes.stderr || tscRes.stdout}`);
+
+        const buildRes = spawnSync("npm", ["run", "build"], {
+          cwd: appDir,
+          encoding: "utf8",
+          timeout: 90000,
+          env: { ...process.env, CI: "true" },
+        });
+        assert.equal(buildRes.status, 0, `Exported production build failed: ${buildRes.stderr || buildRes.stdout}`);
+
+        // Scenario-specific behavioural verification
+        const pageContent = fs.readFileSync(path.join(appDir, "app/page.tsx"), "utf8");
+        if (scenario.id === "scenario-portfolio") {
+          assert.ok(
+            pageContent.includes("project") || pageContent.includes("Project"),
+            "Portfolio must showcase projects"
+          );
+        } else if (scenario.id === "scenario-inventory") {
+          assert.ok(
+            fs.existsSync(path.join(appDir, "app/api")) || fs.existsSync(path.join(appDir, "src/app/api")),
+            "Inventory must have API routes"
+          );
+        } else if (scenario.id === "scenario-booking") {
+          assert.ok(
+            fs.existsSync(path.join(appDir, "prisma/schema.prisma")),
+            "Booking workflow must have schema.prisma"
+          );
+        } else if (scenario.id === "scenario-ecommerce") {
+          assert.ok(
+            pageContent.includes("cart") || pageContent.includes("Cart") || pageContent.includes("order"),
+            "E-commerce store must handle cart or order logic"
+          );
         }
       } finally {
         if (sandbox) {

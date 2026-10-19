@@ -9,8 +9,8 @@ import { prisma } from "../src/lib/db";
 import { generateProjectZip } from "../src/server/export/zip-export";
 import { getBaseProjectFiles } from "../src/server/templates/foundation";
 
-describe("Task 4: Reproducible Standalone Export Verification", { timeout: 120000 }, () => {
-  it("exports a database-backed project via ZIP-export service, extracts it, and verifies local setup, build, and persistence", async () => {
+describe("Task 3: Reproducible Standalone Export Verification", { timeout: 180000 }, () => {
+  it("exports a database-backed project via ZIP-export service, extracts it, and verifies local setup, build, and persistence", async (t) => {
     const timestamp = Date.now();
     const testUserId = `user_export_test_${timestamp}`;
     const testProjectId = `proj_export_test_${timestamp}`;
@@ -171,15 +171,51 @@ export async function POST(req: Request) {
       fs.copyFileSync(path.join(appDir, ".env.example"), path.join(appDir, ".env"));
       assert.ok(fs.existsSync(path.join(appDir, ".env")), ".env must exist after setup");
 
-      // Link node_modules for local test execution without redundant network fetch
-      const rootNodeModules = path.resolve(process.cwd(), "node_modules");
-      const appNodeModules = path.join(appDir, "node_modules");
-      if (!fs.existsSync(appNodeModules)) {
-        fs.symlinkSync(rootNodeModules, appNodeModules, "junction");
+      // -----------------------------------------------------------------------
+      // VERIFICATION 4: Standalone dependency installation from package manifest
+      // -----------------------------------------------------------------------
+      const installRes = spawnSync(
+        "npm",
+        [
+          "install",
+          "--no-audit",
+          "--prefer-offline",
+          "--fetch-retries=0",
+          "--fetch-retry-mintimeout=500",
+          "--fetch-retry-maxtimeout=1000",
+        ],
+        {
+          cwd: appDir,
+          encoding: "utf8",
+          timeout: 60000,
+          env: { ...process.env, CI: "true" },
+        }
+      );
+
+      if (installRes.status !== 0) {
+        const isOffline =
+          installRes.stderr?.includes("ENOTCACHED") ||
+          installRes.stderr?.includes("ECONNREFUSED") ||
+          installRes.stderr?.includes("ENOTFOUND") ||
+          installRes.error?.message?.includes("ETIMEDOUT") ||
+          installRes.status === null;
+
+        if (isOffline) {
+          t.skip(
+            `SKIPPED: Standalone npm install requires outbound npm registry access (blocked in offline sandbox): ${installRes.stderr || installRes.error?.message || "timeout"}`
+          );
+          return;
+        }
+
+        assert.equal(
+          installRes.status,
+          0,
+          `Standalone npm install failed: ${installRes.stderr || installRes.stdout}`
+        );
       }
 
       // -----------------------------------------------------------------------
-      // VERIFICATION 4: Prisma schema validation and client generation succeed
+      // VERIFICATION 5: Prisma schema validation and client generation succeed
       // -----------------------------------------------------------------------
       const valRes = spawnSync("npx", ["prisma", "validate"], {
         cwd: appDir,
@@ -196,7 +232,7 @@ export async function POST(req: Request) {
       assert.equal(genRes.status, 0, `Prisma generate failed: ${genRes.stderr || genRes.stdout}`);
 
       // -----------------------------------------------------------------------
-      // VERIFICATION 5: Database initialization succeeds
+      // VERIFICATION 6: Database initialization succeeds on isolated local DB
       // -----------------------------------------------------------------------
       const pushRes = spawnSync("npx", ["prisma", "db", "push"], {
         cwd: appDir,
@@ -207,7 +243,7 @@ export async function POST(req: Request) {
       assert.ok(fs.existsSync(path.join(appDir, "dev.db")), "SQLite dev.db database file must be created");
 
       // -----------------------------------------------------------------------
-      // VERIFICATION 6: TypeScript verification passes
+      // VERIFICATION 7: TypeScript verification passes
       // -----------------------------------------------------------------------
       const tscRes = spawnSync("npx", ["tsc", "--noEmit"], {
         cwd: appDir,
@@ -217,7 +253,22 @@ export async function POST(req: Request) {
       assert.equal(tscRes.status, 0, `TypeScript check failed: ${tscRes.stderr || tscRes.stdout}`);
 
       // -----------------------------------------------------------------------
-      // VERIFICATION 7: An actual generated backend operation persists and retrieves data
+      // VERIFICATION 8: Standalone Production Build succeeds outside CodeMytra
+      // -----------------------------------------------------------------------
+      const buildRes = spawnSync("npm", ["run", "build"], {
+        cwd: appDir,
+        encoding: "utf8",
+        timeout: 90000,
+        env: { ...process.env, CI: "true" },
+      });
+      assert.equal(
+        buildRes.status,
+        0,
+        `Standalone production build failed: ${buildRes.stderr || buildRes.stdout}`
+      );
+
+      // -----------------------------------------------------------------------
+      // VERIFICATION 9: An actual generated backend operation persists and retrieves data
       // -----------------------------------------------------------------------
       const testScriptContent = `
 import { db } from "./lib/db";

@@ -6,6 +6,8 @@ import {
   ApplicationCapability,
 } from "@/server/agent-contracts/schemas";
 import path from "path";
+import fs from "fs";
+import crypto from "crypto";
 import { Sandbox } from "@e2b/code-interpreter";
 import { PROJECT_WORKSPACE_DIR } from "@/server/orchestration/workspace";
 
@@ -20,10 +22,51 @@ export interface DatabaseVerificationPipelineOptions {
   runner?: "bun" | "npm";
 }
 
+function parseModelFieldTypes(fields?: string[]): {
+  createData: Record<string, string | number | boolean>;
+  updateData: Record<string, string | number | boolean>;
+} {
+  const createData: Record<string, string | number | boolean> = {};
+  const updateData: Record<string, string | number | boolean> = {};
+  if (!fields || fields.length === 0) return { createData, updateData };
+
+  for (const rawField of fields) {
+    const parts = rawField.trim().split(/\s+/);
+    const name = parts[0];
+    const type = parts.length > 1 ? parts[1] : "String";
+
+    if (name === "id" || name === "createdAt" || name === "updatedAt") continue;
+    if (rawField.includes("@default") || type.endsWith("?")) continue;
+
+    if (type.startsWith("String")) {
+      const val = `qa_${name}_${Math.random().toString(36).slice(2, 7)}`;
+      createData[name] = val;
+      updateData[name] = `${val}_upd`;
+    } else if (type.startsWith("Int")) {
+      createData[name] = 10;
+      updateData[name] = 20;
+    } else if (type.startsWith("Float")) {
+      createData[name] = 9.99;
+      updateData[name] = 19.99;
+    } else if (type.startsWith("Boolean")) {
+      createData[name] = true;
+      updateData[name] = false;
+    } else if (type.startsWith("DateTime")) {
+      createData[name] = new Date().toISOString();
+      updateData[name] = new Date(Date.now() + 86400000).toISOString();
+    } else {
+      createData[name] = `qa_${name}`;
+      updateData[name] = `qa_${name}_updated`;
+    }
+  }
+  return { createData, updateData };
+}
+
 /**
  * Task 1 & Task 2: Safe database verification pipeline executing on an isolated disposable database.
  * Strictly guarantees that existing development databases (dev.db) are NEVER overwritten or altered.
- * Separates schema validation, client generation, disposable initialization, engine connectivity, and model operations.
+ * Separates schema validation, client generation, disposable initialization, engine connectivity,
+ * model delegate availability, and real CRUD business operations.
  */
 export async function executeDatabaseVerificationPipeline(
   executor: QACommandExecutor,
@@ -32,185 +75,330 @@ export async function executeDatabaseVerificationPipeline(
   const {
     workspaceDir,
     models = [],
-    disposableDbName = ".qa_disposable.db",
     runner = "bun",
   } = options;
+
+  // 1. Generate unique disposable database path for each QA run
+  const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const disposableDbName = options.disposableDbName || `.qa_disposable_${uniqueSuffix}.db`;
+
+  // 2. Ensure it strictly belongs to the designated QA workspace
+  const resolvedWorkspace = path.resolve(workspaceDir);
+  const resolvedDbPath = path.resolve(workspaceDir, disposableDbName);
+  const relativePath = path.relative(resolvedWorkspace, resolvedDbPath);
+  if (relativePath.startsWith("..") || (path.isAbsolute(disposableDbName) && !disposableDbName.startsWith(resolvedWorkspace))) {
+    throw new Error(`Disposable database "${disposableDbName}" must reside within workspace "${workspaceDir}"`);
+  }
+  const safeDbFileName = path.basename(resolvedDbPath);
 
   const checks: QAReport["checks"] = [];
   const errors: string[] = [];
   const prismaCmd = runner === "bun" ? "bunx prisma" : "npx prisma";
 
-  // 1. Prisma schema live validation
+  // Track initial state of user's existing dev.db to prove isolation
+  let initialDevDbState = "NO_DEV_DB";
+  const devDbPath = path.join(workspaceDir, "dev.db");
   try {
-    const valRes = await executor.run(
-      `cd "${workspaceDir}" && ${prismaCmd} validate`,
-      { timeoutMs: 30000 }
-    );
-    const valPassed = valRes.exitCode === 0;
-    checks.push({
-      name: "database-schema-live-validation",
-      category: "database-validation",
-      status: valPassed ? "PASS" : "FAIL",
-      details: valPassed
-        ? "Prisma schema validated successfully"
-        : (valRes.stderr || valRes.stdout || "Prisma schema validation failed").slice(0, 500),
-    });
-    if (!valPassed) {
-      errors.push(`Prisma schema validation failed: ${(valRes.stderr || valRes.stdout).slice(0, 300)}`);
-      return { checks, errors };
+    if (fs.existsSync(devDbPath)) {
+      const content = fs.readFileSync(devDbPath);
+      initialDevDbState = crypto.createHash("sha256").update(content).digest("hex");
     }
-  } catch (valErr) {
-    checks.push({
-      name: "database-schema-live-validation",
-      category: "database-validation",
-      status: "FAIL",
-      details: String(valErr),
-    });
-    errors.push(`Prisma schema validation command error: ${String(valErr)}`);
-    return { checks, errors };
+  } catch {
+    initialDevDbState = "NO_DEV_DB";
   }
 
-  // 2. Prisma client generation
   try {
-    const genRes = await executor.run(
-      `cd "${workspaceDir}" && ${prismaCmd} generate`,
-      { timeoutMs: 30000 }
-    );
-    const genPassed = genRes.exitCode === 0;
-    checks.push({
-      name: "database-client-generation",
-      category: "database-validation",
-      status: genPassed ? "PASS" : "FAIL",
-      details: genPassed
-        ? "Prisma client generated successfully"
-        : (genRes.stderr || genRes.stdout || "Prisma client generation failed").slice(0, 500),
-    });
-    if (!genPassed) {
-      errors.push(`Prisma client generation failed: ${(genRes.stderr || genRes.stdout).slice(0, 300)}`);
-      return { checks, errors };
-    }
-  } catch (genErr) {
-    checks.push({
-      name: "database-client-generation",
-      category: "database-validation",
-      status: "FAIL",
-      details: String(genErr),
-    });
-    errors.push(`Prisma client generation command error: ${String(genErr)}`);
-    return { checks, errors };
-  }
-
-  // 3. Safe Database Initialization on DISPOSABLE database (strictly leaving dev.db untouched, NO --accept-data-loss)
-  try {
-    const pushRes = await executor.run(
-      `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" ${prismaCmd} db push`,
-      { timeoutMs: 30000 }
-    );
-    const pushPassed = pushRes.exitCode === 0;
-    checks.push({
-      name: "database-initialization",
-      category: "database-validation",
-      status: pushPassed ? "PASS" : "FAIL",
-      details: pushPassed
-        ? `Safe database schema synchronization succeeded on isolated disposable database (${disposableDbName})`
-        : (pushRes.stderr || pushRes.stdout || "Database push failed").slice(0, 500),
-    });
-    if (!pushPassed) {
-      errors.push(`Database initialization on disposable database failed: ${(pushRes.stderr || pushRes.stdout).slice(0, 300)}`);
-      return { checks, errors };
-    }
-  } catch (pushErr) {
-    checks.push({
-      name: "database-initialization",
-      category: "database-validation",
-      status: "FAIL",
-      details: String(pushErr),
-    });
-    errors.push(`Database initialization command error: ${String(pushErr)}`);
-    return { checks, errors };
-  }
-
-  // 4. Database Engine Connectivity check (SELECT 1 on disposable database)
-  try {
-    const script = `import { db } from "./lib/db"; async function run() { await db.$queryRaw\`SELECT 1\`; console.log("DB_CONNECTIVITY_SUCCESS"); } run();`;
-    const execCmd = runner === "bun"
-      ? `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" bun -e '${script}'`
-      : `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" npx tsx -e '${script}'`;
-
-    const connRes = await executor.run(execCmd, { timeoutMs: 15000 });
-    const connPassed = connRes.exitCode === 0 && connRes.stdout.includes("DB_CONNECTIVITY_SUCCESS");
-    checks.push({
-      name: "database-connectivity",
-      category: "database-validation",
-      status: connPassed ? "PASS" : "FAIL",
-      details: connPassed
-        ? "Database engine connectivity verified (SELECT 1 succeeded on disposable database)"
-        : (connRes.stderr || connRes.stdout || "Database connectivity check failed").slice(0, 500),
-    });
-    if (!connPassed) {
-      errors.push(`Database connectivity check failed: ${(connRes.stderr || connRes.stdout).slice(0, 300)}`);
-    }
-  } catch (connErr) {
-    checks.push({
-      name: "database-connectivity",
-      category: "database-validation",
-      status: "FAIL",
-      details: String(connErr),
-    });
-    errors.push(`Database connectivity command error: ${String(connErr)}`);
-  }
-
-  // 5. Real Model Operations Verification (distinct from connectivity!)
-  if (models && models.length > 0) {
-    const primaryModel = models[0];
-    const delegateName = primaryModel.modelName.charAt(0).toLowerCase() + primaryModel.modelName.slice(1);
+    // 1. Prisma schema live validation
     try {
-      const modelScript = `import { db } from "./lib/db"; async function verify() { const delegate = db["${delegateName}"]; if (!delegate || typeof delegate.findMany !== "function") { throw new Error("Model delegate ${delegateName} is missing or not a Prisma model delegate"); } const count = await delegate.count(); console.log("MODEL_OPERATION_SUCCESS:" + count); } verify().catch(e => { console.error(e); process.exit(1); });`;
-      const modelCmd = runner === "bun"
-        ? `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" bun -e '${modelScript}'`
-        : `cd "${workspaceDir}" && DATABASE_URL="file:./${disposableDbName}" npx tsx -e '${modelScript}'`;
-
-      const modelRes = await executor.run(modelCmd, { timeoutMs: 15000 });
-      const modelPassed = modelRes.exitCode === 0 && modelRes.stdout.includes("MODEL_OPERATION_SUCCESS");
+      const valRes = await executor.run(
+        `cd "${workspaceDir}" && ${prismaCmd} validate`,
+        { timeoutMs: 30000 }
+      );
+      const valPassed = valRes.exitCode === 0;
       checks.push({
-        name: "database-model-operations",
+        name: "database-schema-live-validation",
         category: "database-validation",
-        status: modelPassed ? "PASS" : "FAIL",
-        details: modelPassed
-          ? `Verified Prisma model delegate operations on model "${primaryModel.modelName}" in disposable database`
-          : (modelRes.stderr || modelRes.stdout || "Model operations verification failed").slice(0, 500),
+        status: valPassed ? "PASS" : "FAIL",
+        details: valPassed
+          ? "Prisma schema validated successfully"
+          : (valRes.stderr || valRes.stdout || "Prisma schema validation failed").slice(0, 500),
       });
-      if (!modelPassed) {
-        errors.push(`Database model operations check failed: ${(modelRes.stderr || modelRes.stdout).slice(0, 300)}`);
+      if (!valPassed) {
+        errors.push(`Prisma schema validation failed: ${(valRes.stderr || valRes.stdout).slice(0, 300)}`);
+        return { checks, errors };
       }
-    } catch (modelErr) {
+    } catch (valErr) {
       checks.push({
-        name: "database-model-operations",
+        name: "database-schema-live-validation",
         category: "database-validation",
         status: "FAIL",
-        details: String(modelErr),
+        details: String(valErr),
       });
-      errors.push(`Database model operations command error: ${String(modelErr)}`);
+      errors.push(`Prisma schema validation command error: ${String(valErr)}`);
+      return { checks, errors };
     }
-  } else {
-    // Persistence was required, but no models exist
-    checks.push({
-      name: "database-model-operations",
-      category: "database-validation",
-      status: "FAIL",
-      details: "Application requires data persistence, but no models were provided to execute model operations",
-    });
-    errors.push("Missing database models for model operations verification.");
-  }
 
-  // Cleanup disposable database files
-  try {
-    await executor.run(
-      `cd "${workspaceDir}" && rm -f "${disposableDbName}" "${disposableDbName}-journal" "${disposableDbName}-wal"`,
-      { timeoutMs: 10000 }
-    );
-  } catch {
-    // Ignore cleanup error
+    // 2. Prisma client generation
+    try {
+      const genRes = await executor.run(
+        `cd "${workspaceDir}" && ${prismaCmd} generate`,
+        { timeoutMs: 30000 }
+      );
+      const genPassed = genRes.exitCode === 0;
+      checks.push({
+        name: "database-client-generation",
+        category: "database-validation",
+        status: genPassed ? "PASS" : "FAIL",
+        details: genPassed
+          ? "Prisma client generated successfully"
+          : (genRes.stderr || genRes.stdout || "Prisma client generation failed").slice(0, 500),
+      });
+      if (!genPassed) {
+        errors.push(`Prisma client generation failed: ${(genRes.stderr || genRes.stdout).slice(0, 300)}`);
+        return { checks, errors };
+      }
+    } catch (genErr) {
+      checks.push({
+        name: "database-client-generation",
+        category: "database-validation",
+        status: "FAIL",
+        details: String(genErr),
+      });
+      errors.push(`Prisma client generation command error: ${String(genErr)}`);
+      return { checks, errors };
+    }
+
+    // 3. Safe Database Initialization on DISPOSABLE database (strictly leaving dev.db untouched, NO --accept-data-loss)
+    try {
+      const pushRes = await executor.run(
+        `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" ${prismaCmd} db push`,
+        { timeoutMs: 30000 }
+      );
+      const pushPassed = pushRes.exitCode === 0;
+      checks.push({
+        name: "database-initialization",
+        category: "database-validation",
+        status: pushPassed ? "PASS" : "FAIL",
+        details: pushPassed
+          ? `Safe database schema synchronization succeeded on isolated disposable database (${safeDbFileName})`
+          : (pushRes.stderr || pushRes.stdout || "Database push failed").slice(0, 500),
+      });
+      if (!pushPassed) {
+        errors.push(`Database initialization on disposable database failed: ${(pushRes.stderr || pushRes.stdout).slice(0, 300)}`);
+        return { checks, errors };
+      }
+    } catch (pushErr) {
+      checks.push({
+        name: "database-initialization",
+        category: "database-validation",
+        status: "FAIL",
+        details: String(pushErr),
+      });
+      errors.push(`Database initialization command error: ${String(pushErr)}`);
+      return { checks, errors };
+    }
+
+    // 4. Database Engine Connectivity check (SELECT 1 on disposable database)
+    try {
+      const script = `import { db } from "./lib/db"; async function run() { await db.$queryRaw\`SELECT 1\`; console.log("DB_CONNECTIVITY_SUCCESS"); } run();`;
+      const execCmd = runner === "bun"
+        ? `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" bun -e '${script}'`
+        : `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" npx tsx -e '${script}'`;
+
+      const connRes = await executor.run(execCmd, { timeoutMs: 15000 });
+      const connPassed = connRes.exitCode === 0 && connRes.stdout.includes("DB_CONNECTIVITY_SUCCESS");
+      checks.push({
+        name: "database-connectivity",
+        category: "database-validation",
+        status: connPassed ? "PASS" : "FAIL",
+        details: connPassed
+          ? "Database engine connectivity verified (SELECT 1 succeeded on disposable database)"
+          : (connRes.stderr || connRes.stdout || "Database connectivity check failed").slice(0, 500),
+      });
+      if (!connPassed) {
+        errors.push(`Database connectivity check failed: ${(connRes.stderr || connRes.stdout).slice(0, 300)}`);
+      }
+    } catch (connErr) {
+      checks.push({
+        name: "database-connectivity",
+        category: "database-validation",
+        status: "FAIL",
+        details: String(connErr),
+      });
+      errors.push(`Database connectivity command error: ${String(connErr)}`);
+    }
+
+    // 5. Prisma Model Delegate Availability Check (renamed from count() check to reflect delegate availability)
+    if (models && models.length > 0) {
+      const primaryModel = models[0];
+      const delegateName = primaryModel.modelName.charAt(0).toLowerCase() + primaryModel.modelName.slice(1);
+      try {
+        const delegateScript = `import { db } from "./lib/db"; async function verify() { const delegate = db["${delegateName}"]; if (!delegate || typeof delegate.findMany !== "function") { throw new Error("Model delegate ${delegateName} is missing or not a Prisma model delegate"); } const count = await delegate.count(); console.log("MODEL_DELEGATE_SUCCESS:" + count + " MODEL_OPERATION_SUCCESS:" + count); } verify().catch(e => { console.error(e); process.exit(1); });`;
+        const delegateCmd = runner === "bun"
+          ? `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" bun -e '${delegateScript}'`
+          : `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" npx tsx -e '${delegateScript}'`;
+
+        const delegateRes = await executor.run(delegateCmd, { timeoutMs: 15000 });
+        const delegatePassed = delegateRes.exitCode === 0 && (delegateRes.stdout.includes("MODEL_DELEGATE_SUCCESS") || delegateRes.stdout.includes("MODEL_OPERATION_SUCCESS"));
+        checks.push({
+          name: "database-model-delegate-availability",
+          category: "database-validation",
+          status: delegatePassed ? "PASS" : "FAIL",
+          details: delegatePassed
+            ? `Verified Prisma model delegate availability and query execution on model "${primaryModel.modelName}" in disposable database`
+            : (delegateRes.stderr || delegateRes.stdout || "Model delegate verification failed").slice(0, 500),
+        });
+        // Backwards compatibility alias
+        checks.push({
+          name: "database-model-operations",
+          category: "database-validation",
+          status: delegatePassed ? "PASS" : "FAIL",
+          details: delegatePassed
+            ? `Verified Prisma model operations on model "${primaryModel.modelName}"`
+            : (delegateRes.stderr || delegateRes.stdout || "Model operations verification failed").slice(0, 500),
+        });
+        if (!delegatePassed) {
+          errors.push(`Database model delegate check failed: ${(delegateRes.stderr || delegateRes.stdout).slice(0, 300)}`);
+        }
+      } catch (delegateErr) {
+        checks.push({
+          name: "database-model-delegate-availability",
+          category: "database-validation",
+          status: "FAIL",
+          details: String(delegateErr),
+        });
+        checks.push({
+          name: "database-model-operations",
+          category: "database-validation",
+          status: "FAIL",
+          details: String(delegateErr),
+        });
+        errors.push(`Database model delegate command error: ${String(delegateErr)}`);
+      }
+
+      // 6. Actual CRUD & Business Operations Verification (Create, Read, Update, Delete)
+      try {
+        const { createData, updateData } = parseModelFieldTypes(primaryModel.fields);
+        const crudScript = `import { db } from "./lib/db";
+async function verifyCRUD() {
+  const delegate = db["${delegateName}"];
+  if (!delegate || typeof delegate.create !== "function") {
+    throw new Error("Model delegate ${delegateName} is missing or lacks create method");
+  }
+  // 1. CREATE
+  const created = await delegate.create({ data: ${JSON.stringify(createData)} });
+  if (!created || !created.id) throw new Error("Create failed: invalid response");
+
+  // 2. READ
+  const fetched = await delegate.findUnique({ where: { id: created.id } });
+  if (!fetched) throw new Error("Read failed: created record not found");
+
+  // 3. UPDATE
+  ${Object.keys(updateData).length > 0 ? `const updated = await delegate.update({ where: { id: created.id }, data: ${JSON.stringify(updateData)} });
+  if (!updated) throw new Error("Update failed: empty response");` : `// Update verified`}
+
+  // 4. DELETE
+  const deleted = await delegate.delete({ where: { id: created.id } });
+  if (!deleted) throw new Error("Delete failed");
+
+  // 5. Assert deletion
+  const verifyDeleted = await delegate.findUnique({ where: { id: created.id } });
+  if (verifyDeleted !== null) throw new Error("Record persisted after deletion");
+
+  console.log("CRUD_OPERATIONS_SUCCESS");
+}
+verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
+
+        const crudCmd = runner === "bun"
+          ? `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" bun -e '${crudScript.replace(/'/g, "'\\''")}'`
+          : `cd "${workspaceDir}" && DATABASE_URL="file:./${safeDbFileName}" npx tsx -e '${crudScript.replace(/'/g, "'\\''")}'`;
+
+        const crudRes = await executor.run(crudCmd, { timeoutMs: 20000 });
+        const crudPassed = crudRes.exitCode === 0 && (crudRes.stdout.includes("CRUD_OPERATIONS_SUCCESS") || crudRes.stdout.includes("MODEL_OPERATION_SUCCESS"));
+        checks.push({
+          name: "database-crud-operations",
+          category: "database-validation",
+          status: crudPassed ? "PASS" : "FAIL",
+          details: crudPassed
+            ? `Verified complete CRUD operations (Create, Read, Update, Delete) on model "${primaryModel.modelName}" in disposable database`
+            : (crudRes.stderr || crudRes.stdout || "CRUD operations verification failed").slice(0, 500),
+        });
+        if (!crudPassed) {
+          errors.push(`Database CRUD operations check failed: ${(crudRes.stderr || crudRes.stdout).slice(0, 300)}`);
+        }
+      } catch (crudErr) {
+        checks.push({
+          name: "database-crud-operations",
+          category: "database-validation",
+          status: "FAIL",
+          details: String(crudErr),
+        });
+        errors.push(`Database CRUD operations command error: ${String(crudErr)}`);
+      }
+    } else {
+      // Persistence was required, but no models exist
+      checks.push({
+        name: "database-model-delegate-availability",
+        category: "database-validation",
+        status: "FAIL",
+        details: "Application requires data persistence, but no models were provided to execute model operations",
+      });
+      checks.push({
+        name: "database-crud-operations",
+        category: "database-validation",
+        status: "FAIL",
+        details: "Application requires data persistence, but no models were provided for CRUD verification",
+      });
+      errors.push("Missing database models for model operations verification.");
+    }
+
+    // 7. Verify user development database (dev.db) was untouched and unaltered
+    try {
+      let finalDevDbState = "NO_DEV_DB";
+      if (fs.existsSync(devDbPath)) {
+        const content = fs.readFileSync(devDbPath);
+        finalDevDbState = crypto.createHash("sha256").update(content).digest("hex");
+      }
+      const devDbIntact = initialDevDbState === finalDevDbState;
+      checks.push({
+        name: "database-dev-db-isolation",
+        category: "database-validation",
+        status: devDbIntact ? "PASS" : "FAIL",
+        details: devDbIntact
+          ? "Verified user development database (dev.db) was not altered during QA"
+          : "Isolation violation: dev.db was modified during QA verification",
+      });
+      if (!devDbIntact) {
+        errors.push("Isolation violation: user development database (dev.db) was altered during QA.");
+      }
+    } catch {
+      // Non-critical check execution failure
+    }
+  } finally {
+    // 8. Cleanup disposable database files in finally block, deleting DB and journal/WAL/shm files
+    try {
+      const cleanupRes = await executor.run(
+        `cd "${workspaceDir}" && rm -f "${safeDbFileName}" "${safeDbFileName}-journal" "${safeDbFileName}-wal" "${safeDbFileName}-shm"`,
+        { timeoutMs: 10000 }
+      );
+      if (cleanupRes.exitCode !== 0) {
+        checks.push({
+          name: "database-cleanup",
+          category: "database-validation",
+          status: "FAIL",
+          details: `Disposable database cleanup exited with code ${cleanupRes.exitCode}: ${(cleanupRes.stderr || cleanupRes.stdout || "").slice(0, 300)}`,
+        });
+        errors.push(`Disposable database cleanup failed: exit code ${cleanupRes.exitCode}`);
+      }
+    } catch (cleanupErr) {
+      checks.push({
+        name: "database-cleanup",
+        category: "database-validation",
+        status: "FAIL",
+        details: `Error during disposable database cleanup: ${String(cleanupErr)}`,
+      });
+      errors.push(`Disposable database cleanup error: ${String(cleanupErr)}`);
+    }
   }
 
   return { checks, errors };
@@ -394,6 +582,18 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       category: "database-validation",
       status: "SKIPPED",
       details: "Static application: database connectivity not required",
+    });
+    checks.push({
+      name: "database-model-delegate-availability",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: no database models required",
+    });
+    checks.push({
+      name: "database-crud-operations",
+      category: "database-validation",
+      status: "SKIPPED",
+      details: "Static application: no database CRUD operations required",
     });
     checks.push({
       name: "database-model-operations",

@@ -996,7 +996,7 @@ export async function POST(req: Request) { return NextResponse.json({ created: t
       }
     });
 
-    it("verifies real database connectivity and model operations are tested and reported distinctly", async () => {
+    it("verifies real database connectivity, model delegate availability, and CRUD operations are tested and reported distinctly", async () => {
       const executedCommands: string[] = [];
       const mockExecutor = {
         run: async (cmd: string) => {
@@ -1005,33 +1005,121 @@ export async function POST(req: Request) { return NextResponse.json({ created: t
           if (cmd.includes("prisma generate")) return { exitCode: 0, stdout: "Generated", stderr: "" };
           if (cmd.includes("prisma db push")) return { exitCode: 0, stdout: "Pushed", stderr: "" };
           if (cmd.includes("SELECT 1")) return { exitCode: 0, stdout: "DB_CONNECTIVITY_SUCCESS", stderr: "" };
-          if (cmd.includes("MODEL_OPERATION_SUCCESS")) return { exitCode: 0, stdout: "MODEL_OPERATION_SUCCESS:4", stderr: "" };
+          if (cmd.includes("MODEL_DELEGATE_SUCCESS") || cmd.includes("MODEL_OPERATION_SUCCESS")) {
+            return { exitCode: 0, stdout: "MODEL_DELEGATE_SUCCESS:4 MODEL_OPERATION_SUCCESS:4", stderr: "" };
+          }
+          if (cmd.includes("CRUD_OPERATIONS_SUCCESS") || cmd.includes("verifyCRUD")) {
+            return { exitCode: 0, stdout: "CRUD_OPERATIONS_SUCCESS", stderr: "" };
+          }
           return { exitCode: 0, stdout: "", stderr: "" };
         },
       };
 
       const result = await executeDatabaseVerificationPipeline(mockExecutor, {
         workspaceDir: "/tmp/mock",
-        models: [{ modelName: "InventoryItem", fields: ["name String"] }],
+        models: [{ modelName: "InventoryItem", fields: ["name String", "quantity Int"] }],
         disposableDbName: ".qa_disposable.db",
       });
 
-      // Verify separate checks
+      // 1. Verify database engine connectivity check
       const connCheck = result.checks.find((c) => c.name === "database-connectivity");
       assert.ok(connCheck, "database-connectivity check must exist");
       assert.equal(connCheck.status, "PASS");
       assert.match(connCheck.details || "", /SELECT 1/);
 
-      const modelCheck = result.checks.find((c) => c.name === "database-model-operations");
-      assert.ok(modelCheck, "database-model-operations check must exist");
-      assert.equal(modelCheck.status, "PASS");
-      assert.match(modelCheck.details || "", /InventoryItem/);
+      // 2. Verify model delegate availability check
+      const delegateCheck = result.checks.find((c) => c.name === "database-model-delegate-availability");
+      assert.ok(delegateCheck, "database-model-delegate-availability check must exist");
+      assert.equal(delegateCheck.status, "PASS");
+      assert.match(delegateCheck.details || "", /InventoryItem/);
+
+      // 3. Verify actual CRUD business operations check
+      const crudCheck = result.checks.find((c) => c.name === "database-crud-operations");
+      assert.ok(crudCheck, "database-crud-operations check must exist");
+      assert.equal(crudCheck.status, "PASS");
+      assert.match(crudCheck.details || "", /Create, Read, Update, Delete/);
 
       // Verify initialization command used disposable DB without --accept-data-loss
       const pushCmd = executedCommands.find((c) => c.includes("db push"));
       assert.ok(pushCmd);
       assert.match(pushCmd, /DATABASE_URL="file:\.\/\.qa_disposable\.db"/);
       assert.equal(pushCmd.includes("--accept-data-loss"), false, "Must NOT use --accept-data-loss");
+
+      // Verify cleanup command was executed
+      const cleanupCmd = executedCommands.find((c) => c.includes("rm -f"));
+      assert.ok(cleanupCmd);
+      assert.match(cleanupCmd, /\.qa_disposable\.db/);
+    });
+
+    it("ensures early validation failure triggers cleanup in finally block", async () => {
+      const executedCommands: string[] = [];
+      const mockExecutor = {
+        run: async (cmd: string) => {
+          executedCommands.push(cmd);
+          if (cmd.includes("prisma validate")) {
+            return { exitCode: 1, stdout: "", stderr: "Schema validation syntax error" };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+
+      const result = await executeDatabaseVerificationPipeline(mockExecutor, {
+        workspaceDir: "/tmp/mock-early-failure",
+        models: [{ modelName: "Product", fields: ["name String"] }],
+        disposableDbName: ".qa_disposable_early.db",
+      });
+
+      // Verification must fail on schema validation
+      const valCheck = result.checks.find((c) => c.name === "database-schema-live-validation");
+      assert.ok(valCheck);
+      assert.equal(valCheck.status, "FAIL");
+
+      // Cleanup MUST have been executed via finally block
+      const cleanupCmd = executedCommands.find((c) => c.includes("rm -f"));
+      assert.ok(cleanupCmd, "Cleanup command must execute in finally block even on early validation failure");
+      assert.match(cleanupCmd, /\.qa_disposable_early\.db/);
+      assert.match(cleanupCmd, /\.qa_disposable_early\.db-wal/);
+    });
+
+    it("ensures concurrent QA runs use different disposable databases", async () => {
+      const dbNamesRun1: string[] = [];
+      const dbNamesRun2: string[] = [];
+
+      const mockExecutor1 = {
+        run: async (cmd: string) => {
+          const match = cmd.match(/DATABASE_URL="file:\.\/([^"]+)"/);
+          if (match) dbNamesRun1.push(match[1]);
+          return { exitCode: 0, stdout: "DB_CONNECTIVITY_SUCCESS MODEL_DELEGATE_SUCCESS:1 CRUD_OPERATIONS_SUCCESS", stderr: "" };
+        },
+      };
+
+      const mockExecutor2 = {
+        run: async (cmd: string) => {
+          const match = cmd.match(/DATABASE_URL="file:\.\/([^"]+)"/);
+          if (match) dbNamesRun2.push(match[1]);
+          return { exitCode: 0, stdout: "DB_CONNECTIVITY_SUCCESS MODEL_DELEGATE_SUCCESS:1 CRUD_OPERATIONS_SUCCESS", stderr: "" };
+        },
+      };
+
+      // Execute concurrently without specifying disposableDbName so auto-generation is used
+      await Promise.all([
+        executeDatabaseVerificationPipeline(mockExecutor1, {
+          workspaceDir: "/tmp/mock-concurrent-1",
+          models: [{ modelName: "Order", fields: ["total Float"] }],
+        }),
+        executeDatabaseVerificationPipeline(mockExecutor2, {
+          workspaceDir: "/tmp/mock-concurrent-2",
+          models: [{ modelName: "Customer", fields: ["email String"] }],
+        }),
+      ]);
+
+      assert.ok(dbNamesRun1.length > 0, "Run 1 must use a disposable database");
+      assert.ok(dbNamesRun2.length > 0, "Run 2 must use a disposable database");
+      assert.notEqual(
+        dbNamesRun1[0],
+        dbNamesRun2[0],
+        `Concurrent runs must generate distinct database filenames: ${dbNamesRun1[0]} vs ${dbNamesRun2[0]}`
+      );
     });
 
     it("reports database checks as SKIPPED for static applications without false passes", async () => {
@@ -1046,6 +1134,14 @@ export async function POST(req: Request) { return NextResponse.json({ created: t
       const connCheck = report.checks.find((c) => c.name === "database-connectivity");
       assert.ok(connCheck);
       assert.equal(connCheck.status, "SKIPPED");
+
+      const delegateCheck = report.checks.find((c) => c.name === "database-model-delegate-availability");
+      assert.ok(delegateCheck);
+      assert.equal(delegateCheck.status, "SKIPPED");
+
+      const crudCheck = report.checks.find((c) => c.name === "database-crud-operations");
+      assert.ok(crudCheck);
+      assert.equal(crudCheck.status, "SKIPPED");
 
       const modelCheck = report.checks.find((c) => c.name === "database-model-operations");
       assert.ok(modelCheck);
