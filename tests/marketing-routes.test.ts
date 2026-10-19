@@ -104,4 +104,126 @@ describe("M3 Public Marketing Website - Structure & Acceptance Verification", ()
       "Must include exact V4 statement regarding authentic team credits"
     );
   });
+
+  describe("Authentication Fail-Closed & Route Protection Security", () => {
+    it("fails closed on protected API routes when Clerk credentials are missing in production", async () => {
+      const { evaluateAuthRouting } = await import("@/proxy");
+      const { NextRequest } = await import("next/server");
+
+      const req = new NextRequest("http://localhost:3000/api/projects/123/export");
+      const result = evaluateAuthRouting(req, {
+        clerkPublishableKey: "",
+        clerkSecretKey: "",
+        nodeEnv: "production",
+      });
+
+      assert.equal(result.action, "fail_closed");
+      assert.equal(result.response?.status, 401);
+      const json = await result.response?.json();
+      assert.ok(json.error.includes("Authentication"));
+    });
+
+    it("fails closed on protected page routes when Clerk credentials are missing in production", async () => {
+      const { evaluateAuthRouting } = await import("@/proxy");
+      const { NextRequest } = await import("next/server");
+
+      const req = new NextRequest("http://localhost:3000/projects/proj-456");
+      const result = evaluateAuthRouting(req, {
+        clerkPublishableKey: "",
+        clerkSecretKey: "",
+        nodeEnv: "production",
+      });
+
+      assert.equal(result.action, "fail_closed");
+      assert.equal(result.response?.status, 307);
+      const location = result.response?.headers.get("location");
+      assert.ok(location?.includes("/sign-in?redirect_url=%2Fprojects%2Fproj-456"));
+    });
+
+    it("strictly forbids ALLOW_INSECURE_DEV_AUTH in production environment", async () => {
+      const { evaluateAuthRouting } = await import("@/proxy");
+      const { NextRequest } = await import("next/server");
+
+      const req = new NextRequest("http://localhost:3000/dashboard");
+      const result = evaluateAuthRouting(req, {
+        clerkPublishableKey: "",
+        clerkSecretKey: "",
+        nodeEnv: "production",
+        allowInsecureDevAuth: "true",
+      });
+
+      assert.equal(result.action, "fail_closed", "Production must NEVER allow insecure dev auth");
+      assert.equal(result.response?.status, 307);
+    });
+
+    it("allows insecure dev auth ONLY in non-production when explicitly enabled", async () => {
+      const { evaluateAuthRouting } = await import("@/proxy");
+      const { NextRequest } = await import("next/server");
+
+      const req = new NextRequest("http://localhost:3000/dashboard");
+      
+      // Without explicit flag -> fails closed
+      const resultDisabled = evaluateAuthRouting(req, {
+        clerkPublishableKey: "",
+        clerkSecretKey: "",
+        nodeEnv: "development",
+        allowInsecureDevAuth: "false",
+      });
+      assert.equal(resultDisabled.action, "fail_closed");
+
+      // With explicit flag in development -> allows pass-through
+      const resultEnabled = evaluateAuthRouting(req, {
+        clerkPublishableKey: "",
+        clerkSecretKey: "",
+        nodeEnv: "development",
+        allowInsecureDevAuth: "true",
+      });
+      assert.equal(resultEnabled.action, "allow_dev_insecure");
+      assert.equal(resultEnabled.response?.status, 200);
+    });
+
+    it("preserves public access for marketing routes and Inngest endpoint regardless of credentials", async () => {
+      const { evaluateAuthRouting } = await import("@/proxy");
+      const { NextRequest } = await import("next/server");
+
+      const publicPaths = [
+        "/",
+        "/product",
+        "/how-it-works",
+        "/pricing",
+        "/about",
+        "/contact",
+        "/builder",
+        "/sign-in",
+        "/sign-up",
+        "/api/inngest",
+      ];
+
+      for (const p of publicPaths) {
+        const req = new NextRequest(`http://localhost:3000${p}`);
+        const result = evaluateAuthRouting(req, {
+          clerkPublishableKey: "",
+          clerkSecretKey: "",
+          nodeEnv: "production",
+        });
+
+        assert.equal(result.action, "public", `${p} must remain public`);
+        assert.equal(result.response?.status, 200);
+      }
+    });
+
+    it("delegates to Clerk middleware when credentials are fully configured", async () => {
+      const { evaluateAuthRouting } = await import("@/proxy");
+      const { NextRequest } = await import("next/server");
+
+      const req = new NextRequest("http://localhost:3000/dashboard");
+      const result = evaluateAuthRouting(req, {
+        clerkPublishableKey: "pk_test_valid",
+        clerkSecretKey: "sk_test_valid",
+        nodeEnv: "production",
+      });
+
+      assert.equal(result.action, "delegate_to_clerk");
+    });
+  });
 });
