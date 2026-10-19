@@ -38,10 +38,16 @@ Respond with valid JSON matching this schema:
 Do NOT wrap in markdown backticks or include any conversational filler. Only return raw JSON.
 `;
 
-export async function runDesignAgent(prd: PRD): Promise<DesignSpec> {
+export interface DesignerOptions {
+  model?: string;
+  temperature?: number;
+}
+
+export async function runDesignAgent(prd: PRD, options?: DesignerOptions): Promise<DesignSpec> {
+  const selectedModel = options?.model || "gemini-2.5-flash";
   const model = getGeminiModel({
-    model: "gemini-2.5-flash",
-    temperature: 0.3,
+    model: selectedModel,
+    temperature: options?.temperature ?? 0.3,
   });
 
   const agent = createAgent({

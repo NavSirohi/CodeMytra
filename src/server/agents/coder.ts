@@ -42,6 +42,7 @@ export interface RunCodingAgentOptions {
   previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   step?: InngestStepLike;
   stepPrefix?: string;
+  model?: string;
 }
 
 export const MAX_COMMAND_OUTPUT_BYTES = 256 * 1024; // 256 KB
@@ -400,6 +401,7 @@ File Boundaries:
 6. Do NOT import non-existent external npm packages.
 7. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
 8. End your final assistant response with a comprehensive summary enclosed in <task_summary>...</task_summary>.
+9. The initial file context provided is a focused subset. The full repository is restored in ${PROJECT_WORKSPACE_DIR}. If you need to view any other project files, shared types, utility functions, or configs not in initial context, use the "readFiles" tool at any time.
 `;
 }
 
@@ -421,6 +423,7 @@ export async function runCodingAgent(
     previousMessages = [],
     step,
     stepPrefix = "code-agent",
+    model,
   } = options;
 
   let toolCallCounter = 0;
@@ -446,8 +449,14 @@ export async function runCodingAgent(
     }
   );
 
+  const selectedModel = model || (
+    stepPrefix?.includes("repair")
+      ? "gemini-2.5-pro"
+      : "gemini-2.5-flash"
+  );
+
   const geminiModel = getGeminiModel({
-    model: "gemini-2.5-flash",
+    model: selectedModel,
   });
 
   const systemPrompt = buildContextEnhancedPrompt(

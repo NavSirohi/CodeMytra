@@ -68,14 +68,21 @@ export class ArchitectureError extends Error {
   }
 }
 
+export interface ArchitectOptions {
+  model?: string;
+  temperature?: number;
+}
+
 export async function runArchitectureAgent(
   prd: PRD,
   designSpec: DesignSpec,
-  maxRetries = 1
+  maxRetries = 1,
+  options?: ArchitectOptions
 ): Promise<ArchitectureSpec> {
+  const selectedModel = options?.model || "gemini-2.5-pro";
   const model = getGeminiModel({
-    model: "gemini-2.5-pro",
-    temperature: 0.2,
+    model: selectedModel,
+    temperature: options?.temperature ?? 0.2,
   });
 
   const agent = createAgent({

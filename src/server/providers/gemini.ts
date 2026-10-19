@@ -9,7 +9,7 @@ import { gemini } from "@inngest/agent-kit";
 export type GeminiModelTier = "gemini-2.5-flash" | "gemini-2.5-pro";
 
 export interface CreateGeminiModelOptions {
-  model?: GeminiModelTier;
+  model?: GeminiModelTier | string;
   temperature?: number;
   maxOutputTokens?: number;
   thinkingBudget?: number;
@@ -36,7 +36,7 @@ export function getGeminiModel(options: CreateGeminiModelOptions = {}) {
     thinkingBudget = 0,
   } = options;
 
-  return gemini({
+  const adapter = gemini({
     model,
     apiKey,
     defaultParameters: {
@@ -47,4 +47,10 @@ export function getGeminiModel(options: CreateGeminiModelOptions = {}) {
       },
     },
   });
+
+  // Attach modelId property for explicit observability & verification
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).modelId = model;
+
+  return adapter;
 }

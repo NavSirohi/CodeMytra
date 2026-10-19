@@ -28,12 +28,17 @@ import { runCodingAgent } from "@/server/agents/coder";
 import {
   initializeSandboxWorkspace,
   resolveWorkspacePath,
+  PROJECT_WORKSPACE_DIR,
 } from "@/server/orchestration/workspace";
 import { getBaseProjectFiles, MissingDatabaseModelsError } from "@/server/templates/foundation";
-import { GenerationMetricsCollector } from "@/server/observability/metrics";
+import {
+  recordStageMetric,
+  aggregateAndPersistRunMetrics,
+} from "@/server/observability/metrics";
 import {
   canBypassPlanningAndArchitecture,
   filterRelevantFiles,
+  selectModelForStage,
 } from "@/server/orchestration/stage-optimizer";
 
 export interface CodeAgentState {
@@ -108,6 +113,9 @@ export const codeAgentFunction = inngest.createFunction(
           errorCode: "WORKFLOW_EXECUTION_FAILED",
           errorMessage: safeErrorMessage,
         });
+
+        // Keep incomplete-run metrics available when generation fails
+        await aggregateAndPersistRunMetrics(runId, projectId, "FAILED");
       } catch (err) {
         console.error(
           "[Generation] Failure finalization failed:",
@@ -163,6 +171,8 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     const prd = await step.run("planner-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.PLANNING);
+      const stageStart = Date.now();
+      const plannerModel = selectModelForStage("planning", { isComplexFullstack: false });
 
       if (bypassDecision.canBypass && existingSpec.prd) {
         await recordRunEvent(
@@ -171,17 +181,30 @@ export const codeAgentFunction = inngest.createFunction(
           "Planner Agent",
           `Reusing approved PRD for ${existingSpec.prd.projectName} (${bypassDecision.reason})`
         );
+        await recordStageMetric({
+          runId,
+          projectId,
+          stageName: "planning",
+          modelId: plannerModel,
+          startedAt: stageStart,
+          finishedAt: Date.now(),
+          details: { bypassed: true, reason: bypassDecision.reason },
+        });
         return existingSpec.prd;
       }
 
       await recordRunEvent(runId, "PLANNING", "Planner Agent", "Analyzing requirements and drafting product specification");
 
-      const generatedPRD = await runPlannerAgent(promptValue, {
-        existingPRD: existingSpec.prd,
-        existingDesignSpec: existingSpec.designSpec,
-        existingArchitectureSpec: existingSpec.architectureSpec,
-        existingFiles: baseFiles,
-      });
+      const generatedPRD = await runPlannerAgent(
+        promptValue,
+        {
+          existingPRD: existingSpec.prd,
+          existingDesignSpec: existingSpec.designSpec,
+          existingArchitectureSpec: existingSpec.architectureSpec,
+          existingFiles: baseFiles,
+        },
+        { model: plannerModel }
+      );
 
       await saveProjectPRD(projectId, generatedPRD);
 
@@ -192,6 +215,16 @@ export const codeAgentFunction = inngest.createFunction(
         `Generated PRD for ${generatedPRD.projectName} with ${generatedPRD.pages.length} pages`
       );
 
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "planning",
+        modelId: plannerModel,
+        startedAt: stageStart,
+        finishedAt: Date.now(),
+        details: { bypassed: false, pagesCount: generatedPRD.pages.length },
+      });
+
       return generatedPRD;
     });
 
@@ -200,6 +233,8 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     const designSpec = await step.run("designer-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.DESIGNING);
+      const stageStart = Date.now();
+      const designerModel = selectModelForStage("design");
 
       if (bypassDecision.canBypass && existingSpec.designSpec) {
         await recordRunEvent(
@@ -208,12 +243,21 @@ export const codeAgentFunction = inngest.createFunction(
           "Design Agent",
           `Reusing approved design specification (${existingSpec.designSpec.aestheticTheme} theme)`
         );
+        await recordStageMetric({
+          runId,
+          projectId,
+          stageName: "design",
+          modelId: designerModel,
+          startedAt: stageStart,
+          finishedAt: Date.now(),
+          details: { bypassed: true },
+        });
         return existingSpec.designSpec;
       }
 
       await recordRunEvent(runId, "DESIGNING", "Design Agent", "Creating accessible color palette, typography, and component styling");
 
-      const spec = await runDesignAgent(prd);
+      const spec = await runDesignAgent(prd, { model: designerModel });
       await saveDesignSpec(projectId, spec);
 
       await recordRunEvent(
@@ -223,6 +267,16 @@ export const codeAgentFunction = inngest.createFunction(
         `Selected ${spec.aestheticTheme} theme with primary color ${spec.colorPalette.primary}`
       );
 
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "design",
+        modelId: designerModel,
+        startedAt: stageStart,
+        finishedAt: Date.now(),
+        details: { bypassed: false, theme: spec.aestheticTheme },
+      });
+
       return spec;
     });
 
@@ -231,6 +285,8 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     const archSpec = await step.run("architect-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
+      const stageStart = Date.now();
+      const architectModel = selectModelForStage("architecture");
 
       if (bypassDecision.canBypass && existingSpec.architectureSpec) {
         await recordRunEvent(
@@ -239,12 +295,21 @@ export const codeAgentFunction = inngest.createFunction(
           "Architecture Agent",
           `Reusing approved full-stack architecture specification (${existingSpec.architectureSpec.routeEndpoints.length} routes)`
         );
+        await recordStageMetric({
+          runId,
+          projectId,
+          stageName: "architecture",
+          modelId: architectModel,
+          startedAt: stageStart,
+          finishedAt: Date.now(),
+          details: { bypassed: true },
+        });
         return existingSpec.architectureSpec;
       }
 
       await recordRunEvent(runId, "ARCHITECTING", "Architecture Agent", "Establishing route contracts and file ownership boundaries");
 
-      const spec = await runArchitectureAgent(prd, designSpec);
+      const spec = await runArchitectureAgent(prd, designSpec, 1, { model: architectModel });
       await saveArchitectureSpec(projectId, spec);
 
       await recordRunEvent(
@@ -261,6 +326,20 @@ export const codeAgentFunction = inngest.createFunction(
         );
       }
 
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "architecture",
+        modelId: architectModel,
+        startedAt: stageStart,
+        finishedAt: Date.now(),
+        details: {
+          bypassed: false,
+          routesCount: spec.routeEndpoints.length,
+          requiresDatabase: spec.requiresDatabase,
+        },
+      });
+
       return spec;
     });
 
@@ -273,6 +352,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     const sandboxId = await step.run("get-sandbox-id-and-restore", async () => {
+      const stageStart = Date.now();
       // 1. Validate manifest before restoring
       if (baseRev?.manifest) {
         const manifestValidation = validateRevisionManifest(
@@ -327,6 +407,19 @@ export const codeAgentFunction = inngest.createFunction(
         }
       }
 
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "sandbox-init",
+        startedAt: stageStart,
+        finishedAt: Date.now(),
+        details: {
+          templateId: getE2BTemplateId(),
+          workspacePath: PROJECT_WORKSPACE_DIR,
+          restoredFileCount: fileEntries.length,
+        },
+      });
+
       return sandbox.sandboxId;
     });
 
@@ -359,6 +452,8 @@ export const codeAgentFunction = inngest.createFunction(
       : baseFiles;
 
     const relevantBaseFiles = filterRelevantFiles(effectiveBaseFiles, promptValue);
+    const coderModel = selectModelForStage("coding", { isComplexFullstack: archSpec.requiresDatabase });
+    const codingStageStart = Date.now();
 
     const { summary, files } = await runCodingAgent({
       sandboxId,
@@ -370,6 +465,19 @@ export const codeAgentFunction = inngest.createFunction(
       previousMessages,
       step,
       stepPrefix: "initial-coding",
+      model: coderModel,
+    });
+
+    await recordStageMetric({
+      runId,
+      projectId,
+      stageName: "coding",
+      modelId: coderModel,
+      startedAt: codingStageStart,
+      finishedAt: Date.now(),
+      details: {
+        filesCount: Object.keys(files || {}).length,
+      },
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -406,6 +514,8 @@ export const codeAgentFunction = inngest.createFunction(
     const qaResult = await step.run("qa-agent", async () => {
       await transitionRun(runId, GenerationRunStatus.VALIDATING);
       await recordRunEvent(runId, "VALIDATING", "QA Agent", "Running comprehensive sandbox verification pipeline");
+      const qaStageStart = Date.now();
+      let repairAttempts = 0;
 
       let currentFiles = { ...(files || {}) };
       let currentSummary = summary;
@@ -422,6 +532,7 @@ export const codeAgentFunction = inngest.createFunction(
 
       // Bounded self-repair (1 repair iteration)
       if (!report.passed && report.repairNeeded) {
+        repairAttempts++;
         await recordRunEvent(
           runId,
           "VALIDATING",
@@ -439,6 +550,7 @@ Conclude with an updated <task_summary>...</task_summary>.
 `;
         try {
           const repairBaseFiles = filterRelevantFiles(currentFiles, repairPrompt);
+          const repairModel = selectModelForStage("repair", { isRepairAttempt: true });
           const repairResult = await runCodingAgent({
             sandboxId,
             prompt: repairPrompt,
@@ -452,6 +564,7 @@ Conclude with an updated <task_summary>...</task_summary>.
             ],
             step,
             stepPrefix: "qa-repair-1",
+            model: repairModel,
           });
           currentFiles = repairResult.files;
           currentSummary = repairResult.summary;
@@ -497,6 +610,20 @@ Conclude with an updated <task_summary>...</task_summary>.
         }
       }
 
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "qa-and-repair",
+        startedAt: qaStageStart,
+        finishedAt: Date.now(),
+        details: {
+          passed: report.passed,
+          score: report.score,
+          verificationMode: report.verificationMode,
+          repairAttempts,
+        },
+      });
+
       return { report, finalFiles, finalSummary: currentSummary };
     });
 
@@ -511,33 +638,35 @@ Conclude with an updated <task_summary>...</task_summary>.
     });
 
     const finalizationResult = await step.run("save-result", async () => {
-      // Record lightweight performance & cost metrics
-      const collector = new GenerationMetricsCollector(runId, projectId);
-      collector.startStage("workflow-execution");
-      collector.endStage("workflow-execution", {
-        details: {
-          passed: qaReport.passed,
-          score: qaReport.score,
-          filesCount: Object.keys(finalFiles || {}).length,
-          verificationMode: qaReport.verificationMode,
-        },
-      });
-      await collector.persist(qaReport.passed && qaReport.verificationMode !== "static-only" ? "COMPLETED" : "FAILED");
+      const saveStageStart = Date.now();
 
       if (!qaReport.passed || qaReport.verificationMode === "static-only") {
         const failureReason = qaReport.verificationMode === "static-only"
           ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
           : (qaReport.repairInstructions || "Validation checks failed");
 
-        return await finalizeGenerationFailure({
+        const failResult = await finalizeGenerationFailure({
           projectId,
           generationRunId: runId,
           errorCode: "QA_VERIFICATION_FAILED",
           errorMessage: failureReason,
         });
+
+        await recordStageMetric({
+          runId,
+          projectId,
+          stageName: "save-result",
+          startedAt: saveStageStart,
+          finishedAt: Date.now(),
+          details: { passed: false, errorCode: "QA_VERIFICATION_FAILED" },
+        });
+
+        await aggregateAndPersistRunMetrics(runId, projectId, "FAILED");
+
+        return failResult;
       }
 
-      return await finalizeGenerationSuccess({
+      const successResult = await finalizeGenerationSuccess({
         projectId,
         generationRunId: runId,
         baseRevisionId,
@@ -546,6 +675,19 @@ Conclude with an updated <task_summary>...</task_summary>.
         files: finalFiles || {},
         sandboxUrl,
       });
+
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "save-result",
+        startedAt: saveStageStart,
+        finishedAt: Date.now(),
+        details: { passed: true, revisionId: successResult.revision.id },
+      });
+
+      await aggregateAndPersistRunMetrics(runId, projectId, "COMPLETED");
+
+      return successResult;
     });
 
     if (!qaReport.passed || qaReport.verificationMode === "static-only") {

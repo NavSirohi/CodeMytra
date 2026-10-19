@@ -1,4 +1,5 @@
 import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
+import { GeminiModelTier } from "@/server/providers/gemini";
 
 /**
  * Configurable generation limits to prevent runaway loops and runaway costs.
@@ -23,27 +24,31 @@ export const GENERATION_LIMITS: GenerationLimits = {
 export function selectModelForStage(
   stage: "planning" | "design" | "architecture" | "coding" | "repair",
   options?: { isComplexFullstack?: boolean; isRepairAttempt?: boolean }
-): string {
+): GeminiModelTier {
   // Economical model by default for fast, lightweight stages
   if (stage === "design") {
     return "gemini-2.5-flash";
   }
-  if (stage === "planning" && !options?.isComplexFullstack) {
-    return "gemini-2.5-flash";
+  if (stage === "planning") {
+    return options?.isComplexFullstack ? "gemini-2.5-pro" : "gemini-2.5-flash";
   }
   // Escalate to Pro for complex architecture decisions or after a verification failure in repair
   if (stage === "architecture" || (stage === "repair" && options?.isRepairAttempt)) {
     return "gemini-2.5-pro";
   }
-  if (stage === "coding" && options?.isComplexFullstack) {
-    return "gemini-2.5-pro";
+  if (stage === "coding") {
+    return options?.isComplexFullstack ? "gemini-2.5-pro" : "gemini-2.5-flash";
   }
   return "gemini-2.5-flash";
 }
 
 /**
- * Identifies whether a follow-up modification is simple enough to safely bypass
- * unnecessary re-planning and re-architecture stages, reusing approved specifications.
+ * Task 3: Conservative fast-path check.
+ * Only allow obvious cosmetic modifications to reuse existing planning and architecture specifications.
+ * Backend, database, authentication, authorization, payment, API, business-rule and ambiguous changes
+ * MUST take the full planning path.
+ *
+ * Never bypasses QA or revision persistence.
  */
 export function canBypassPlanningAndArchitecture(
   prompt: string,
@@ -57,58 +62,128 @@ export function canBypassPlanningAndArchitecture(
     return { canBypass: false, reason: "Missing existing approved specifications" };
   }
 
-  const p = prompt.toLowerCase();
+  const p = prompt.toLowerCase().trim();
 
-  // Prompts that introduce new entities, routes, or backend systems require full planning
-  const requiresArchitecturalRethink =
-    p.includes("new model") ||
-    p.includes("new table") ||
-    p.includes("database schema") ||
-    p.includes("new route") ||
-    p.includes("new api") ||
-    p.includes("authentication") ||
-    p.includes("auth system") ||
-    p.includes("stripe") ||
-    p.includes("payment");
+  // 1. Strict Non-Cosmetic Rejection Triggers:
+  // If prompt matches ANY backend, database, auth, permission, payment, API, business rule, or data operation:
+  const nonCosmeticPatterns = [
+    // Database & data operations
+    /\b(database|db|prisma|sqlite|sql|postgres|table|schema|migration|seed)\b/,
+    /\b(model|models|entity|entities|record|records)\b/,
+    /\b(delete|deletes|deleted|deleting|remove|destroy|insert|create\s+record|update\s+record)\b/,
+    /\b(customer|customers|user\s+account|user\s+records)\b/,
+    // Authentication & authorization
+    /\b(auth|authentication|authenticate|login|logout|signin|signup|sign\s+in|sign\s+up|register)\b/,
+    /\b(admin|permission|permissions|role|roles|rbac|privilege|credential|session|jwt|token)\b/,
+    // Payment & billing
+    /\b(payment|payments|pay|stripe|billing|invoice|checkout|subscription|charge|credit)\b/,
+    // API & backend endpoints
+    /\b(api|apis|endpoint|endpoints|backend|server\s+action|server-side|route\s+handler|webhook|graphql|rest)\b/,
+    // Business rules & workflow logic
+    /\b(order|orders|order-processing|processing|behaviour|behavior|business\s*rule|workflow|algorithm)\b/,
+    /\b(cart|inventory|stock|booking\s+conflict|pricing\s+rule|discount|status\s+transition)\b/,
+    // Structural routing changes
+    /\b(new\s+page|add\s+page|delete\s+page|remove\s+page|new\s+route|subdomain)\b/,
+  ];
 
-  if (requiresArchitecturalRethink) {
+  for (const pattern of nonCosmeticPatterns) {
+    if (pattern.test(p)) {
+      return {
+        canBypass: false,
+        reason: "Prompt involves structural, database, security, backend, or business-logic modifications requiring full planning",
+      };
+    }
+  }
+
+  // 2. Strict Cosmetic Acceptance Criteria:
+  // Must match purely surface styling, typography, copy/text, or visual theme alterations
+  const cosmeticPatterns = [
+    /\b(colour|color|colors|colours|palette|theme|dark\s+mode|light\s+mode)\b/,
+    /\b(heading|subtitle|title|text|copy|caption|placeholder|label)\b/,
+    /\b(font|fonts|typography|size|line-height|letter-spacing)\b/,
+    /\b(padding|margin|gap|spacing|alignment|center|justify)\b/,
+    /\b(hero\s+heading|hero\s+section\s+color|background|surface\s+color|border|shadow|rounded|radius)\b/,
+  ];
+
+  const isExplicitlyCosmetic = cosmeticPatterns.some((pattern) => pattern.test(p));
+
+  if (!isExplicitlyCosmetic) {
     return {
       canBypass: false,
-      reason: "Prompt introduces structural changes requiring updated architecture specification",
+      reason: "Prompt does not qualify as an unambiguous cosmetic modification; taking full planning path",
     };
   }
 
-  // Simple modifications: styling, text updates, filter tags, small UI tweaks
-  const isSimpleModification =
-    p.includes("color") ||
-    p.includes("theme") ||
-    p.includes("dark mode") ||
-    p.includes("light mode") ||
-    p.includes("toggle") ||
-    p.includes("padding") ||
-    p.includes("margin") ||
-    p.includes("font") ||
-    p.includes("filter") ||
-    p.includes("tag") ||
-    p.includes("button") ||
-    p.includes("badge") ||
-    p.includes("text") ||
-    p.includes("heading") ||
-    p.includes("banner");
-
-  if (isSimpleModification) {
-    return {
-      canBypass: true,
-      reason: "Incremental UI/component modification can safely reuse approved specifications",
-    };
-  }
-
-  return { canBypass: false, reason: "Prompt may require requirements adjustment" };
+  return {
+    canBypass: true,
+    reason: "Unambiguous cosmetic UI/styling modification safely reuses approved specifications",
+  };
 }
 
 /**
- * Context window optimization: filters source files to send only the relevant subset
- * to the model instead of flooding the prompt with unnecessary boilerplate.
+ * Resolves imported dependencies from source file contents.
+ * Looks for `import ... from '...'` statements and matches relative (`./`, `../`)
+ * or alias (`@/`) imports to file keys in the project.
+ */
+function extractImportedPaths(sourceContent: string, currentFilePath: string, allFileKeys: string[]): string[] {
+  const matches: string[] = [];
+  const importRegex = /(?:import|from)\s+['"]([^'"]+)['"]/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = importRegex.exec(sourceContent)) !== null) {
+    const importPath = match[1];
+    // Skip third-party packages (node_modules like react, next, zod, lucide-react, etc.)
+    if (!importPath.startsWith(".") && !importPath.startsWith("@/")) {
+      continue;
+    }
+
+    const normalized = importPath;
+    if (normalized.startsWith("@/")) {
+      // Alias `@/` -> search for matching `src/...` or root `...`
+      const relativePart = normalized.slice(2);
+      for (const key of allFileKeys) {
+        const withoutExt = key.replace(/\.(tsx?|jsx?|json|css)$/, "");
+        if (
+          withoutExt === relativePart ||
+          withoutExt === `src/${relativePart}` ||
+          key === relativePart ||
+          key === `src/${relativePart}`
+        ) {
+          matches.push(key);
+        }
+      }
+    } else if (normalized.startsWith(".")) {
+      // Relative import: resolve relative to currentFilePath directory
+      const currentDir = currentFilePath.split("/").slice(0, -1).join("/");
+      const parts = `${currentDir}/${normalized}`.split("/");
+      const resolvedStack: string[] = [];
+      for (const part of parts) {
+        if (!part || part === ".") continue;
+        if (part === "..") {
+          resolvedStack.pop();
+        } else {
+          resolvedStack.push(part);
+        }
+      }
+      const resolvedBase = resolvedStack.join("/");
+      for (const key of allFileKeys) {
+        const withoutExt = key.replace(/\.(tsx?|jsx?|json|css)$/, "");
+        if (withoutExt === resolvedBase || key === resolvedBase) {
+          matches.push(key);
+        }
+      }
+    }
+  }
+
+  return matches;
+}
+
+/**
+ * Task 4: Context window optimization:
+ * - Keeps the complete project filesystem intact in E2B (handled by caller).
+ * - Only reduces the initial source context passed to the model.
+ * - Includes relevant imported dependencies where practical.
+ * - Respects the configured context budget (limits.maxInputFilesForContext).
  */
 export function filterRelevantFiles(
   files: Record<string, string>,
@@ -116,56 +191,66 @@ export function filterRelevantFiles(
   limits = GENERATION_LIMITS
 ): Record<string, string> {
   const fileKeys = Object.keys(files);
-  if (fileKeys.length <= limits.maxInputFilesForContext) {
+  const budget = limits.maxInputFilesForContext;
+
+  if (fileKeys.length <= budget) {
     return files;
   }
 
   const p = prompt.toLowerCase();
-  const isDbRelated = p.includes("database") || p.includes("prisma") || p.includes("model") || p.includes("api");
-  const isStyleRelated = p.includes("style") || p.includes("theme") || p.includes("color") || p.includes("css");
-
   const filtered: Record<string, string> = {};
 
-  // Core essential files always included
-  const essentialPatterns = [
+  const addFile = (key: string): boolean => {
+    if (filtered[key]) return true; // already included, continue processing
+    if (Object.keys(filtered).length >= budget) return false; // budget exhausted
+    if (files[key] !== undefined) {
+      filtered[key] = files[key];
+      return true;
+    }
+    return true;
+  };
+
+  // 1. Core essential files always included
+  const essentialSuffixes = [
+    "package.json",
     "app/page.tsx",
     "src/app/page.tsx",
-    "package.json",
+    "app/layout.tsx",
+    "src/app/layout.tsx",
+    "app/globals.css",
+    "src/app/globals.css",
   ];
 
   for (const key of fileKeys) {
-    // 1. Always keep entrypoint and package manifest
-    if (essentialPatterns.some((pattern) => key.endsWith(pattern) || key === pattern)) {
-      filtered[key] = files[key];
-      continue;
-    }
-
-    // 2. Database files
-    if (isDbRelated && (key.includes("prisma") || key.includes("lib/db") || key.includes("app/api"))) {
-      filtered[key] = files[key];
-      continue;
-    }
-
-    // 3. Style files
-    if (isStyleRelated && (key.includes("globals.css") || key.includes("theme") || key.includes("components/"))) {
-      filtered[key] = files[key];
-      continue;
-    }
-
-    // 4. Relevant components mentioned in prompt
-    const baseName = key.split("/").pop()?.replace(/\.[^/.]+$/, "").toLowerCase();
-    if (baseName && baseName.length > 3 && p.includes(baseName)) {
-      filtered[key] = files[key];
-      continue;
+    if (essentialSuffixes.some((suffix) => key.endsWith(suffix) || key === suffix)) {
+      addFile(key);
     }
   }
 
-  // If filtered set is too small, include key app files up to limit
+  // 2. Identify target files mentioned directly in prompt (component name, route, etc.)
+  for (const key of fileKeys) {
+    const baseName = key.split("/").pop()?.replace(/\.[^/.]+$/, "").toLowerCase();
+    if (baseName && baseName.length > 2 && p.includes(baseName)) {
+      addFile(key);
+    }
+  }
+
+  // 3. Dependency resolution: include imported dependencies of included files where practical
+  const keysToInspect = Object.keys(filtered);
+  for (const currentKey of keysToInspect) {
+    const content = files[currentKey];
+    if (!content) continue;
+    const importedKeys = extractImportedPaths(content, currentKey, fileKeys);
+    for (const importedKey of importedKeys) {
+      if (!addFile(importedKey)) break;
+    }
+  }
+
+  // 4. Fill remaining budget with top-level app files if budget allows
   if (Object.keys(filtered).length < 5) {
     for (const key of fileKeys) {
       if (!filtered[key] && !key.includes(".next") && !key.includes("node_modules")) {
-        filtered[key] = files[key];
-        if (Object.keys(filtered).length >= limits.maxInputFilesForContext) break;
+        if (!addFile(key)) break;
       }
     }
   }

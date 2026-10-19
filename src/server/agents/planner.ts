@@ -57,10 +57,20 @@ export class PlannerError extends Error {
   }
 }
 
-export async function runPlannerAgent(prompt: string, context?: PlannerContext): Promise<PRD> {
+export interface PlannerOptions {
+  model?: string;
+  temperature?: number;
+}
+
+export async function runPlannerAgent(
+  prompt: string,
+  context?: PlannerContext,
+  options?: PlannerOptions
+): Promise<PRD> {
+  const selectedModel = options?.model || "gemini-2.5-pro";
   const model = getGeminiModel({
-    model: "gemini-2.5-pro",
-    temperature: 0.2,
+    model: selectedModel,
+    temperature: options?.temperature ?? 0.2,
   });
 
   const isFollowUp = Boolean(context?.existingPRD || (context?.existingFiles && Object.keys(context.existingFiles).length > 0));

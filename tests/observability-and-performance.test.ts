@@ -2,8 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   calculateCost,
+  extractUsageMetadata,
+  recordStageMetric,
+  aggregateAndPersistRunMetrics,
   GenerationMetricsCollector,
-  PricingConfig,
+  COST_DISCLAIMER,
 } from "../src/server/observability/metrics";
 import {
   filterRelevantFiles,
@@ -11,273 +14,434 @@ import {
   selectModelForStage,
   GENERATION_LIMITS,
 } from "../src/server/orchestration/stage-optimizer";
-import { PRD, ArchitectureSpec, DesignSpec } from "../src/server/agent-contracts/schemas";
+import { getGeminiModel } from "../src/server/providers/gemini";
+import { PRD, ArchitectureSpec } from "../src/server/agent-contracts/schemas";
 
-describe("Performance & Cost Observability Requirements", () => {
-  describe("Requirement 1 & Observability: Configurable Pricing & Cost Estimation", () => {
-    it("calculates cost accurately using default Gemini rates and records pricing assumptions", () => {
-      // 10,000 prompt tokens, 2,000 completion tokens on gemini-2.5-flash
-      // Rate: $0.075 / 1M in, $0.30 / 1M out
-      // (10,000 / 1M) * 0.075 = $0.00075
-      // (2,000 / 1M) * 0.30 = $0.0006
-      // Total = $0.00135
-      const { costUsd, rateUsed } = calculateCost("gemini-2.5-flash", 10000, 2000);
-      assert.equal(costUsd, 0.00135);
-      assert.equal(rateUsed.inputPerMillionUsd, 0.075);
-      assert.equal(rateUsed.outputPerMillionUsd, 0.30);
-    });
+describe("Performance, Observability & Cost Corrections (PR 1)", () => {
+  describe("Task 1: Replay-Safe Stage Instrumentation & Incomplete Runs", () => {
+    it("upserts stage metrics in a replay-safe manner without duplicate records", async () => {
+      // Mock dbClient to track create vs update calls
+      const events: Array<{ id: string; runId: string; stage: string; message: string; payload: any }> = [];
+      let autoId = 1;
 
-    it("calculates cost accurately for gemini-2.5-pro", () => {
-      // 5,000 prompt tokens, 1,000 completion tokens on gemini-2.5-pro
-      // Rate: $1.25 / 1M in, $5.00 / 1M out
-      // (5,000 / 1M) * 1.25 = $0.00625
-      // (1,000 / 1M) * 5.00 = $0.005
-      // Total = $0.01125
-      const { costUsd, rateUsed } = calculateCost("gemini-2.5-pro", 5000, 1000);
-      assert.equal(costUsd, 0.01125);
-      assert.equal(rateUsed.inputPerMillionUsd, 1.25);
-      assert.equal(rateUsed.outputPerMillionUsd, 5.00);
-    });
-
-    it("respects custom configurable pricing table without hardcoding assumptions", () => {
-      const customConfig: PricingConfig = {
-        rates: {
-          "custom-model": { inputPerMillionUsd: 0.50, outputPerMillionUsd: 2.00 },
-        },
-        defaultRate: { inputPerMillionUsd: 0.20, outputPerMillionUsd: 0.80 },
-      };
-
-      const customResult = calculateCost("custom-model", 1_000_000, 1_000_000, customConfig);
-      assert.equal(customResult.costUsd, 2.50);
-
-      const fallbackResult = calculateCost("unknown-model", 1_000_000, 1_000_000, customConfig);
-      assert.equal(fallbackResult.costUsd, 1.00);
-    });
-  });
-
-  describe("Requirement 1, 2, 7: GenerationMetricsCollector Lifecycle", () => {
-    it("tracks stage timings, token usage, sandbox creation, repair attempts, and finalizes complete metrics", async () => {
-      const collector = new GenerationMetricsCollector("run-test-123", "proj-test-123");
-
-      // 1. Stage 1: Planning
-      collector.startStage("planning", "gemini-2.5-pro");
-      await new Promise((resolve) => setTimeout(resolve, 15));
-      const planMetric = collector.endStage("planning", {
-        promptTokens: 1200,
-        completionTokens: 800,
-        details: { pagesCount: 3 },
-      });
-      assert.equal(planMetric.stageName, "planning");
-      assert.equal(planMetric.modelId, "gemini-2.5-pro");
-      assert.ok(planMetric.durationMs >= 10);
-      assert.equal(planMetric.totalTokens, 2000);
-      assert.ok(planMetric.estimatedCostUsd > 0);
-
-      // 2. Stage 2: Sandbox creation & initialization
-      collector.recordSandboxCreation(2500, "e2b-nextjs-base", "/home/user");
-      collector.recordSandboxTotal(12500);
-
-      // 3. Stage 3: Coding
-      collector.startStage("coding", "gemini-2.5-flash");
-      await new Promise((resolve) => setTimeout(resolve, 15));
-      collector.endStage("coding", {
-        promptTokens: 4500,
-        completionTokens: 3200,
-      });
-
-      // 4. Record repair attempt
-      collector.recordRepairAttempt();
-
-      // 5. Finalize metrics
-      const metrics = collector.finalize("COMPLETED");
-
-      assert.equal(metrics.runId, "run-test-123");
-      assert.equal(metrics.projectId, "proj-test-123");
-      assert.equal(metrics.finalOutcome, "COMPLETED");
-      assert.equal(metrics.repairAttempts, 1);
-      assert.ok(metrics.totalDurationMs >= 25);
-      assert.equal(metrics.totalPromptTokens, 1200 + 4500);
-      assert.equal(metrics.totalCompletionTokens, 800 + 3200);
-      assert.equal(metrics.totalTokens, 9700);
-      assert.ok(metrics.totalEstimatedCostUsd > 0);
-      assert.ok(metrics.modelsUsed.includes("gemini-2.5-pro"));
-      assert.ok(metrics.modelsUsed.includes("gemini-2.5-flash"));
-      assert.equal(metrics.sandbox?.creationDurationMs, 2500);
-      assert.equal(metrics.sandbox?.totalDurationMs, 12500);
-      assert.ok(metrics.pricingAssumptions["gemini-2.5-pro"]);
-    });
-
-    it("persists metrics via RunEvent without schema breaking changes", async () => {
-      const mockEvents: any[] = [];
-      const mockPrisma = {
+      const mockDb: any = {
         runEvent: {
-          create: async (args: any) => {
-            mockEvents.push(args.data);
-            return { id: "evt-1", ...args.data };
+          findFirst: async ({ where }: any) => {
+            return events.find((e) => e.runId === where.runId && e.stage === where.stage) || null;
+          },
+          findMany: async ({ where }: any) => {
+            return events.filter((e) => {
+              if (where.runId && e.runId !== where.runId) return false;
+              if (where.stage?.startsWith && !e.stage.startsWith(where.stage.startsWith)) return false;
+              return true;
+            });
+          },
+          create: async ({ data }: any) => {
+            const row = { id: `evt-${autoId++}`, ...data };
+            events.push(row);
+            return row;
+          },
+          update: async ({ where, data }: any) => {
+            const idx = events.findIndex((e) => e.id === where.id);
+            if (idx >= 0) {
+              events[idx] = { ...events[idx], ...data };
+              return events[idx];
+            }
+            throw new Error("Not found");
           },
         },
       };
 
-      const collector = new GenerationMetricsCollector("run-persist-1", "proj-persist-1");
-      collector.startStage("planning", "gemini-2.5-flash");
-      collector.endStage("planning", { promptTokens: 500, completionTokens: 200 });
+      const runId = "test-run-replay-1";
+      const projectId = "test-project-1";
 
-      const metrics = await collector.persist("COMPLETED", mockPrisma as any);
-      assert.equal(metrics.finalOutcome, "COMPLETED");
-      assert.equal(mockEvents.length, 1);
-      assert.equal(mockEvents[0].stage, "METRICS_RECORDED");
-      assert.equal(mockEvents[0].runId, "run-persist-1");
-      assert.equal(mockEvents[0].payload.runId, "run-persist-1");
+      // 1. First execution of "planning" stage
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "planning",
+          modelId: "gemini-2.5-pro",
+          startedAt: 1000,
+          finishedAt: 2000,
+          promptTokens: 1000,
+          completionTokens: 500,
+        },
+        mockDb
+      );
+
+      assert.equal(events.length, 1);
+      assert.equal(events[0].stage, "STAGE_METRIC_planning");
+      assert.equal(events[0].payload.promptTokens, 1000);
+
+      // 2. Inngest step retries the "planning" stage after transient failure
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "planning",
+          modelId: "gemini-2.5-pro",
+          startedAt: 1000,
+          finishedAt: 2500,
+          promptTokens: 1100,
+          completionTokens: 550,
+        },
+        mockDb
+      );
+
+      // Must NOT create a duplicate record — should update existing stage event
+      assert.equal(events.length, 1);
+      assert.equal(events[0].payload.promptTokens, 1100);
+      assert.equal(events[0].payload.durationMs, 1500);
+
+      // 3. Add other stages
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "coding",
+          modelId: "gemini-2.5-flash",
+          startedAt: 3000,
+          finishedAt: 5000,
+          promptTokens: 4000,
+          completionTokens: 2000,
+        },
+        mockDb
+      );
+
+      assert.equal(events.length, 2);
+
+      // 4. Aggregate from persisted stage records
+      const aggregate = await aggregateAndPersistRunMetrics(runId, projectId, "COMPLETED", undefined, mockDb);
+      assert.equal(aggregate.finalOutcome, "COMPLETED");
+      assert.equal(aggregate.totalPromptTokens, 1100 + 4000);
+      assert.equal(aggregate.totalCompletionTokens, 550 + 2000);
+      assert.equal(aggregate.modelsUsed.length, 2);
+      assert.ok(aggregate.modelsUsed.includes("gemini-2.5-pro"));
+      assert.ok(aggregate.modelsUsed.includes("gemini-2.5-flash"));
+    });
+
+    it("keeps incomplete-run metrics available when generation fails midway", async () => {
+      const events: any[] = [];
+      let autoId = 1;
+
+      const mockDb: any = {
+        runEvent: {
+          findFirst: async ({ where }: any) => {
+            return events.find((e) => e.runId === where.runId && e.stage === where.stage) || null;
+          },
+          findMany: async ({ where }: any) => {
+            return events.filter((e) => {
+              if (where.runId && e.runId !== where.runId) return false;
+              if (where.stage?.startsWith && !e.stage.startsWith(where.stage.startsWith)) return false;
+              return true;
+            });
+          },
+          create: async ({ data }: any) => {
+            const row = { id: `evt-${autoId++}`, ...data };
+            events.push(row);
+            return row;
+          },
+          update: async ({ where, data }: any) => {
+            const idx = events.findIndex((e) => e.id === where.id);
+            if (idx >= 0) {
+              events[idx] = { ...events[idx], ...data };
+              return events[idx];
+            }
+            throw new Error("Not found");
+          },
+        },
+      };
+
+      const runId = "test-run-failed-midway";
+      const projectId = "test-project-failed";
+
+      // Stages recorded prior to failure
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "planning",
+          modelId: "gemini-2.5-pro",
+          startedAt: 1000,
+          finishedAt: 2000,
+          promptTokens: 1500,
+          completionTokens: 600,
+        },
+        mockDb
+      );
+
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "design",
+          modelId: "gemini-2.5-flash",
+          startedAt: 2100,
+          finishedAt: 3000,
+          promptTokens: 800,
+          completionTokens: 400,
+        },
+        mockDb
+      );
+
+      // Workflow fails before coding finishes
+      const failedAggregate = await aggregateAndPersistRunMetrics(runId, projectId, "FAILED", undefined, mockDb);
+
+      assert.equal(failedAggregate.finalOutcome, "FAILED");
+      assert.ok(failedAggregate.stages["planning"]);
+      assert.ok(failedAggregate.stages["design"]);
+      assert.equal(failedAggregate.totalPromptTokens, 1500 + 800);
+      assert.equal(failedAggregate.totalCompletionTokens, 600 + 400);
+      assert.equal(failedAggregate.costDisclaimer, COST_DISCLAIMER);
     });
   });
 
-  describe("Requirement 3: Context Filtering (Avoid Flooding Prompt with Entire Tree)", () => {
-    it("filters out unrelated files when prompt targets specific UI or styling", () => {
-      const sourceFiles: Record<string, string> = {
-        "app/page.tsx": "export default function () { return <div>Home</div>; }",
-        "app/globals.css": ":root { --primary: red; }",
-        "package.json": '{"name": "app"}',
-        "components/theme-toggle.tsx": "export function ThemeToggle() {}",
-        "components/navbar.tsx": "export function Navbar() {}",
-        "lib/db.ts": "export const db = {};",
-        "prisma/schema.prisma": "model User { id String @id }",
-        "app/api/auth/route.ts": "export function POST() {}",
-        "app/api/users/route.ts": "export function GET() {}",
-        "lib/utils.ts": "export function cn() {}",
-      };
+  describe("Task 2: Connect Model Selection to Real Execution", () => {
+    it("confirms recorded model equals the model actually passed to the Gemini provider", () => {
+      process.env.GEMINI_API_KEY = process.env.GEMINI_API_KEY || "test-gemini-key";
 
-      // User prompt is purely visual/style related
-      const filtered = filterRelevantFiles(
-        sourceFiles,
-        "Update the navbar with a dark mode theme-toggle button and adjust primary colors",
-        { ...GENERATION_LIMITS, maxInputFilesForContext: 5 }
-      );
+      // 1. Architecture stage escalates to Pro
+      const archModel = selectModelForStage("architecture");
+      assert.equal(archModel, "gemini-2.5-pro");
+      const archAdapter = getGeminiModel({ model: archModel });
+      // Verify modelId passed into provider adapter equals selected model
+      assert.equal((archAdapter as any).modelId, "gemini-2.5-pro");
 
-      // Must keep entrypoint and manifest
-      assert.ok(filtered["app/page.tsx"], "Must keep app/page.tsx");
-      assert.ok(filtered["package.json"], "Must keep package.json");
-      assert.ok(filtered["app/globals.css"], "Must keep styling file");
-      assert.ok(filtered["components/theme-toggle.tsx"], "Must keep explicitly referenced component");
-      assert.ok(filtered["components/navbar.tsx"], "Must keep navbar component");
+      // 2. Design stage selects economical Flash
+      const designModel = selectModelForStage("design");
+      assert.equal(designModel, "gemini-2.5-flash");
+      const designAdapter = getGeminiModel({ model: designModel });
+      assert.equal((designAdapter as any).modelId, "gemini-2.5-flash");
 
-      // Should exclude unrelated backend routes to save token window
-      assert.equal(filtered["app/api/auth/route.ts"], undefined);
-      assert.equal(filtered["app/api/users/route.ts"], undefined);
-    });
-
-    it("keeps database files when prompt involves database modifications", () => {
-      const sourceFiles: Record<string, string> = {
-        "app/page.tsx": "export default function () {}",
-        "package.json": '{"name": "app"}',
-        "prisma/schema.prisma": "model Product { id String @id }",
-        "lib/db.ts": "export const db = {};",
-        "app/api/products/route.ts": "export function GET() {}",
-        "components/footer.tsx": "export function Footer() {}",
-        "components/banner.tsx": "export function Banner() {}",
-      };
-
-      const filtered = filterRelevantFiles(
-        sourceFiles,
-        "Add a new quantity field to the Product prisma database model and update product API route",
-        { ...GENERATION_LIMITS, maxInputFilesForContext: 4 }
-      );
-
-      assert.ok(filtered["prisma/schema.prisma"], "Must include prisma schema");
-      assert.ok(filtered["lib/db.ts"], "Must include db client");
-      assert.ok(filtered["app/api/products/route.ts"], "Must include api route");
+      // 3. Repair stage escalates to Pro
+      const repairModel = selectModelForStage("repair", { isRepairAttempt: true });
+      assert.equal(repairModel, "gemini-2.5-pro");
+      const repairAdapter = getGeminiModel({ model: repairModel });
+      assert.equal((repairAdapter as any).modelId, "gemini-2.5-pro");
     });
   });
 
-  describe("Requirement 4 & 5: Specification Reuse & Stage Bypass", () => {
-    const existingPRD: PRD = {
-      projectName: "Developer Portfolio",
-      summary: "Modern developer portfolio",
-      targetAudience: "Recruiters and engineers",
-      capabilities: ["pages-navigation", "forms-validation"],
+  describe("Task 3: Conservative Fast Path (6 Mandatory Prompts)", () => {
+    const mockPrd: PRD = {
+      projectName: "Acme Platform",
+      summary: "Fullstack web platform",
+      targetAudience: "Users",
+      capabilities: ["pages-navigation", "data-persistence"],
       unsupportedRequirements: [],
-      coreFeatures: [{ name: "Projects", description: "Project list", priority: "MUST" }],
-      pages: [{ route: "/", title: "Home", purpose: "Showcase", keyComponents: ["ProjectGrid"] }],
-      dataEntities: [],
-      userFlows: [],
+      coreFeatures: [{ name: "Core", description: "Base", priority: "MUST" }],
+      pages: [{ route: "/", title: "Home", purpose: "Landing", keyComponents: ["Hero"] }],
+      dataEntities: [{ name: "User", fields: ["id", "email"], relationships: [], isPersistent: true }],
+      userFlows: [{ name: "Visit", steps: ["Opens page"] }],
     };
 
-    const existingDesign: DesignSpec = {
-      aestheticTheme: "Modern Dark",
-      colorPalette: {
-        primary: "#3b82f6",
-        secondary: "#1e293b",
-        accent: "#06b6d4",
-        background: "#0f172a",
-        surface: "#1e293b",
-        text: "#f8fafc",
-      },
-      typography: { headingFont: "Geist", bodyFont: "Geist Sans" },
-      layoutStyle: "clean",
-      componentGuidelines: [],
-    };
-
-    const existingArch: ArchitectureSpec = {
+    const mockArch: ArchitectureSpec = {
       appType: "nextjs-fullstack",
-      capabilities: ["pages-navigation", "forms-validation"],
-      requiresDatabase: false,
-      routeEndpoints: [{ path: "/", type: "page", purpose: "Home page" }],
-      uiComponents: [{ name: "ProjectGrid", purpose: "Showcase", route: "/" }],
-      databaseModels: [],
+      capabilities: ["pages-navigation", "data-persistence"],
+      requiresDatabase: true,
+      routeEndpoints: [{ path: "/", type: "page", purpose: "Home", methods: ["GET"] }],
+      uiComponents: [{ name: "Hero", purpose: "Banner", route: "/" }],
+      databaseModels: [{ modelName: "User", fields: ["id String @id", "email String"], relations: [] }],
       backendOperations: [],
       businessConstraints: [],
       authRequirements: { enabled: false, strategy: "none" },
       externalIntegrations: [],
       userJourneys: [],
-      fileOwnership: { frontend: ["app/**/*.tsx"] },
+      fileOwnership: {
+        frontend: ["src/app/page.tsx"],
+        backend: [],
+        database: ["prisma/schema.prisma"],
+      },
       dependencies: [],
     };
 
-    it("safely bypasses planning and architecture for simple styling or UI modifications", () => {
-      const decision = canBypassPlanningAndArchitecture(
-        "Change the primary button color to emerald green and add a dark mode toggle",
-        { prd: existingPRD, designSpec: existingDesign, architectureSpec: existingArch }
-      );
+    const mockSpecs = {
+      prd: mockPrd,
+      architectureSpec: mockArch,
+      designSpec: null,
+    };
 
-      assert.equal(decision.canBypass, true);
-      assert.match(decision.reason, /reusing approved specifications|Incremental UI/i);
+    it("1. 'Change the hero heading colour.' -> BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Change the hero heading colour.", mockSpecs);
+      assert.equal(res.canBypass, true);
     });
 
-    it("does NOT bypass planning when the prompt introduces new database models or backend systems", () => {
-      const decision = canBypassPlanningAndArchitecture(
-        "Add a new database schema for customer testimonials and an API endpoint to submit reviews",
-        { prd: existingPRD, designSpec: existingDesign, architectureSpec: existingArch }
-      );
-
-      assert.equal(decision.canBypass, false);
-      assert.match(decision.reason, /structural changes/i);
+    it("2. 'Update the homepage subtitle.' -> BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Update the homepage subtitle.", mockSpecs);
+      assert.equal(res.canBypass, true);
     });
 
-    it("does NOT bypass planning when approved specifications do not exist", () => {
-      const decision = canBypassPlanningAndArchitecture("Change color to blue", {
+    it("3. 'Add a button that deletes customer records.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Add a button that deletes customer records.", mockSpecs);
+      assert.equal(res.canBypass, false);
+      assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
+    });
+
+    it("4. 'Add database-backed product filtering.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Add database-backed product filtering.", mockSpecs);
+      assert.equal(res.canBypass, false);
+      assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
+    });
+
+    it("5. 'Change order-processing behaviour.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Change order-processing behaviour.", mockSpecs);
+      assert.equal(res.canBypass, false);
+      assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
+    });
+
+    it("6. 'Add login and admin permissions.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Add login and admin permissions.", mockSpecs);
+      assert.equal(res.canBypass, false);
+      assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
+    });
+
+    it("Never bypasses if approved specifications are missing", () => {
+      const res = canBypassPlanningAndArchitecture("Change the hero heading colour.", {
         prd: null,
-        designSpec: null,
         architectureSpec: null,
       });
-
-      assert.equal(decision.canBypass, false);
-      assert.match(decision.reason, /Missing existing approved specifications/i);
+      assert.equal(res.canBypass, false);
     });
   });
 
-  describe("Requirement 7 & 9: Model Escalation & Configurable Limits", () => {
-    it("selects economical model for design and fast tasks, escalating to Pro for architecture or repair", () => {
-      assert.equal(selectModelForStage("design"), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("planning", { isComplexFullstack: false }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("architecture"), "gemini-2.5-pro");
-      assert.equal(selectModelForStage("repair", { isRepairAttempt: true }), "gemini-2.5-pro");
-      assert.equal(selectModelForStage("coding", { isComplexFullstack: true }), "gemini-2.5-pro");
+  describe("Task 4: Correct File-Context Filtering & Dependency Resolution", () => {
+    it("includes relevant imported dependencies for a modified component", () => {
+      const files: Record<string, string> = {
+        "src/app/page.tsx": `import { UserProfile } from "@/components/UserProfile"; export default function Home() { return <UserProfile />; }`,
+        "src/app/layout.tsx": `export default function RootLayout({ children }) { return <html><body>{children}</body></html>; }`,
+        "src/app/globals.css": `@tailwind base;`,
+        "package.json": `{"name": "test-app"}`,
+        // Target component
+        "src/components/UserProfile.tsx": `
+          import { User } from "@/types/user";
+          import { formatCurrency } from "@/lib/utils";
+          export function UserProfile({ user }: { user: User }) {
+            return <div>{user.name} - {formatCurrency(user.balance)}</div>;
+          }
+        `,
+        // Imported dependencies
+        "src/types/user.ts": `export interface User { id: string; name: string; balance: number; }`,
+        "src/lib/utils.ts": `export function formatCurrency(amount: number) { return "$" + amount.toFixed(2); }`,
+        // Unrelated backend files
+        "src/server/auth.ts": `export const auth = () => {};`,
+        "src/server/billing.ts": `export const billing = () => {};`,
+        "src/server/orders.ts": `export const orders = () => {};`,
+        "src/server/inventory.ts": `export const inventory = () => {};`,
+        "src/server/reports.ts": `export const reports = () => {};`,
+        "src/server/analytics.ts": `export const analytics = () => {};`,
+        "src/server/notifications.ts": `export const notifications = () => {};`,
+        "src/server/audit.ts": `export const audit = () => {};`,
+        "src/server/webhooks.ts": `export const webhooks = () => {};`,
+        "src/server/db.ts": `export const db = () => {};`,
+      };
+
+      const limits = {
+        maxRepairAttempts: 2,
+        maxGenerationDurationMs: 300000,
+        maxConcurrentRunsPerUser: 3,
+        maxInputFilesForContext: 8, // budget strictly limited to 8 files
+      };
+
+      const filtered = filterRelevantFiles(files, "Update UserProfile component layout", limits);
+      const filteredKeys = Object.keys(filtered);
+
+      // Must not exceed budget
+      assert.ok(filteredKeys.length <= limits.maxInputFilesForContext);
+
+      // Must include essential files
+      assert.ok(filteredKeys.includes("package.json"));
+      assert.ok(filteredKeys.includes("src/app/page.tsx"));
+
+      // Must include target component
+      assert.ok(filteredKeys.includes("src/components/UserProfile.tsx"));
+
+      // Must include transitively imported dependencies!
+      assert.ok(filteredKeys.includes("src/types/user.ts"), "Must resolve imported @/types/user");
+      assert.ok(filteredKeys.includes("src/lib/utils.ts"), "Must resolve imported @/lib/utils");
+
+      // Must exclude unrelated backend files to protect context window
+      assert.ok(!filteredKeys.includes("src/server/billing.ts"));
+      assert.ok(!filteredKeys.includes("src/server/orders.ts"));
+    });
+  });
+
+  describe("Task 5: Correct Cost Reporting & Pricing Assumptions", () => {
+    it("uses real usage metadata when supplied and does not report missing usage as measured zero", () => {
+      // 1. Missing tokens: do NOT report as measured zero
+      const missingTokens = calculateCost("gemini-2.5-flash", undefined, undefined);
+      assert.equal(missingTokens.usageMeasured, false);
+      assert.equal(missingTokens.costUsd, undefined);
+      assert.ok(missingTokens.rateUsed, "Identifies rate that would apply to model");
+
+      // 2. Real provider tokens supplied
+      const measured = calculateCost("gemini-2.5-flash", 20000, 5000);
+      assert.equal(measured.usageMeasured, true);
+      assert.ok(measured.costUsd !== undefined);
+      // (20,000 / 1M) * 0.075 + (5,000 / 1M) * 0.30 = 0.0015 + 0.0015 = 0.003
+      assert.equal(measured.costUsd, 0.003);
     });
 
-    it("exposes valid configurable generation limits", () => {
-      assert.ok(GENERATION_LIMITS.maxRepairAttempts >= 1);
-      assert.ok(GENERATION_LIMITS.maxGenerationDurationMs >= 30000);
-      assert.ok(GENERATION_LIMITS.maxConcurrentRunsPerUser >= 1);
-      assert.ok(GENERATION_LIMITS.maxInputFilesForContext >= 5);
+    it("does not substitute a default model ID when actual model identity is unknown", () => {
+      const unknownModel = calculateCost(undefined, 10000, 5000);
+      assert.equal(unknownModel.costUsd, undefined);
+      assert.equal(unknownModel.rateUsed, undefined);
+      assert.equal(unknownModel.usageMeasured, false);
+
+      const emptyModel = calculateCost("", 10000, 5000);
+      assert.equal(emptyModel.costUsd, undefined);
+      assert.equal(emptyModel.rateUsed, undefined);
+      assert.equal(emptyModel.usageMeasured, false);
+    });
+
+    it("extracts usage metadata from provider responses accurately", () => {
+      // From AgentKit RunCompletedEvent structure
+      const directUsage = extractUsageMetadata({
+        usage: { promptTokens: 350, completionTokens: 120, totalTokens: 470 },
+      });
+      assert.deepEqual(directUsage, {
+        promptTokens: 350,
+        completionTokens: 120,
+        totalTokens: 470,
+      });
+
+      // From Gemini raw JSON response
+      const rawGeminiJson = extractUsageMetadata({
+        raw: JSON.stringify({
+          usageMetadata: {
+            promptTokenCount: 1200,
+            candidatesTokenCount: 450,
+            totalTokenCount: 1650,
+          },
+        }),
+      });
+      assert.deepEqual(rawGeminiJson, {
+        promptTokens: 1200,
+        completionTokens: 450,
+        totalTokens: 1650,
+      });
+
+      // Missing metadata returns undefined (not zeros)
+      assert.equal(extractUsageMetadata({}), undefined);
+      assert.equal(extractUsageMetadata(null), undefined);
+    });
+
+    it("ensures total cost includes disclaimer and is not presented as billing expenditure", () => {
+      const collector = new GenerationMetricsCollector("run-disc", "proj-disc");
+      collector.startStage("planning", "gemini-2.5-flash");
+      collector.endStage("planning", { promptTokens: 1000, completionTokens: 500 });
+      const metrics = collector.finalize("COMPLETED");
+
+      assert.equal(metrics.costDisclaimer, COST_DISCLAIMER);
+      assert.match(metrics.costDisclaimer, /not actual provider billing expenditure/i);
+    });
+  });
+
+  describe("Task 6: Configurable Limits", () => {
+    it("exposes valid configurable generation limits matching runtime defaults", () => {
+      assert.equal(GENERATION_LIMITS.maxRepairAttempts, 2);
+      assert.equal(GENERATION_LIMITS.maxGenerationDurationMs, 300000);
+      assert.equal(GENERATION_LIMITS.maxConcurrentRunsPerUser, 3);
+      assert.equal(GENERATION_LIMITS.maxInputFilesForContext, 30);
     });
   });
 });
