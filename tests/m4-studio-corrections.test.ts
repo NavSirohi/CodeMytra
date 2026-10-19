@@ -474,7 +474,7 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
           "Query state must resolve to QUEUED via actual query function execution"
         );
         assert.strictEqual(
-          observedData?.status,
+          (observedData as { status?: string } | null)?.status,
           "QUEUED",
           "Subscribed observer must observe QUEUED run returned by query function"
         );

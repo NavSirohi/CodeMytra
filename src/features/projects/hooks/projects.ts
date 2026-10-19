@@ -113,7 +113,7 @@ export const getActiveRunPollInterval = (
     | string
     | null
     | ActiveRunPollOptions
-    | { state?: { data?: { status?: string | null } | null; dataUpdateCount?: number } },
+    | { state?: { data?: unknown; dataUpdateCount?: number } },
   legacyDataUpdateCount?: number
 ): number | false => {
   let status: string | null | undefined;
