@@ -393,7 +393,8 @@ describe("M4 PR 1: Studio Lifecycle, Polling & Selection Corrections", () => {
     it("handles clipboard rejection gracefully without clearing or wiping target URL", async () => {
       const fakeFailingNavigator = {
         clipboard: {
-          writeText: async () => {
+          writeText: async (..._args: unknown[]) => {
+            void _args;
             throw new Error("Clipboard permission denied");
           },
         },

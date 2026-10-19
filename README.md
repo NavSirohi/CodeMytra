@@ -144,7 +144,7 @@ See [DEVELOPMENT.md — Deployment section](./DEVELOPMENT.md#deployment) for the
 ## Security
 
 - All secrets are environment variables — never committed to git
-- The teacher's E2B API key that appeared in the original project has been removed. **Please notify your teacher to revoke/rotate key `e2b_bf8e535c13c02ee0355eaee8255e06bebd54d593` via the E2B dashboard.**
+- All legacy/sample API keys from upstream prototypes have been scrubbed from this repository. The project owner must generate and configure their own isolated credentials via `.env`.
 - Tenant isolation enforced in all server actions
 - No platform credentials are accessible inside the code execution sandbox
 

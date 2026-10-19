@@ -470,4 +470,77 @@ describe("Phase 2: Builder & Contact Integration", () => {
       }
     });
   });
+
+  describe("Task 5: Production Database Configuration Validation", () => {
+    it("rejects missing DATABASE_URL in production runtime", async () => {
+      const { validateDatabaseConfig } = await import("@/lib/db");
+      const env = process.env as Record<string, string | undefined>;
+      const prevEnv = env.NODE_ENV;
+      const prevUrl = env.DATABASE_URL;
+      const prevPhase = env.NEXT_PHASE;
+      const prevLifecycle = env.npm_lifecycle_event;
+
+      try {
+        env.NODE_ENV = "production";
+        delete env.DATABASE_URL;
+        delete env.NEXT_PHASE;
+        delete env.npm_lifecycle_event;
+
+        const result = validateDatabaseConfig();
+        assert.strictEqual(result.isValid, false);
+        assert.ok(result.error?.includes("DATABASE_URL is not configured"));
+        assert.ok(result.error?.includes("Implicit localhost fallback is prohibited"));
+      } finally {
+        env.NODE_ENV = prevEnv;
+        if (prevUrl !== undefined) env.DATABASE_URL = prevUrl;
+        else delete env.DATABASE_URL;
+        if (prevPhase !== undefined) env.NEXT_PHASE = prevPhase;
+        else delete env.NEXT_PHASE;
+        if (prevLifecycle !== undefined) env.npm_lifecycle_event = prevLifecycle;
+        else delete env.npm_lifecycle_event;
+      }
+    });
+
+    it("rejects localhost/127.0.0.1 connection strings in production", async () => {
+      const { validateDatabaseConfig } = await import("@/lib/db");
+      const env = process.env as Record<string, string | undefined>;
+      const prevEnv = env.NODE_ENV;
+      const prevUrl = env.DATABASE_URL;
+
+      try {
+        env.NODE_ENV = "production";
+        env.DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/codemytra";
+
+        const result = validateDatabaseConfig();
+        assert.strictEqual(result.isValid, false);
+        assert.ok(result.error?.includes("cannot target localhost"));
+      } finally {
+        env.NODE_ENV = prevEnv;
+        if (prevUrl !== undefined) env.DATABASE_URL = prevUrl;
+        else delete env.DATABASE_URL;
+      }
+    });
+
+    it("accepts valid remote PostgreSQL connection strings in production", async () => {
+      const { validateDatabaseConfig } = await import("@/lib/db");
+      const env = process.env as Record<string, string | undefined>;
+      const prevEnv = env.NODE_ENV;
+      const prevUrl = env.DATABASE_URL;
+
+      try {
+        env.NODE_ENV = "production";
+        env.DATABASE_URL =
+          "postgresql://neondb_owner:npg_123@ep-cool-fog-456.us-east-2.aws.neon.tech/neondb?sslmode=require";
+
+        const result = validateDatabaseConfig();
+        assert.strictEqual(result.isValid, true);
+        assert.strictEqual(result.isFallback, false);
+        assert.strictEqual(result.connectionString, env.DATABASE_URL);
+      } finally {
+        env.NODE_ENV = prevEnv;
+        if (prevUrl !== undefined) env.DATABASE_URL = prevUrl;
+        else delete env.DATABASE_URL;
+      }
+    });
+  });
 });
