@@ -146,8 +146,9 @@ export function FileExplorer({ files }: { files: Record<string, string> }) {
   return (
     <ResizablePanelGroup orientation="horizontal" className="h-full min-h-0">
       <ResizablePanel
-        defaultSize={22}
-       
+        defaultSize="25%"
+        minSize={220}
+        maxSize="45%"
         className="min-w-[220px] bg-sidebar"
       >
         <TreeView
@@ -158,7 +159,7 @@ export function FileExplorer({ files }: { files: Record<string, string> }) {
       </ResizablePanel>
       <ResizableHandle className="w-px bg-border transition-colors hover:bg-primary/40" />
 
-      <ResizablePanel defaultSize={78} minSize={55} className="min-w-0">
+      <ResizablePanel defaultSize="75%" minSize={360} className="min-w-0">
         {selectedFile && files[selectedFile] ? (
           <div className="flex h-full min-h-0 w-full flex-col">
             <div className="flex shrink-0 items-center justify-between gap-x-2 border-b bg-sidebar/50 px-4 py-2">

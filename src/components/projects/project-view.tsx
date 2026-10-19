@@ -22,7 +22,11 @@ import { GenerationStatusBanner } from "./generation-status-banner";
 import { AgentTimeline } from "./agent-timeline";
 import { RevisionHistory } from "./revision-history";
 import { PRDViewer } from "./prd-viewer";
-import { useGetProjectById } from "@/features/projects/hooks/projects";
+import {
+  useGetProjectById,
+  useGetActiveGenerationRun,
+  isGenerationActiveStatus,
+} from "@/features/projects/hooks/projects";
 import { useGetMessages } from "@/features/messages/hooks/messages";
 import {
   parseFragmentFiles,
@@ -38,6 +42,8 @@ export function ProjectView({ projectId }: { projectId: string }) {
   const [mobileView, setMobileView] = useState<"chat" | "workspace">("chat");
 
   const { data: project, isPending, isError, error } = useGetProjectById(projectId);
+  const { data: activeRun } = useGetActiveGenerationRun(projectId);
+  const isGenerating = isGenerationActiveStatus(activeRun?.status);
   const { data: messages } = useGetMessages(projectId);
 
   // Deterministically find latest assistant fragment from active conversation
@@ -255,10 +261,10 @@ export function ProjectView({ projectId }: { projectId: string }) {
           <ResizablePanelGroup orientation="horizontal">
             {/* Left Column: AI Conversation Panel */}
             <ResizablePanel
-              defaultSize={32}
-              minSize={25}
-              maxSize={45}
-              className="flex min-h-0 flex-col border-r border-[#28382b] bg-[#19231c]"
+              defaultSize="35%"
+              minSize={320}
+              maxSize="50%"
+              className="flex min-h-0 flex-col border-r border-[#28382b] bg-[#19231c] shrink-0"
             >
               <ProjectHeader projectId={projectId} />
               <MessageContainer
@@ -273,7 +279,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
             <ResizableHandle withHandle className="bg-[#28382b] hover:bg-[#c75c35]/60 transition-colors" />
 
             {/* Right Column: Studio Canvas (Tabs for Preview & Code) */}
-            <ResizablePanel defaultSize={68} minSize={55} className="min-w-0 bg-[#17201a]">
+            <ResizablePanel defaultSize="65%" minSize={420} className="min-w-0 bg-[#17201a]">
               <Tabs
                 className="flex h-full flex-col"
                 defaultValue="preview"
@@ -375,12 +381,22 @@ export function ProjectView({ projectId }: { projectId: string }) {
                     />
                   ) : (
                     <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
-                      <div className="size-12 rounded-xl bg-[#202d24] border border-[#2e3e33] flex items-center justify-center text-[#c75c35]">
-                        <EyeIcon className="size-6" />
+                      <div className="size-12 rounded-xl bg-[#284938]/30 border border-[#284938]/60 flex items-center justify-center text-[#81aa80]">
+                        {isGenerating ? (
+                          <div className="w-5 h-5 border-2 border-[#81aa80] border-t-transparent rounded-full animate-spin" />
+                        ) : (
+                          <EyeIcon className="size-6 text-[#81aa80]" />
+                        )}
                       </div>
-                      <p className="text-sm font-medium text-[#eae8df]">Preview Initializing</p>
-                      <p className="text-xs max-w-sm text-[#8a9a8e]">
-                        The AI agent team is generating code and initializing the sandbox container. Preview will activate upon validation.
+                      <p className="text-sm font-medium text-[#eae8df]">
+                        {isGenerating
+                          ? `Multi-Agent Pipeline Active: ${activeRun?.status || "Planning"}`
+                          : "Preview Initializing"}
+                      </p>
+                      <p className="text-xs max-w-sm text-[#8a9a8e] leading-relaxed">
+                        {isGenerating
+                          ? "Agents are drafting specifications, generating full-stack source code, and executing sandbox tests. Real-time preview will render here upon validation."
+                          : "The AI agent team is preparing code and initializing the execution environment."}
                       </p>
                     </div>
                   )}

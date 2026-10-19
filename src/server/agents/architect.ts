@@ -5,6 +5,7 @@ import { SpecStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { agentOutputText } from "@/features/inngest/utils";
 import { extractUsageMetadata } from "@/server/observability/metrics";
+import { runWithoutStepContext } from "@/server/orchestration/async-context";
 
 export const ARCHITECT_PROMPT = `
 You are a Principal Software Architect & Systems Designer for CodeMytra.
@@ -101,7 +102,7 @@ export async function runArchitectureAgent(
   let hasAnyUsage = false;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await agent.run(currentPrompt);
+    const result = await runWithoutStepContext(() => agent.run(currentPrompt));
     const usage = extractUsageMetadata(result);
     if (usage) {
       hasAnyUsage = true;

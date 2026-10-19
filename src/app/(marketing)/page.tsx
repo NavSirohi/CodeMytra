@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { HeroActions } from "@/components/marketing/hero-actions";
 
 export const metadata: Metadata = {
   title: "Build something meaningful | CodeMytra",
@@ -21,17 +22,7 @@ export default function HomePage() {
             <p className="lede">
               From a neighbourhood business finding its first home online to a developer building their next product, CodeMytra helps turn a conversation into a workable web application.
             </p>
-            <div className="actions">
-              <Link className="btn" href="/builder">
-                Start with your idea <span aria-hidden="true">↗</span>
-              </Link>
-              <Link className="btn alt" href="/sign-in">
-                Sign In / Sign Up
-              </Link>
-              <Link className="btn alt" href="/how-it-works">
-                See how it works <span aria-hidden="true">↗</span>
-              </Link>
-            </div>
+            <HeroActions />
             <p className="micro">
               Plan the experience · Generate code · Preview and refine · Export your project
             </p>

@@ -28,7 +28,14 @@ const nextConfig: NextConfig = {
   // ─── Vercel / Serverless Function Limits ──────────────────────────────────
   // Long-running generation is handled by Inngest (outside request handling).
   // Normal Next.js routes keep a short timeout to stay within Vercel free tier.
-  serverExternalPackages: ["@prisma/client", "@prisma/adapter-pg", "pg"],
+  serverExternalPackages: [
+    "@prisma/client",
+    "@prisma/adapter-pg",
+    "pg",
+    "e2b",
+    "@e2b/code-interpreter",
+    "@opentelemetry/auto-instrumentations-node",
+  ],
 
   // ─── Image Optimisation ───────────────────────────────────────────────────
   images: {

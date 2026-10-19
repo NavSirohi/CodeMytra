@@ -47,6 +47,7 @@ import {
   checkGenerationDeadline,
   GENERATION_LIMITS,
 } from "@/server/orchestration/stage-optimizer";
+import { runWithoutStepContext } from "@/server/orchestration/async-context";
 
 export interface CodeAgentState {
   sandboxId: string;
@@ -247,7 +248,7 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 1: REQUIREMENTS & PLANNING (Planner Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
-    const prd = await step.run("planner-agent", async () => {
+    const prd = await step.run("planner-spec", async () => {
       checkGenerationDeadline(deadlineMs, "planning");
       await transitionRun(runId, GenerationRunStatus.PLANNING);
       const stageStart = Date.now();
@@ -315,7 +316,7 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 2: DESIGN SPECIFICATION (Design Agent with Gemini 2.5 Flash)
     // ─────────────────────────────────────────────────────────────────────────
-    const designSpec = await step.run("designer-agent", async () => {
+    const designSpec = await step.run("design-spec", async () => {
       checkGenerationDeadline(deadlineMs, "design");
       await transitionRun(runId, GenerationRunStatus.DESIGNING);
       const stageStart = Date.now();
@@ -373,7 +374,7 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 3: ARCHITECTURE & CONTRACTS (Architecture Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
-    const archSpec = await step.run("architect-agent", async () => {
+    const archSpec = await step.run("architecture-spec", async () => {
       checkGenerationDeadline(deadlineMs, "architecture");
       await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
       const stageStart = Date.now();
@@ -584,39 +585,53 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 6: TITLE & RESPONSE TEXT HELPERS (Auxiliary AI Calls)
     // ─────────────────────────────────────────────────────────────────────────
     const auxStageStart = Date.now();
-    const geminiModel = getGeminiModel({
-      model: "gemini-2.5-flash",
-    });
+    const { fragmentTitle, responseText, auxPromptTokens, auxCompletionTokens } = await step.run(
+      "generate-response-metadata",
+      async () => {
+        const geminiModel = getGeminiModel({
+          model: "gemini-2.5-flash",
+        });
 
-    const makeTextAgent = (name: string, system: string) =>
-      createAgent({ name, system, model: geminiModel });
+        const makeTextAgent = (name: string, system: string) =>
+          createAgent({ name, system, model: geminiModel });
 
-    const fragmentTitleGenerator = makeTextAgent(
-      "fragment-title-generator",
-      FRAGMENT_TITLE_PROMPT
+        const fragmentTitleGenerator = makeTextAgent(
+          "fragment-title-generator",
+          FRAGMENT_TITLE_PROMPT
+        );
+        const responseGenerator = makeTextAgent(
+          "response-generator",
+          RESPONSE_PROMPT
+        );
+
+        const [fragmentTitleResult, responseResult] = await runWithoutStepContext(() =>
+          Promise.all([
+            fragmentTitleGenerator.run(summary),
+            responseGenerator.run(summary),
+          ])
+        );
+
+        const title = agentOutputText(fragmentTitleResult.output, prd.projectName || "Application Update");
+        const respText = agentOutputText(responseResult.output, "Here is your built application.");
+
+        const fragUsage = extractUsageMetadata(fragmentTitleResult);
+        const respUsage = extractUsageMetadata(responseResult);
+        const hasAuxUsage = Boolean(fragUsage || respUsage);
+        const promptTokens = hasAuxUsage
+          ? (fragUsage?.promptTokens || 0) + (respUsage?.promptTokens || 0)
+          : undefined;
+        const completionTokens = hasAuxUsage
+          ? (fragUsage?.completionTokens || 0) + (respUsage?.completionTokens || 0)
+          : undefined;
+
+        return {
+          fragmentTitle: title,
+          responseText: respText,
+          auxPromptTokens: promptTokens,
+          auxCompletionTokens: completionTokens,
+        };
+      }
     );
-    const responseGenerator = makeTextAgent(
-      "response-generator",
-      RESPONSE_PROMPT
-    );
-
-    const [fragmentTitleResult, responseResult] = await Promise.all([
-      fragmentTitleGenerator.run(summary, { step }),
-      responseGenerator.run(summary, { step }),
-    ]);
-
-    const fragmentTitle = agentOutputText(fragmentTitleResult.output, prd.projectName || "Application Update");
-    const responseText = agentOutputText(responseResult.output, "Here is your built application.");
-
-    const fragUsage = extractUsageMetadata(fragmentTitleResult);
-    const respUsage = extractUsageMetadata(responseResult);
-    const hasAuxUsage = Boolean(fragUsage || respUsage);
-    const auxPromptTokens = hasAuxUsage
-      ? (fragUsage?.promptTokens || 0) + (respUsage?.promptTokens || 0)
-      : undefined;
-    const auxCompletionTokens = hasAuxUsage
-      ? (fragUsage?.completionTokens || 0) + (respUsage?.completionTokens || 0)
-      : undefined;
 
     await recordStageMetric({
       runId,

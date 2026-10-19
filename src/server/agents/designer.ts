@@ -5,6 +5,7 @@ import { Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { agentOutputText } from "@/features/inngest/utils";
 import { extractUsageMetadata } from "@/server/observability/metrics";
+import { runWithoutStepContext } from "@/server/orchestration/async-context";
 
 export const DESIGNER_PROMPT = `
 You are a Principal UI/UX Designer & Design Systems Architect for CodeMytra.
@@ -58,7 +59,9 @@ export async function runDesignAgent(prd: PRD, options?: DesignerOptions): Promi
     model,
   });
 
-  const result = await agent.run(`Project Requirements:\n${JSON.stringify(prd, null, 2)}`);
+  const result = await runWithoutStepContext(() =>
+    agent.run(`Project Requirements:\n${JSON.stringify(prd, null, 2)}`)
+  );
   const text = agentOutputText(result.output, "").trim();
   const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 

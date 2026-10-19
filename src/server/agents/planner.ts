@@ -5,6 +5,7 @@ import { SpecStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { agentOutputText } from "@/features/inngest/utils";
 import { extractUsageMetadata } from "@/server/observability/metrics";
+import { runWithoutStepContext } from "@/server/orchestration/async-context";
 
 export const PLANNER_PROMPT = `
 You are a Principal Software Planner & Product Requirements Engineer for CodeMytra.
@@ -103,7 +104,7 @@ You are modifying an existing, previously generated application.
     model,
   });
 
-  const result = await agent.run(userPrompt);
+  const result = await runWithoutStepContext(() => agent.run(userPrompt));
   const text = agentOutputText(result.output, "").trim();
   const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 

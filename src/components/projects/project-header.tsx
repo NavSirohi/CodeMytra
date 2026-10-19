@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { ChevronDownIcon, ChevronLeftIcon, SunMoonIcon } from "lucide-react";
 import { useTheme } from "next-themes";
-import { Chai0Mark } from "@/components/brand/chai0-logo";
+import { CodeMytraMark } from "@/components/brand/codemytra-logo";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -53,7 +53,7 @@ export default function ProjectHeader({ projectId }: { projectId: string }) {
               size="sm"
               className="h-8 gap-2 px-2 transition-opacity hover:bg-muted/50 focus-visible:ring-0"
             >
-              <Chai0Mark className="h-6 w-6" />
+              <CodeMytraMark className="h-6 w-6" />
               <div className="flex items-center gap-1.5 min-w-0 text-left">
                 <span className="text-xs font-semibold text-foreground/80 tracking-tight">Code<em className="text-[#c75c35] not-italic">Mytra</em></span>
                 <span className="text-muted-foreground/40 font-mono text-xs">/</span>

@@ -203,4 +203,112 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
     assert.equal(opts.id, "outbox-recovery");
     assert.deepEqual(opts.triggers, [{ cron: "*/5 * * * *" }]);
   });
+
+  it("regression: initial dispatch failure (fetch failed) transitions event to FAILED, then recovery worker successfully claims and delivers", async () => {
+    const originalQueryRaw = prisma.$queryRawUnsafe;
+    const originalInngestSend = inngest.send;
+
+    let inngestAvailable = false;
+    const queryCalls: { query: string; args: any[] }[] = [];
+    const inngestDispatched: any[] = [];
+
+    // State of the synthetic database event
+    const currentEvent: any = {
+      id: "evt-network-failure",
+      eventName: "code-agent/run",
+      payload: {
+        runId: "run-e2e-recovery",
+        projectId: "proj-e2e",
+        prompt: "Build SaaS marketing page",
+        baseRevisionId: null,
+      },
+      status: OutboxStatus.PENDING,
+      attempts: 0,
+      lastError: null,
+      claimedAt: null,
+      nextAttemptAt: null,
+      claimToken: null,
+      createdAt: new Date(),
+      processedAt: null,
+    };
+
+    prisma.$queryRawUnsafe = (async (query: string, ...args: any[]) => {
+      queryCalls.push({ query, args });
+
+      // Claim query (FOR UPDATE SKIP LOCKED)
+      if (query.includes("FOR UPDATE SKIP LOCKED")) {
+        // Can be claimed if PENDING or FAILED and attempts < max
+        if (currentEvent.status === OutboxStatus.PENDING || currentEvent.status === OutboxStatus.FAILED) {
+          currentEvent.status = OutboxStatus.PROCESSING;
+          currentEvent.attempts += 1;
+          currentEvent.claimedAt = new Date();
+          currentEvent.claimToken = "claim-tok-e2e-" + currentEvent.attempts;
+          return [currentEvent];
+        }
+        return [];
+      }
+
+      // Mark PROCESSED
+      if (query.includes("status = 'PROCESSED'")) {
+        currentEvent.status = OutboxStatus.PROCESSED;
+        currentEvent.processedAt = new Date();
+        currentEvent.claimToken = null;
+        currentEvent.claimedAt = null;
+        return [{ id: args[0] }];
+      }
+
+      // Mark FAILED
+      if (query.includes("status = 'FAILED'")) {
+        currentEvent.status = OutboxStatus.FAILED;
+        currentEvent.nextAttemptAt = args[1];
+        currentEvent.lastError = args[2];
+        currentEvent.claimToken = null;
+        currentEvent.claimedAt = null;
+        return [{ id: args[0] }];
+      }
+
+      return [{ id: args[0] }];
+    }) as unknown as typeof prisma.$queryRawUnsafe;
+
+    inngest.send = (async (payload: any) => {
+      if (!inngestAvailable) {
+        throw new TypeError("fetch failed: ECONNREFUSED 127.0.0.1:8288");
+      }
+      inngestDispatched.push(payload);
+      return { ids: ["inngest-evt-ok"] };
+    }) as any;
+
+    try {
+      // Step 1: Initial dispatch fails because Inngest local daemon is starting up
+      const { dispatchOutboxEvent } = await import("../src/server/orchestration/outbox");
+      const dispatchResult = await dispatchOutboxEvent("evt-network-failure");
+
+      assert.equal(dispatchResult.dispatched, false);
+      assert.match(dispatchResult.error || "", /fetch failed/);
+      assert.equal(currentEvent.status, OutboxStatus.FAILED);
+      assert.equal(currentEvent.attempts, 1);
+      assert.match(currentEvent.lastError, /fetch failed/);
+      assert.ok(currentEvent.nextAttemptAt instanceof Date);
+
+      // Step 2: Inngest becomes available / daemon starts up
+      inngestAvailable = true;
+
+      // Step 3: Scheduled recovery worker runs
+      const recoveryResult = await recoverStaleOutboxEvents();
+
+      assert.equal(recoveryResult.total, 1);
+      assert.equal(recoveryResult.recovered, 1);
+      assert.equal(recoveryResult.failed, 0);
+
+      // Step 4: Verify event was dispatched and transitioned to PROCESSED
+      assert.equal(currentEvent.status, OutboxStatus.PROCESSED);
+      assert.equal(currentEvent.attempts, 2);
+      assert.equal(inngestDispatched.length, 1);
+      assert.equal(inngestDispatched[0].id, "run-run-e2e-recovery");
+      assert.equal(inngestDispatched[0].data.projectId, "proj-e2e");
+    } finally {
+      prisma.$queryRawUnsafe = originalQueryRaw;
+      inngest.send = originalInngestSend;
+    }
+  });
 });

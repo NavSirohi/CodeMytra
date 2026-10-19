@@ -1,10 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { ExternalLink, RefreshCcw, History, Code, Download, AlertTriangle } from "lucide-react";
+import { ExternalLink, RefreshCcw, History, Code, Download, AlertTriangle, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Hint } from "@/components/ui/hint";
+import { useGetActiveGenerationRun, isGenerationActiveStatus } from "@/features/projects/hooks/projects";
 import type { ProjectFragment } from "@/features/projects/fragment-types";
 
 /**
@@ -31,6 +32,9 @@ export default function FragmentWeb({
 }) {
   const [fragmentKey, setFragmentKey] = useState(0);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
+
+  const { data: activeRun } = useGetActiveGenerationRun(projectId || "");
+  const isGenerating = isGenerationActiveStatus(activeRun?.status);
 
   const isHistorical = data.messageId === "historical";
 
@@ -234,6 +238,32 @@ export default function FragmentWeb({
               >
                 <Download className="size-3.5" />
                 <span>Export This Revision ZIP</span>
+              </Button>
+            )}
+          </div>
+        </div>
+      ) : isGenerating ? (
+        <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
+          <div className="size-12 rounded-xl bg-[#284938]/30 border border-[#284938]/60 flex items-center justify-center text-[#81aa80]">
+            <Loader2 className="size-6 animate-spin text-[#81aa80]" />
+          </div>
+          <h4 className="text-sm font-medium text-[#eae8df]">
+            Multi-Agent Pipeline Active: {activeRun?.status || "Generating"}
+          </h4>
+          <p className="text-xs text-[#8a9a8e] max-w-md leading-relaxed">
+            The multi-agent pipeline is executing durable steps (specifications, UI/UX tokens, implementation, and QA sandbox tests).
+            Live sandbox preview will activate automatically upon build validation.
+          </p>
+          <div className="flex items-center gap-2 mt-2">
+            {onViewCode && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onViewCode}
+                className="h-8 gap-1.5 text-xs border-[#2e3e33] bg-[#202d24] text-[#eae8df] hover:bg-[#28382b]"
+              >
+                <Code className="size-3.5" />
+                <span>Switch to Code Explorer</span>
               </Button>
             )}
           </div>
