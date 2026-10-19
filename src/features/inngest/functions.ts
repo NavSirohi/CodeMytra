@@ -34,17 +34,29 @@ import { getBaseProjectFiles, MissingDatabaseModelsError } from "@/server/templa
 import {
   recordStageMetric,
   aggregateAndPersistRunMetrics,
+  extractUsageMetadata,
 } from "@/server/observability/metrics";
 import {
   canBypassPlanningAndArchitecture,
   filterRelevantFiles,
   selectModelForStage,
+  checkGenerationTimeout,
+  GenerationTimeoutError,
 } from "@/server/orchestration/stage-optimizer";
 
 export interface CodeAgentState {
   sandboxId: string;
   summary: string;
   files: Record<string, string>;
+}
+
+interface AgentOutputUsage {
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+  modelId?: string;
 }
 
 function getE2BTemplateId(): string {
@@ -107,10 +119,15 @@ export const codeAgentFunction = inngest.createFunction(
             ? error.message.slice(0, 500)
             : "Generation failed after workflow retries.";
 
+        const isTimeout =
+          error instanceof GenerationTimeoutError ||
+          (typeof error?.message === "string" && error.message.includes("timed out"));
+        const errorCode = isTimeout ? "GENERATION_TIMEOUT" : "WORKFLOW_EXECUTION_FAILED";
+
         await finalizeGenerationFailure({
           generationRunId: runId,
           projectId,
-          errorCode: "WORKFLOW_EXECUTION_FAILED",
+          errorCode,
           errorMessage: safeErrorMessage,
         });
 
@@ -130,6 +147,7 @@ export const codeAgentFunction = inngest.createFunction(
     const runId = event.data.runId as string;
     const promptValue = event.data.value as string;
     const baseRevisionId = (event.data.baseRevisionId as string) || undefined;
+    const workflowStartTime = Date.now();
 
     // Enforce required persisted runId
     if (!runId) {
@@ -170,6 +188,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 1: REQUIREMENTS & PLANNING (Planner Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
     const prd = await step.run("planner-agent", async () => {
+      checkGenerationTimeout(workflowStartTime, "planning");
       await transitionRun(runId, GenerationRunStatus.PLANNING);
       const stageStart = Date.now();
       const plannerModel = selectModelForStage("planning", { isComplexFullstack: false });
@@ -215,13 +234,18 @@ export const codeAgentFunction = inngest.createFunction(
         `Generated PRD for ${generatedPRD.projectName} with ${generatedPRD.pages.length} pages`
       );
 
+      const plannerUsage = (generatedPRD as unknown as AgentOutputUsage).usage;
+      const plannerModelUsed = (generatedPRD as unknown as AgentOutputUsage).modelId || plannerModel;
+
       await recordStageMetric({
         runId,
         projectId,
         stageName: "planning",
-        modelId: plannerModel,
+        modelId: plannerModelUsed,
         startedAt: stageStart,
         finishedAt: Date.now(),
+        promptTokens: plannerUsage?.promptTokens,
+        completionTokens: plannerUsage?.completionTokens,
         details: { bypassed: false, pagesCount: generatedPRD.pages.length },
       });
 
@@ -232,6 +256,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 2: DESIGN SPECIFICATION (Design Agent with Gemini 2.5 Flash)
     // ─────────────────────────────────────────────────────────────────────────
     const designSpec = await step.run("designer-agent", async () => {
+      checkGenerationTimeout(workflowStartTime, "design");
       await transitionRun(runId, GenerationRunStatus.DESIGNING);
       const stageStart = Date.now();
       const designerModel = selectModelForStage("design");
@@ -267,13 +292,18 @@ export const codeAgentFunction = inngest.createFunction(
         `Selected ${spec.aestheticTheme} theme with primary color ${spec.colorPalette.primary}`
       );
 
+      const designerUsage = (spec as unknown as AgentOutputUsage).usage;
+      const designerModelUsed = (spec as unknown as AgentOutputUsage).modelId || designerModel;
+
       await recordStageMetric({
         runId,
         projectId,
         stageName: "design",
-        modelId: designerModel,
+        modelId: designerModelUsed,
         startedAt: stageStart,
         finishedAt: Date.now(),
+        promptTokens: designerUsage?.promptTokens,
+        completionTokens: designerUsage?.completionTokens,
         details: { bypassed: false, theme: spec.aestheticTheme },
       });
 
@@ -284,6 +314,7 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 3: ARCHITECTURE & CONTRACTS (Architecture Agent with Gemini 2.5 Pro)
     // ─────────────────────────────────────────────────────────────────────────
     const archSpec = await step.run("architect-agent", async () => {
+      checkGenerationTimeout(workflowStartTime, "architecture");
       await transitionRun(runId, GenerationRunStatus.ARCHITECTING);
       const stageStart = Date.now();
       const architectModel = selectModelForStage("architecture");
@@ -326,13 +357,18 @@ export const codeAgentFunction = inngest.createFunction(
         );
       }
 
+      const architectUsage = (spec as unknown as AgentOutputUsage).usage;
+      const architectModelUsed = (spec as unknown as AgentOutputUsage).modelId || architectModel;
+
       await recordStageMetric({
         runId,
         projectId,
         stageName: "architecture",
-        modelId: architectModel,
+        modelId: architectModelUsed,
         startedAt: stageStart,
         finishedAt: Date.now(),
+        promptTokens: architectUsage?.promptTokens,
+        completionTokens: architectUsage?.completionTokens,
         details: {
           bypassed: false,
           routesCount: spec.routeEndpoints.length,
@@ -352,6 +388,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     const sandboxId = await step.run("get-sandbox-id-and-restore", async () => {
+      checkGenerationTimeout(workflowStartTime, "sandbox-init");
       const stageStart = Date.now();
       // 1. Validate manifest before restoring
       if (baseRev?.manifest) {
@@ -442,6 +479,7 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 5: IMPLEMENTATION (Authoritative Coding Agent Engine)
     // ─────────────────────────────────────────────────────────────────────────
+    checkGenerationTimeout(workflowStartTime, "coding");
     const effectiveBaseFiles = Object.keys(baseFiles).length === 0
       ? getBaseProjectFiles({
           projectName: prd.projectName,
@@ -455,7 +493,7 @@ export const codeAgentFunction = inngest.createFunction(
     const coderModel = selectModelForStage("coding", { isComplexFullstack: archSpec.requiresDatabase });
     const codingStageStart = Date.now();
 
-    const { summary, files } = await runCodingAgent({
+    const { summary, files, usage: codingUsage, modelId: coderModelUsed } = await runCodingAgent({
       sandboxId,
       prompt: promptValue,
       prd,
@@ -472,17 +510,20 @@ export const codeAgentFunction = inngest.createFunction(
       runId,
       projectId,
       stageName: "coding",
-      modelId: coderModel,
+      modelId: coderModelUsed || coderModel,
       startedAt: codingStageStart,
       finishedAt: Date.now(),
+      promptTokens: codingUsage?.promptTokens,
+      completionTokens: codingUsage?.completionTokens,
       details: {
         filesCount: Object.keys(files || {}).length,
       },
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 6: TITLE & RESPONSE TEXT HELPERS
+    // STAGE 6: TITLE & RESPONSE TEXT HELPERS (Auxiliary AI Calls)
     // ─────────────────────────────────────────────────────────────────────────
+    const auxStageStart = Date.now();
     const geminiModel = getGeminiModel({
       model: "gemini-2.5-flash",
     });
@@ -499,23 +540,51 @@ export const codeAgentFunction = inngest.createFunction(
       RESPONSE_PROMPT
     );
 
-    const [{ output: fragmentTitleOutput }, { output: responseOutput }] =
-      await Promise.all([
-        fragmentTitleGenerator.run(summary, { step }),
-        responseGenerator.run(summary, { step }),
-      ]);
+    const [fragmentTitleResult, responseResult] = await Promise.all([
+      fragmentTitleGenerator.run(summary, { step }),
+      responseGenerator.run(summary, { step }),
+    ]);
 
-    const fragmentTitle = agentOutputText(fragmentTitleOutput, prd.projectName || "Application Update");
-    const responseText = agentOutputText(responseOutput, "Here is your built application.");
+    const fragmentTitle = agentOutputText(fragmentTitleResult.output, prd.projectName || "Application Update");
+    const responseText = agentOutputText(responseResult.output, "Here is your built application.");
+
+    const fragUsage = extractUsageMetadata(fragmentTitleResult);
+    const respUsage = extractUsageMetadata(responseResult);
+    const hasAuxUsage = Boolean(fragUsage || respUsage);
+    const auxPromptTokens = hasAuxUsage
+      ? (fragUsage?.promptTokens || 0) + (respUsage?.promptTokens || 0)
+      : undefined;
+    const auxCompletionTokens = hasAuxUsage
+      ? (fragUsage?.completionTokens || 0) + (respUsage?.completionTokens || 0)
+      : undefined;
+
+    await recordStageMetric({
+      runId,
+      projectId,
+      stageName: "auxiliary-text",
+      modelId: "gemini-2.5-flash",
+      startedAt: auxStageStart,
+      finishedAt: Date.now(),
+      promptTokens: auxPromptTokens,
+      completionTokens: auxCompletionTokens,
+      details: {
+        fragmentTitleGenerated: Boolean(fragmentTitle),
+        responseGenerated: Boolean(responseText),
+      },
+    });
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 7: QUALITY ASSURANCE, VERIFICATION & BOUNDED REPAIR
     // ─────────────────────────────────────────────────────────────────────────
     const qaResult = await step.run("qa-agent", async () => {
+      checkGenerationTimeout(workflowStartTime, "qa-and-repair");
       await transitionRun(runId, GenerationRunStatus.VALIDATING);
       await recordRunEvent(runId, "VALIDATING", "QA Agent", "Running comprehensive sandbox verification pipeline");
       const qaStageStart = Date.now();
       let repairAttempts = 0;
+      let repairPromptTokens: number | undefined;
+      let repairCompletionTokens: number | undefined;
+      let repairModelUsed: string | undefined;
 
       let currentFiles = { ...(files || {}) };
       let currentSummary = summary;
@@ -568,6 +637,11 @@ Conclude with an updated <task_summary>...</task_summary>.
           });
           currentFiles = repairResult.files;
           currentSummary = repairResult.summary;
+          if (repairResult.usage) {
+            repairPromptTokens = repairResult.usage.promptTokens;
+            repairCompletionTokens = repairResult.usage.completionTokens;
+          }
+          repairModelUsed = repairResult.modelId || repairModel;
 
           // Re-verify after repair attempt
           report = await runQAInspector({
@@ -614,8 +688,11 @@ Conclude with an updated <task_summary>...</task_summary>.
         runId,
         projectId,
         stageName: "qa-and-repair",
+        modelId: repairModelUsed,
         startedAt: qaStageStart,
         finishedAt: Date.now(),
+        promptTokens: repairPromptTokens,
+        completionTokens: repairCompletionTokens,
         details: {
           passed: report.passed,
           score: report.score,

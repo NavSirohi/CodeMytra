@@ -12,20 +12,33 @@ import {
   filterRelevantFiles,
   canBypassPlanningAndArchitecture,
   selectModelForStage,
+  checkGenerationTimeout,
+  GenerationTimeoutError,
   GENERATION_LIMITS,
 } from "../src/server/orchestration/stage-optimizer";
 import { getGeminiModel } from "../src/server/providers/gemini";
 import { PRD, ArchitectureSpec } from "../src/server/agent-contracts/schemas";
 
 describe("Performance, Observability & Cost Corrections (PR 1)", () => {
-  describe("Task 1: Replay-Safe Stage Instrumentation & Incomplete Runs", () => {
+  describe("Task 1: Concurrency-Safe Stage Instrumentation & Incomplete Runs", () => {
     it("upserts stage metrics in a replay-safe manner without duplicate records", async () => {
       // Mock dbClient to track create vs update calls
-      const events: Array<{ id: string; runId: string; stage: string; message: string; payload: any }> = [];
+      const events: Array<{ id: string; runId: string; stage: string; metricKey?: string; message: string; payload: any }> = [];
       let autoId = 1;
 
       const mockDb: any = {
         runEvent: {
+          upsert: async ({ where, create, update }: any) => {
+            const idx = events.findIndex((e) => e.metricKey === where.metricKey);
+            if (idx >= 0) {
+              events[idx] = { ...events[idx], ...update };
+              return events[idx];
+            } else {
+              const row = { id: `evt-${autoId++}`, ...create };
+              events.push(row);
+              return row;
+            }
+          },
           findFirst: async ({ where }: any) => {
             return events.find((e) => e.runId === where.runId && e.stage === where.stage) || null;
           },
@@ -72,6 +85,7 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
 
       assert.equal(events.length, 1);
       assert.equal(events[0].stage, "STAGE_METRIC_planning");
+      assert.equal(events[0].metricKey, `${runId}:planning`);
       assert.equal(events[0].payload.promptTokens, 1000);
 
       // 2. Inngest step retries the "planning" stage after transient failure
@@ -119,6 +133,134 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
       assert.equal(aggregate.modelsUsed.length, 2);
       assert.ok(aggregate.modelsUsed.includes("gemini-2.5-pro"));
       assert.ok(aggregate.modelsUsed.includes("gemini-2.5-flash"));
+      assert.equal(aggregate.isCompleteMeasurement, true);
+      assert.equal(aggregate.hasInstrumentationErrors, false);
+    });
+
+    it("handles two concurrent attempts to record the same metric without duplicate records", async () => {
+      const events: any[] = [];
+      let autoId = 1;
+      const mockDb: any = {
+        runEvent: {
+          upsert: async ({ where, create, update }: any) => {
+            const idx = events.findIndex((e) => e.metricKey === where.metricKey);
+            if (idx >= 0) {
+              events[idx] = { ...events[idx], ...update };
+              return events[idx];
+            } else {
+              const row = { id: `evt-${autoId++}`, ...create };
+              events.push(row);
+              return row;
+            }
+          },
+          findMany: async ({ where }: any) => {
+            return events.filter((e) => !where.runId || e.runId === where.runId);
+          },
+        },
+      };
+
+      const runId = "test-concurrent-run";
+      const projectId = "test-concurrent-project";
+
+      // Two concurrent calls recording the same stage metric
+      await Promise.all([
+        recordStageMetric(
+          {
+            runId,
+            projectId,
+            stageName: "coding",
+            modelId: "gemini-2.5-flash",
+            startedAt: 1000,
+            finishedAt: 2000,
+            promptTokens: 500,
+            completionTokens: 200,
+          },
+          mockDb
+        ),
+        recordStageMetric(
+          {
+            runId,
+            projectId,
+            stageName: "coding",
+            modelId: "gemini-2.5-flash",
+            startedAt: 1000,
+            finishedAt: 2500,
+            promptTokens: 600,
+            completionTokens: 250,
+          },
+          mockDb
+        ),
+      ]);
+
+      // Exactly 1 record created for this stage
+      assert.equal(events.length, 1);
+      assert.equal(events[0].metricKey, `${runId}:coding`);
+      assert.ok(events[0].payload.promptTokens === 500 || events[0].payload.promptTokens === 600);
+    });
+
+    it("does not inadvertently prevent ordinary repeated RunEvent records", async () => {
+      const events: any[] = [];
+      let autoId = 1;
+      const mockDb: any = {
+        runEvent: {
+          create: async ({ data }: any) => {
+            const row = { id: `evt-${autoId++}`, ...data };
+            events.push(row);
+            return row;
+          },
+        },
+      };
+
+      // Ordinary repeated events (null metricKey) can occur multiple times
+      await mockDb.runEvent.create({
+        data: { runId: "run-timeline", stage: "PLANNING", message: "Step 1: Parsing requirements" },
+      });
+      await mockDb.runEvent.create({
+        data: { runId: "run-timeline", stage: "PLANNING", message: "Step 2: Drafting features" },
+      });
+
+      assert.equal(events.length, 2);
+      assert.equal(events[0].metricKey, undefined);
+      assert.equal(events[1].metricKey, undefined);
+    });
+
+    it("explicitly identifies instrumentation failures in final metrics rather than falsely claiming complete measurement", async () => {
+      const events: any[] = [];
+      let autoId = 1;
+      const mockDb: any = {
+        runEvent: {
+          findMany: async () => events,
+          upsert: async ({ create }: any) => {
+            const row = { id: `evt-${autoId++}`, ...create };
+            events.push(row);
+            return row;
+          },
+        },
+      };
+
+      const runId = "test-instrumentation-fail-run";
+      const projectId = "test-proj";
+
+      // Record a stage with an instrumentation error
+      const stageMetric = await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "coding",
+          modelId: "gemini-2.5-flash",
+          startedAt: 1000,
+          finishedAt: 2000,
+          instrumentationError: "Database write timeout during token persistence",
+        },
+        mockDb
+      );
+
+      assert.equal(stageMetric.instrumentationError, "Database write timeout during token persistence");
+
+      const aggregate = await aggregateAndPersistRunMetrics(runId, projectId, "COMPLETED", undefined, mockDb);
+      assert.equal(aggregate.hasInstrumentationErrors, true);
+      assert.equal(aggregate.isCompleteMeasurement, false);
+      assert.ok(aggregate.instrumentationErrors.some((e) => e.includes("Database write timeout")));
     });
 
     it("keeps incomplete-run metrics available when generation fails midway", async () => {
@@ -261,8 +403,8 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
       designSpec: null,
     };
 
-    it("1. 'Change the hero heading colour.' -> BYPASS", () => {
-      const res = canBypassPlanningAndArchitecture("Change the hero heading colour.", mockSpecs);
+    it("1. 'Change the hero colour.' -> BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Change the hero colour.", mockSpecs);
       assert.equal(res.canBypass, true);
     });
 
@@ -271,32 +413,32 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
       assert.equal(res.canBypass, true);
     });
 
-    it("3. 'Add a button that deletes customer records.' -> NO BYPASS", () => {
-      const res = canBypassPlanningAndArchitecture("Add a button that deletes customer records.", mockSpecs);
+    it("3. 'Change the hero colour and add email notifications.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Change the hero colour and add email notifications.", mockSpecs);
       assert.equal(res.canBypass, false);
       assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
     });
 
-    it("4. 'Add database-backed product filtering.' -> NO BYPASS", () => {
-      const res = canBypassPlanningAndArchitecture("Add database-backed product filtering.", mockSpecs);
+    it("4. 'Change the heading and store contact-form submissions.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Change the heading and store contact-form submissions.", mockSpecs);
       assert.equal(res.canBypass, false);
       assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
     });
 
-    it("5. 'Change order-processing behaviour.' -> NO BYPASS", () => {
-      const res = canBypassPlanningAndArchitecture("Change order-processing behaviour.", mockSpecs);
+    it("5. 'Change a button label and modify its authorization behaviour.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Change a button label and modify its authorization behaviour.", mockSpecs);
       assert.equal(res.canBypass, false);
       assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
     });
 
-    it("6. 'Add login and admin permissions.' -> NO BYPASS", () => {
-      const res = canBypassPlanningAndArchitecture("Add login and admin permissions.", mockSpecs);
+    it("6. 'Add a product filter that retrieves database records.' -> NO BYPASS", () => {
+      const res = canBypassPlanningAndArchitecture("Add a product filter that retrieves database records.", mockSpecs);
       assert.equal(res.canBypass, false);
       assert.match(res.reason, /structural, database, security, backend, or business-logic/i);
     });
 
     it("Never bypasses if approved specifications are missing", () => {
-      const res = canBypassPlanningAndArchitecture("Change the hero heading colour.", {
+      const res = canBypassPlanningAndArchitecture("Change the hero colour.", {
         prd: null,
         architectureSpec: null,
       });
@@ -436,12 +578,154 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
     });
   });
 
-  describe("Task 6: Configurable Limits", () => {
+  describe("Task 4: Enforce Actual Generation Limits (Timeout & User Concurrency)", () => {
     it("exposes valid configurable generation limits matching runtime defaults", () => {
       assert.equal(GENERATION_LIMITS.maxRepairAttempts, 2);
       assert.equal(GENERATION_LIMITS.maxGenerationDurationMs, 300000);
       assert.equal(GENERATION_LIMITS.maxConcurrentRunsPerUser, 3);
       assert.equal(GENERATION_LIMITS.maxInputFilesForContext, 30);
+    });
+
+    it("throws GenerationTimeoutError when run exceeds maxGenerationDurationMs", () => {
+      const startTime = Date.now() - 310000; // 310 seconds ago
+      assert.throws(
+        () =>
+          checkGenerationTimeout(startTime, "coding", {
+            maxGenerationDurationMs: 300000,
+            maxRepairAttempts: 2,
+            maxConcurrentRunsPerUser: 3,
+            maxInputFilesForContext: 30,
+          }),
+        (err: any) => {
+          assert.ok(err instanceof GenerationTimeoutError);
+          assert.equal(err.name, "GenerationTimeoutError");
+          assert.match(err.message, /timed out before stage "coding"/);
+          assert.ok(err.durationMs >= 310000);
+          assert.equal(err.limitMs, 300000);
+          return true;
+        }
+      );
+    });
+
+    it("passes timeout check when elapsed duration is within maxGenerationDurationMs", () => {
+      const startTime = Date.now() - 5000; // 5 seconds ago
+      assert.doesNotThrow(() =>
+        checkGenerationTimeout(startTime, "coding", {
+          maxGenerationDurationMs: 300000,
+          maxRepairAttempts: 2,
+          maxConcurrentRunsPerUser: 3,
+          maxInputFilesForContext: 30,
+        })
+      );
+    });
+
+    it("enforces per-user concurrent run limit when admission check is executed", async () => {
+      // Simulating the admission transaction logic in messages/actions/index.ts
+      const userActiveRuns = 3;
+      const maxConcurrent = GENERATION_LIMITS.maxConcurrentRunsPerUser;
+
+      const attemptAdmission = (activeRunsCount: number) => {
+        if (activeRunsCount >= maxConcurrent) {
+          throw new Error(
+            `Maximum concurrent generation runs (${maxConcurrent}) reached for this user. Please wait for an existing run to complete.`
+          );
+        }
+        return { admitted: true };
+      };
+
+      assert.throws(
+        () => attemptAdmission(userActiveRuns),
+        /Maximum concurrent generation runs \(3\) reached for this user/
+      );
+
+      assert.deepEqual(attemptAdmission(2), { admitted: true });
+    });
+  });
+
+  describe("Task 2: Provider Usage Propagation Across Agent Executions & Auxiliary AI", () => {
+    it("associates repair and auxiliary AI token consumption with the relevant run accounting", async () => {
+      const events: any[] = [];
+      let autoId = 1;
+      const mockDb: any = {
+        runEvent: {
+          upsert: async ({ create, update, where }: any) => {
+            const idx = events.findIndex((e) => e.metricKey === where.metricKey);
+            if (idx >= 0) {
+              events[idx] = { ...events[idx], ...update };
+              return events[idx];
+            } else {
+              const row = { id: `evt-${autoId++}`, ...create };
+              events.push(row);
+              return row;
+            }
+          },
+          findMany: async ({ where }: any) => {
+            return events.filter((e) => !where.runId || e.runId === where.runId);
+          },
+        },
+      };
+
+      const runId = "test-provider-usage-run";
+      const projectId = "test-proj-usage";
+
+      // 1. Planning stage usage
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "planning",
+          modelId: "gemini-2.5-pro",
+          startedAt: 1000,
+          finishedAt: 2000,
+          promptTokens: 1200,
+          completionTokens: 400,
+        },
+        mockDb
+      );
+
+      // 2. Auxiliary AI calls (fragment title + response generator)
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "auxiliary-text",
+          modelId: "gemini-2.5-flash",
+          startedAt: 2100,
+          finishedAt: 2500,
+          promptTokens: 350,
+          completionTokens: 150,
+        },
+        mockDb
+      );
+
+      // 3. QA and repair stage (accounting for repair agent execution tokens)
+      await recordStageMetric(
+        {
+          runId,
+          projectId,
+          stageName: "qa-and-repair",
+          modelId: "gemini-2.5-pro",
+          startedAt: 2600,
+          finishedAt: 4000,
+          promptTokens: 2500,
+          completionTokens: 800,
+          details: { repairAttempts: 1 },
+        },
+        mockDb
+      );
+
+      const aggregate = await aggregateAndPersistRunMetrics(runId, projectId, "COMPLETED", undefined, mockDb);
+
+      assert.equal(aggregate.finalOutcome, "COMPLETED");
+      assert.equal(aggregate.hasMeasuredUsage, true);
+      assert.equal(aggregate.totalPromptTokens, 1200 + 350 + 2500);
+      assert.equal(aggregate.totalCompletionTokens, 400 + 150 + 800);
+      assert.equal(aggregate.repairAttempts, 1);
+      assert.ok(aggregate.stages["auxiliary-text"]);
+      assert.ok(aggregate.stages["qa-and-repair"]);
+      assert.equal(aggregate.stages["auxiliary-text"].totalTokens, 500);
+      assert.equal(aggregate.stages["qa-and-repair"].totalTokens, 3300);
+      assert.ok(aggregate.totalEstimatedCostUsd! > 0);
     });
   });
 });

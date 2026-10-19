@@ -177,6 +177,7 @@ export interface StageMetric {
   estimatedCostUsd?: number;
   pricingAssumptions?: ModelRate;
   details?: Record<string, unknown>;
+  instrumentationError?: string;
 }
 
 export interface SandboxMetric {
@@ -204,6 +205,9 @@ export interface GenerationRunMetrics {
   finalOutcome: "COMPLETED" | "FAILED" | "CANCELLED";
   pricingAssumptions: Record<string, ModelRate>;
   costDisclaimer: string;
+  hasInstrumentationErrors: boolean;
+  instrumentationErrors: string[];
+  isCompleteMeasurement: boolean;
 }
 
 export interface RecordStageMetricParams {
@@ -217,12 +221,14 @@ export interface RecordStageMetricParams {
   completionTokens?: number;
   details?: Record<string, unknown>;
   pricingConfig?: PricingConfig;
+  instrumentationError?: string;
 }
 
 /**
  * Replay-safe stage metric persistence.
- * Upserts the stage metric into RunEvent with stage `STAGE_METRIC_${stageName}`.
- * If an Inngest step retries, it updates the existing stage event rather than duplicating it.
+ * Upserts the stage metric into RunEvent with unique metricKey `${runId}:${stageName}`.
+ * If an Inngest step retries or concurrent attempts occur, it updates the existing stage event
+ * atomically using database-level uniqueness rather than duplicating it.
  */
 export async function recordStageMetric(
   params: RecordStageMetricParams,
@@ -234,6 +240,7 @@ export async function recordStageMetric(
     modelId,
     details,
     pricingConfig = getModelPricingConfig(),
+    instrumentationError,
   } = params;
 
   const startMs = typeof params.startedAt === "number"
@@ -268,41 +275,64 @@ export async function recordStageMetric(
     estimatedCostUsd: costUsd,
     pricingAssumptions: rateUsed,
     details,
+    instrumentationError,
   };
 
   const stageKey = `STAGE_METRIC_${stageName}`;
+  const metricKey = `${runId}:${stageName}`;
   const costText = costUsd !== undefined ? `$${costUsd.toFixed(4)} (indicative)` : "unmeasured";
   const tokensText = totalTokens !== undefined ? `${totalTokens} tokens` : "unmeasured tokens";
 
   try {
-    const existing = await dbClient.runEvent.findFirst({
-      where: {
-        runId,
-        stage: stageKey,
-      },
-      orderBy: { createdAt: "desc" },
-    });
-
-    if (existing) {
-      await dbClient.runEvent.update({
-        where: { id: existing.id },
-        data: {
+    if (typeof dbClient.runEvent.upsert === "function") {
+      await dbClient.runEvent.upsert({
+        where: { metricKey },
+        update: {
+          stage: stageKey,
+          agentRole: "Observability Engine",
           message: `Stage ${stageName} metric updated: duration ${durationMs}ms, ${tokensText}, estimated cost: ${costText}`,
           payload: metric as unknown as Prisma.InputJsonObject,
         },
-      });
-    } else {
-      await dbClient.runEvent.create({
-        data: {
+        create: {
           runId,
           stage: stageKey,
           agentRole: "Observability Engine",
           message: `Stage ${stageName} metric recorded: duration ${durationMs}ms, ${tokensText}, estimated cost: ${costText}`,
           payload: metric as unknown as Prisma.InputJsonObject,
+          metricKey,
         },
       });
+    } else {
+      // Fallback for mock environments lacking upsert
+      const existing = await dbClient.runEvent.findFirst({
+        where: { runId, stage: stageKey },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (existing) {
+        await dbClient.runEvent.update({
+          where: { id: existing.id },
+          data: {
+            message: `Stage ${stageName} metric updated: duration ${durationMs}ms, ${tokensText}, estimated cost: ${costText}`,
+            payload: metric as unknown as Prisma.InputJsonObject,
+          },
+        });
+      } else {
+        await dbClient.runEvent.create({
+          data: {
+            runId,
+            stage: stageKey,
+            agentRole: "Observability Engine",
+            message: `Stage ${stageName} metric recorded: duration ${durationMs}ms, ${tokensText}, estimated cost: ${costText}`,
+            payload: metric as unknown as Prisma.InputJsonObject,
+            metricKey,
+          },
+        });
+      }
     }
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    metric.instrumentationError = errorMsg;
     console.error(`[recordStageMetric] Failed to persist stage metric for ${stageName}:`, err);
   }
 
@@ -330,6 +360,7 @@ export async function aggregateAndPersistRunMetrics(
   });
 
   const stages: Record<string, StageMetric> = {};
+  const instrumentationErrors: string[] = [];
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
   let totalEstimatedCostUsd = 0;
@@ -348,6 +379,10 @@ export async function aggregateAndPersistRunMetrics(
     const stageMetric = event.payload as unknown as StageMetric;
     const stageName = stageMetric.stageName || event.stage.replace("STAGE_METRIC_", "");
     stages[stageName] = stageMetric;
+
+    if (stageMetric.instrumentationError) {
+      instrumentationErrors.push(`${stageName}: ${stageMetric.instrumentationError}`);
+    }
 
     totalDurationMs += stageMetric.durationMs || 0;
     const sStart = new Date(stageMetric.startedAt).getTime();
@@ -410,6 +445,9 @@ export async function aggregateAndPersistRunMetrics(
   if (earliestStart > Date.now()) earliestStart = Date.now();
   if (latestEnd === 0) latestEnd = Date.now();
 
+  const hasInstrumentationErrors = instrumentationErrors.length > 0;
+  const isCompleteMeasurement = !hasInstrumentationErrors && Object.keys(stages).length > 0;
+
   const finalMetrics: GenerationRunMetrics = {
     runId,
     projectId,
@@ -428,6 +466,9 @@ export async function aggregateAndPersistRunMetrics(
     finalOutcome: outcome,
     pricingAssumptions,
     costDisclaimer: COST_DISCLAIMER,
+    hasInstrumentationErrors,
+    instrumentationErrors,
+    isCompleteMeasurement,
   };
 
   const costStr = finalMetrics.totalEstimatedCostUsd !== undefined
@@ -437,35 +478,62 @@ export async function aggregateAndPersistRunMetrics(
     ? `${finalMetrics.totalTokens} tokens`
     : "unmeasured tokens";
 
-  try {
-    const existingAggregate = await dbClient.runEvent.findFirst({
-      where: {
-        runId,
-        stage: "METRICS_RECORDED",
-      },
-      orderBy: { createdAt: "desc" },
-    });
+  const aggMetricKey = `${runId}:AGGREGATE_METRICS`;
 
-    if (existingAggregate) {
-      await dbClient.runEvent.update({
-        where: { id: existingAggregate.id },
-        data: {
-          message: `Generation metrics aggregated (${outcome}): duration ${finalMetrics.totalDurationMs}ms, ${tokenStr}, estimated cost ${costStr}`,
-          payload: finalMetrics as unknown as Prisma.InputJsonObject,
-        },
-      });
-    } else {
-      await dbClient.runEvent.create({
-        data: {
-          runId,
+  try {
+    if (typeof dbClient.runEvent.upsert === "function") {
+      await dbClient.runEvent.upsert({
+        where: { metricKey: aggMetricKey },
+        update: {
           stage: "METRICS_RECORDED",
           agentRole: "Observability Engine",
           message: `Generation metrics aggregated (${outcome}): duration ${finalMetrics.totalDurationMs}ms, ${tokenStr}, estimated cost ${costStr}`,
           payload: finalMetrics as unknown as Prisma.InputJsonObject,
         },
+        create: {
+          runId,
+          stage: "METRICS_RECORDED",
+          agentRole: "Observability Engine",
+          message: `Generation metrics aggregated (${outcome}): duration ${finalMetrics.totalDurationMs}ms, ${tokenStr}, estimated cost ${costStr}`,
+          payload: finalMetrics as unknown as Prisma.InputJsonObject,
+          metricKey: aggMetricKey,
+        },
       });
+    } else {
+      const existingAggregate = await dbClient.runEvent.findFirst({
+        where: {
+          runId,
+          stage: "METRICS_RECORDED",
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (existingAggregate) {
+        await dbClient.runEvent.update({
+          where: { id: existingAggregate.id },
+          data: {
+            message: `Generation metrics aggregated (${outcome}): duration ${finalMetrics.totalDurationMs}ms, ${tokenStr}, estimated cost ${costStr}`,
+            payload: finalMetrics as unknown as Prisma.InputJsonObject,
+          },
+        });
+      } else {
+        await dbClient.runEvent.create({
+          data: {
+            runId,
+            stage: "METRICS_RECORDED",
+            agentRole: "Observability Engine",
+            message: `Generation metrics aggregated (${outcome}): duration ${finalMetrics.totalDurationMs}ms, ${tokenStr}, estimated cost ${costStr}`,
+            payload: finalMetrics as unknown as Prisma.InputJsonObject,
+            metricKey: aggMetricKey,
+          },
+        });
+      }
     }
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    finalMetrics.hasInstrumentationErrors = true;
+    finalMetrics.isCompleteMeasurement = false;
+    finalMetrics.instrumentationErrors.push(`persistence: ${errorMsg}`);
     console.error("[aggregateAndPersistRunMetrics] Failed to persist aggregated metrics:", err);
   }
 
@@ -606,6 +674,12 @@ export class GenerationMetricsCollector {
     this.repairAttempts += 1;
   }
 
+  public recordInstrumentationError(stageName: string, error: string) {
+    if (this.stages[stageName]) {
+      this.stages[stageName].instrumentationError = error;
+    }
+  }
+
   public finalize(outcome: "COMPLETED" | "FAILED" | "CANCELLED" = "COMPLETED"): GenerationRunMetrics {
     const endMs = Date.now();
     const totalDurationMs = Math.max(1, endMs - this.startedAt);
@@ -617,8 +691,12 @@ export class GenerationMetricsCollector {
     let hasMeasuredCost = false;
     const modelsUsedSet = new Set<string>();
     const pricingAssumptions: Record<string, ModelRate> = {};
+    const instrumentationErrors: string[] = [];
 
     for (const stage of Object.values(this.stages)) {
+      if (stage.instrumentationError) {
+        instrumentationErrors.push(`${stage.stageName}: ${stage.instrumentationError}`);
+      }
       if (stage.usageMeasured) {
         hasMeasuredUsage = true;
         totalPromptTokens += stage.promptTokens || 0;
@@ -635,6 +713,9 @@ export class GenerationMetricsCollector {
         }
       }
     }
+
+    const hasInstrumentationErrors = instrumentationErrors.length > 0;
+    const isCompleteMeasurement = !hasInstrumentationErrors && Object.keys(this.stages).length > 0;
 
     return {
       runId: this.runId,
@@ -654,6 +735,9 @@ export class GenerationMetricsCollector {
       finalOutcome: outcome,
       pricingAssumptions,
       costDisclaimer: COST_DISCLAIMER,
+      hasInstrumentationErrors,
+      instrumentationErrors,
+      isCompleteMeasurement,
     };
   }
 

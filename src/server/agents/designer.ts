@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db";
 import { Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { agentOutputText } from "@/features/inngest/utils";
+import { extractUsageMetadata } from "@/server/observability/metrics";
 
 export const DESIGNER_PROMPT = `
 You are a Principal UI/UX Designer & Design Systems Architect for CodeMytra.
@@ -61,9 +62,19 @@ export async function runDesignAgent(prd: PRD, options?: DesignerOptions): Promi
   const text = agentOutputText(result.output, "").trim();
   const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 
+  const usage = extractUsageMetadata(result);
+
   try {
     const rawJson = JSON.parse(cleaned);
-    return DesignSpecSchema.parse(rawJson);
+    const spec = DesignSpecSchema.parse(rawJson) as DesignSpec & {
+      usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+      modelId?: string;
+    };
+    if (usage) {
+      spec.usage = usage;
+    }
+    spec.modelId = selectedModel;
+    return spec;
   } catch (error) {
     console.error("[Designer] Failed to parse DesignSpec output:", error, "Raw response:", text);
     // Safe default design spec

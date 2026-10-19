@@ -20,11 +20,26 @@ import {
 import {
   lastAssistantTextMessageContent,
 } from "@/features/inngest/utils";
+import { extractUsageMetadata } from "@/server/observability/metrics";
 
 export interface CodeAgentState {
   sandboxId: string;
   summary: string;
   files: Record<string, string>;
+  promptTokens?: number;
+  completionTokens?: number;
+  hasUsage?: boolean;
+}
+
+export interface CodingAgentResult {
+  files: Record<string, string>;
+  summary: string;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+  modelId?: string;
 }
 
 export interface InngestStepLike {
@@ -659,6 +674,12 @@ export async function runCodingAgent(
             network.state.data.summary = lastText;
           }
         }
+        const stepUsage = extractUsageMetadata(result);
+        if (stepUsage && network?.state?.data) {
+          network.state.data.promptTokens = (network.state.data.promptTokens || 0) + (stepUsage.promptTokens || 0);
+          network.state.data.completionTokens = (network.state.data.completionTokens || 0) + (stepUsage.completionTokens || 0);
+          network.state.data.hasUsage = true;
+        }
         return result;
       },
     },
@@ -689,8 +710,25 @@ export async function runCodingAgent(
     cleanedSummary = `Built ${prd.projectName} with ${Object.keys(finalFiles).length} files adhering to approved PRD and design guidelines.`;
   }
 
+  const networkUsage = extractUsageMetadata(result);
+  let finalUsage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
+
+  if (result.state.data.hasUsage) {
+    const pt = result.state.data.promptTokens || 0;
+    const ct = result.state.data.completionTokens || 0;
+    finalUsage = {
+      promptTokens: pt,
+      completionTokens: ct,
+      totalTokens: pt + ct,
+    };
+  } else if (networkUsage) {
+    finalUsage = networkUsage;
+  }
+
   return {
     files: finalFiles,
     summary: cleanedSummary,
+    usage: finalUsage,
+    modelId: selectedModel,
   };
 }

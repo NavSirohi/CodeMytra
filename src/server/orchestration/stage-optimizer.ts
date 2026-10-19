@@ -42,6 +42,36 @@ export function selectModelForStage(
   return "gemini-2.5-flash";
 }
 
+export class GenerationTimeoutError extends Error {
+  constructor(
+    message: string,
+    public readonly durationMs: number,
+    public readonly limitMs: number
+  ) {
+    super(message);
+    this.name = "GenerationTimeoutError";
+  }
+}
+
+/**
+ * Checks whether the current generation run has exceeded its maximum configured duration.
+ * Throws a GenerationTimeoutError if the limit is exceeded.
+ */
+export function checkGenerationTimeout(
+  startedAtMs: number,
+  stageName: string,
+  limits: GenerationLimits = GENERATION_LIMITS
+): void {
+  const elapsedMs = Date.now() - startedAtMs;
+  if (elapsedMs > limits.maxGenerationDurationMs) {
+    throw new GenerationTimeoutError(
+      `Generation timed out before stage "${stageName}": elapsed ${elapsedMs}ms exceeds limit of ${limits.maxGenerationDurationMs}ms`,
+      elapsedMs,
+      limits.maxGenerationDurationMs
+    );
+  }
+}
+
 /**
  * Task 3: Conservative fast-path check.
  * Only allow obvious cosmetic modifications to reuse existing planning and architecture specifications.
@@ -65,16 +95,25 @@ export function canBypassPlanningAndArchitecture(
   const p = prompt.toLowerCase().trim();
 
   // 1. Strict Non-Cosmetic Rejection Triggers:
-  // If prompt matches ANY backend, database, auth, permission, payment, API, business rule, or data operation:
+  // If prompt matches ANY backend, database, auth, permission, payment, API, business rule, notification,
+  // storage, submission, data retrieval, or filtering operation:
   const nonCosmeticPatterns = [
     // Database & data operations
     /\b(database|db|prisma|sqlite|sql|postgres|table|schema|migration|seed)\b/,
     /\b(model|models|entity|entities|record|records)\b/,
     /\b(delete|deletes|deleted|deleting|remove|destroy|insert|create\s+record|update\s+record)\b/,
     /\b(customer|customers|user\s+account|user\s+records)\b/,
+    // Data storage, persistence & form submissions
+    /\b(store|stores|stored|storing|storage|submit|submits|submitted|submitting|submission|submissions)\b/,
+    /\b(retrieve|retrieves|retrieving|retrieval|query|queries|fetch|fetching)\b/,
+    /\b(form|forms|contact-form|lead|leads|collect|collection)\b/,
+    // Dynamic filtering, search & pagination
+    /\b(filter|filters|filtering|search|searching|sort|sorting|paginate|pagination)\b/,
+    // Notifications & messaging
+    /\b(email|emails|notification|notifications|notify|notifying|message|messages|messaging|sms|alert|alerts)\b/,
     // Authentication & authorization
     /\b(auth|authentication|authenticate|login|logout|signin|signup|sign\s+in|sign\s+up|register)\b/,
-    /\b(admin|permission|permissions|role|roles|rbac|privilege|credential|session|jwt|token)\b/,
+    /\b(admin|permission|permissions|role|roles|rbac|privilege|credential|session|jwt|token|access\s+control)\b/,
     // Payment & billing
     /\b(payment|payments|pay|stripe|billing|invoice|checkout|subscription|charge|credit)\b/,
     // API & backend endpoints
@@ -102,7 +141,7 @@ export function canBypassPlanningAndArchitecture(
     /\b(heading|subtitle|title|text|copy|caption|placeholder|label)\b/,
     /\b(font|fonts|typography|size|line-height|letter-spacing)\b/,
     /\b(padding|margin|gap|spacing|alignment|center|justify)\b/,
-    /\b(hero\s+heading|hero\s+section\s+color|background|surface\s+color|border|shadow|rounded|radius)\b/,
+    /\b(hero\s+heading|hero\s+section\s+color|hero\s+colour|hero\s+color|background|surface\s+color|border|shadow|rounded|radius)\b/,
   ];
 
   const isExplicitlyCosmetic = cosmeticPatterns.some((pattern) => pattern.test(p));

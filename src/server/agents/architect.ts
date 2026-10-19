@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db";
 import { SpecStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { agentOutputText } from "@/features/inngest/utils";
+import { extractUsageMetadata } from "@/server/observability/metrics";
 
 export const ARCHITECT_PROMPT = `
 You are a Principal Software Architect & Systems Designer for CodeMytra.
@@ -95,16 +96,37 @@ export async function runArchitectureAgent(
   let currentPrompt = `PRD:\n${JSON.stringify(prd, null, 2)}\n\nDesignSpec:\n${JSON.stringify(designSpec, null, 2)}`;
   let lastError: unknown = null;
   let lastText = "";
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+  let hasAnyUsage = false;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const result = await agent.run(currentPrompt);
+    const usage = extractUsageMetadata(result);
+    if (usage) {
+      hasAnyUsage = true;
+      totalPromptTokens += usage.promptTokens || 0;
+      totalCompletionTokens += usage.completionTokens || 0;
+    }
     const text = agentOutputText(result.output, "").trim();
     lastText = text;
     const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
 
     try {
       const rawJson = JSON.parse(cleaned);
-      return ArchitectureSpecSchema.parse(rawJson);
+      const spec = ArchitectureSpecSchema.parse(rawJson) as ArchitectureSpec & {
+        usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+        modelId?: string;
+      };
+      if (hasAnyUsage) {
+        spec.usage = {
+          promptTokens: totalPromptTokens,
+          completionTokens: totalCompletionTokens,
+          totalTokens: totalPromptTokens + totalCompletionTokens,
+        };
+      }
+      spec.modelId = selectedModel;
+      return spec;
     } catch (error) {
       lastError = error;
       console.warn(`[Architect] Attempt ${attempt + 1}/${maxRetries + 1} failed schema validation:`, error);

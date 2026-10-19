@@ -4,6 +4,7 @@ import { getCurrentUser } from "@/features/auth/actions";
 import { prisma } from "@/lib/db";
 import { MessageRole, MessageType, GenerationRunStatus } from "@/generated/prisma/client";
 import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
+import { GENERATION_LIMITS } from "@/server/orchestration/stage-optimizer";
 
 /**
  * Create a new user message in a project and kick off a durable agent run.
@@ -73,6 +74,30 @@ export const createMessage = async (value: string, projectId: string) => {
 
     if (activeRun) {
       throw new Error("A generation run is already in progress for this project. Please wait for it to complete.");
+    }
+
+    // 4. Enforce per-user concurrent run limit across all user projects
+    const userActiveRunsCount = await tx.generationRun.count({
+      where: {
+        userId: user.id,
+        status: {
+          in: [
+            GenerationRunStatus.QUEUED,
+            GenerationRunStatus.PLANNING,
+            GenerationRunStatus.AWAITING_APPROVAL,
+            GenerationRunStatus.DESIGNING,
+            GenerationRunStatus.ARCHITECTING,
+            GenerationRunStatus.RUNNING,
+            GenerationRunStatus.VALIDATING,
+          ],
+        },
+      },
+    });
+
+    if (userActiveRunsCount >= GENERATION_LIMITS.maxConcurrentRunsPerUser) {
+      throw new Error(
+        `Maximum concurrent generation runs (${GENERATION_LIMITS.maxConcurrentRunsPerUser}) reached for this user. Please wait for an existing run to complete.`
+      );
     }
 
     const message = await tx.message.create({

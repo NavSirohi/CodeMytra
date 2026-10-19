@@ -202,6 +202,7 @@ model RunEvent {
   agentRole String?
   message   String
   payload   Json?
+  metricKey String?       @unique
   createdAt DateTime      @default(now())
 
   @@index([runId, createdAt])

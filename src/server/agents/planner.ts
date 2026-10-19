@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db";
 import { SpecStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { agentOutputText } from "@/features/inngest/utils";
+import { extractUsageMetadata } from "@/server/observability/metrics";
 
 export const PLANNER_PROMPT = `
 You are a Principal Software Planner & Product Requirements Engineer for CodeMytra.
@@ -108,7 +109,16 @@ You are modifying an existing, previously generated application.
 
   try {
     const rawJson = JSON.parse(cleaned);
-    return PRDSchema.parse(rawJson);
+    const parsedPrd = PRDSchema.parse(rawJson) as PRD & {
+      usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+      modelId?: string;
+    };
+    const usage = extractUsageMetadata(result);
+    if (usage) {
+      parsedPrd.usage = usage;
+    }
+    parsedPrd.modelId = selectedModel;
+    return parsedPrd;
   } catch (error) {
     console.error("[Planner] Failed to parse PRD output:", error, "Raw response:", text);
     throw new PlannerError(
