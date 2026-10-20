@@ -615,19 +615,20 @@ export const codeAgentFunction = inngest.createFunction(
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 5: IMPLEMENTATION (Authoritative Coding Agent Engine)
     // ─────────────────────────────────────────────────────────────────────────
-    checkGenerationDeadline(deadlineMs, "coding");
-
-    const isCodingActive = await isRunActiveInDb(runId);
-    if (!isCodingActive) {
-      throw new RunAbortedError(`Generation run ${runId} is no longer active in database`);
-    }
-
-    await recordRunEvent(
-      runId,
-      "CODING",
-      "Code Agent",
-      "Beginning code generation with authoritative AgentKit coder"
-    );
+    await step.run("check-coding-active", async () => {
+      checkGenerationDeadline(deadlineMs, "coding");
+      const isCodingActive = await isRunActiveInDb(runId);
+      if (!isCodingActive) {
+        throw new RunAbortedError(`Generation run ${runId} is no longer active in database`);
+      }
+      await recordRunEvent(
+        runId,
+        "CODING",
+        "Code Agent",
+        "Beginning code generation with authoritative AgentKit coder"
+      );
+      return { active: true };
+    });
 
     const effectiveBaseFiles = Object.keys(baseFiles).length === 0
       ? getBaseProjectFiles({
@@ -662,24 +663,26 @@ export const codeAgentFunction = inngest.createFunction(
       tokenBudget: GENERATION_LIMITS.maxRunTokenBudget,
     }));
 
-    const isPostCodingActive = await isRunActiveInDb(runId);
-    if (!isPostCodingActive) {
-      throw new RunAbortedError(`Generation run ${runId} was marked terminal during coding stage`);
-    }
-
-    await recordStageMetric({
-      runId,
-      projectId,
-      stageName: "coding",
-      modelId: coderModelUsed || coderModel,
-      startedAt: codingStageStart,
-      finishedAt: Date.now(),
-      promptTokens: codingUsage?.promptTokens,
-      completionTokens: codingUsage?.completionTokens,
-      details: {
-        filesCount: Object.keys(files || {}).length,
-        modelPreference,
-      },
+    await step.run("check-post-coding-active", async () => {
+      const isPostCodingActive = await isRunActiveInDb(runId);
+      if (!isPostCodingActive) {
+        throw new RunAbortedError(`Generation run ${runId} was marked terminal during coding stage`);
+      }
+      await recordStageMetric({
+        runId,
+        projectId,
+        stageName: "coding",
+        modelId: coderModelUsed || coderModel,
+        startedAt: codingStageStart,
+        finishedAt: Date.now(),
+        promptTokens: codingUsage?.promptTokens,
+        completionTokens: codingUsage?.completionTokens,
+        details: {
+          filesCount: Object.keys(files || {}).length,
+          modelPreference,
+        },
+      });
+      return { active: true };
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -775,7 +778,7 @@ export const codeAgentFunction = inngest.createFunction(
     // (Planning, Design, Architecture, Coder, and QA Repair).
     // ─────────────────────────────────────────────────────────────────────────
     const auxStageStart = Date.now();
-    const { fragmentTitle, responseText, auxPromptTokens, auxCompletionTokens } = await step.run(
+    const { fragmentTitle, responseText } = await step.run(
       "generate-response-metadata",
       async () => {
         const openAIModel = getOpenAIModel({
@@ -814,29 +817,27 @@ export const codeAgentFunction = inngest.createFunction(
           ? (fragUsage?.completionTokens || 0) + (respUsage?.completionTokens || 0)
           : undefined;
 
+        await recordStageMetric({
+          runId,
+          projectId,
+          stageName: "auxiliary-text",
+          modelId: "gpt-4o-mini",
+          startedAt: auxStageStart,
+          finishedAt: Date.now(),
+          promptTokens,
+          completionTokens,
+          details: {
+            fragmentTitleGenerated: Boolean(title),
+            responseGenerated: Boolean(respText),
+          },
+        });
+
         return {
           fragmentTitle: title,
           responseText: respText,
-          auxPromptTokens: promptTokens,
-          auxCompletionTokens: completionTokens,
         };
       }
     );
-
-    await recordStageMetric({
-      runId,
-      projectId,
-      stageName: "auxiliary-text",
-      modelId: "gpt-4o-mini",
-      startedAt: auxStageStart,
-      finishedAt: Date.now(),
-      promptTokens: auxPromptTokens,
-      completionTokens: auxCompletionTokens,
-      details: {
-        fragmentTitleGenerated: Boolean(fragmentTitle),
-        responseGenerated: Boolean(responseText),
-      },
-    });
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 7: QUALITY ASSURANCE, VERIFICATION & BOUNDED REPAIR

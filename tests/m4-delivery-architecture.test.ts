@@ -22,6 +22,9 @@ import {
   runQAInspector,
   formatRepairInstructions,
 } from "@/server/agents/qa";
+import { codeAgentFunction } from "@/features/inngest/functions";
+import { isRunActiveInDb } from "@/server/orchestration/finalization";
+import { RunAbortedError } from "@/server/orchestration/stage-optimizer";
 
 describe("M4 Source Delivery Architecture: Draft Preservation, QA Diagnostics & Resilient Watchdog", () => {
   // =========================================================================
@@ -472,5 +475,367 @@ describe("M4 Source Delivery Architecture: Draft Preservation, QA Diagnostics & 
     assert.match(instructions, /error TS2322/);
     assert.match(instructions, /\[Check: production-build \(production-build\)\]/);
     assert.match(instructions, /Status: Command exceeded execution timeout budget/);
+  });
+
+  // =========================================================================
+  // SCENARIO 6: Workspace Preflight Bounded Operation & Timeout Diagnostics
+  // =========================================================================
+  it("Scenario 6: Workspace preflight bounds timeout, diagnoses missing dependencies, and treats timeout as infrastructure failure without AI repair", async () => {
+    // Sub-case A: E2B sandbox throws deadline_exceeded during preflight
+    const timeoutExecutor = {
+      run: async (cmd: string) => {
+        if (cmd.includes("test -d") && cmd.includes("package.json")) {
+          const timeoutErr = new Error("deadline_exceeded: E2B microVM command execution timed out");
+          (timeoutErr as any).name = "TimeoutError";
+          throw timeoutErr;
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const timeoutReport = await runQAInspector({
+      files: {
+        "package.json": JSON.stringify({ name: "artisan-bakery" }),
+        "app/page.tsx": "export default function Page() { return <h1>Bakery</h1>; }",
+      },
+      summary: "Bakery",
+      sandboxId: "mock-sandbox",
+      runSandboxCommands: true,
+      customExecutor: timeoutExecutor,
+      workspaceDir: "/home/user/workspace",
+    });
+
+    assert.equal(timeoutReport.passed, false);
+    assert.equal(timeoutReport.isInfrastructureTimeout, true, "Must flag infrastructure timeout");
+    assert.equal(timeoutReport.repairNeeded, false, "Must NOT require AI repair on infrastructure timeout");
+
+    const timeoutPreflight = timeoutReport.checks.find((c) => c.name === "workspace-preflight");
+    assert.ok(timeoutPreflight);
+    assert.equal(timeoutPreflight.status, "FAIL");
+    assert.equal(timeoutPreflight.timeout, true);
+    assert.match(timeoutPreflight.details || "", /Infrastructure timeout/i);
+
+    const skippedTsc = timeoutReport.checks.find((c) => c.name === "typescript-validation");
+    assert.ok(skippedTsc);
+    assert.equal(skippedTsc.status, "SKIPPED");
+
+    // Sub-case B: Successful preflight on 14-file bakery project proceeds to TypeScript and Build checks
+    let tscCalled = false;
+    let buildCalled = false;
+    let preflightCommandRun = "";
+
+    const successExecutor = {
+      run: async (cmd: string) => {
+        if (cmd.includes("test -d") && cmd.includes("package.json")) {
+          preflightCommandRun = cmd;
+          return { exitCode: 0, stdout: "verified", stderr: "" };
+        }
+        if (cmd.includes("tsc")) {
+          tscCalled = true;
+          return { exitCode: 0, stdout: "tsc clean", stderr: "" };
+        }
+        if (cmd.includes("build")) {
+          buildCalled = true;
+          return { exitCode: 0, stdout: "build success", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const fourteenFiles: Record<string, string> = {
+      "package.json": JSON.stringify({ name: "bakery-app", scripts: { build: "next build" } }),
+      "app/page.tsx": "export default function Page() { return <div>Bakery</div>; }",
+      "app/layout.tsx": "export default function RootLayout({ children }: { children: any }) { return <html><body>{children}</body></html>; }",
+      "components/header.tsx": "export function Header() { return <header>Header</header>; }",
+      "components/footer.tsx": "export function Footer() { return <footer>Footer</footer>; }",
+      "components/hero.tsx": "export function Hero() { return <section>Hero</section>; }",
+      "components/product-card.tsx": "export function ProductCard() { return <div>Card</div>; }",
+      "components/cart-drawer.tsx": "export function CartDrawer() { return <aside>Cart</aside>; }",
+      "components/hours-location.tsx": "export function Hours() { return <div>Hours</div>; }",
+      "components/contact-form.tsx": "export function Contact() { return <form>Form</form>; }",
+      "lib/cart-context.tsx": "export const Cart = {};",
+      "lib/products.ts": "export const products = [];",
+      "types/product.ts": "export type Product = { id: string };",
+      "styles/globals.css": "body { margin: 0; }",
+    };
+
+    const successReport = await runQAInspector({
+      files: fourteenFiles,
+      summary: "14-file bakery app",
+      sandboxId: "mock-sandbox",
+      runSandboxCommands: true,
+      customExecutor: successExecutor,
+      workspaceDir: "/home/user/workspace",
+    });
+
+    assert.equal(successReport.passed, true);
+    assert.equal(tscCalled, true, "TypeScript validation must run after preflight passes");
+    assert.equal(buildCalled, true, "Production build must run after TypeScript passes");
+    assert.match(preflightCommandRun, /test -d/);
+    assert.match(preflightCommandRun, /node_modules/);
+
+    const successPreflight = successReport.checks.find((c) => c.name === "workspace-preflight");
+    assert.ok(successPreflight);
+    assert.equal(successPreflight.status, "PASS");
+    assert.equal(successPreflight.timeout, false);
+  });
+
+  // =========================================================================
+  // SCENARIO 7: Inngest Replay After save-result Finalization
+  // =========================================================================
+  it("Scenario 7: Inngest replay after save-result returns normally without RunAbortedError while maintaining active terminal guards", async () => {
+    const testProjectId = "proj-replay-test";
+    const testRunId = "run-replay-test";
+
+    // Setup initial database state: Run is RUNNING
+    let currentDbStatus: GenerationRunStatus = GenerationRunStatus.RUNNING;
+    const runStartedAt: Date = new Date();
+
+    const originalFindUnique = prisma.generationRun.findUnique;
+    const originalUpdateMany = prisma.generationRun.updateMany;
+    const originalProjectSpec = prisma.projectSpecification?.findUnique;
+    const originalRunEventFindMany = prisma.runEvent?.findMany;
+    const originalRunEventUpsert = prisma.runEvent?.upsert;
+    const originalRunEventCreate = prisma.runEvent?.create;
+    const originalTx = prisma.$transaction;
+    const originalEnvKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "mock-openai-key";
+
+    prisma.generationRun.findUnique = (async (args: any) => {
+      if (args.where?.id === testRunId) {
+        return {
+          id: testRunId,
+          projectId: testProjectId,
+          status: currentDbStatus,
+          startedAt: runStartedAt,
+          createdAt: runStartedAt,
+          revisions: [],
+        };
+      }
+      return null;
+    }) as any;
+
+    prisma.generationRun.updateMany = (async () => ({ count: 1 })) as any;
+
+    if (prisma.runEvent) {
+      prisma.runEvent.findMany = (async () => []) as any;
+      prisma.runEvent.upsert = (async () => ({})) as any;
+      prisma.runEvent.create = (async () => ({})) as any;
+    }
+
+    if (prisma.projectSpecification) {
+      prisma.projectSpecification.findUnique = (async () => null) as any;
+    }
+
+    prisma.$transaction = (async (fnOrArray: any) => {
+      if (typeof fnOrArray === "function") {
+        const mockTx = {
+          generationRun: {
+            findUnique: async () => ({
+              id: testRunId,
+              projectId: testProjectId,
+              status: currentDbStatus,
+              startedAt: runStartedAt,
+              revisions: [],
+            }),
+            update: async (args: any) => {
+              if (args.data?.status) {
+                currentDbStatus = args.data.status;
+              }
+              return { id: testRunId, status: currentDbStatus };
+            },
+            updateMany: async () => ({ count: 1 }),
+          },
+          project: {
+            findUnique: async () => ({ currentRevisionId: null }),
+            updateMany: async () => ({ count: 0 }),
+          },
+          projectRevision: {
+            count: async () => 0,
+            create: async () => ({ id: "rev-mock", revisionNumber: 1 }),
+          },
+          generationDraft: {
+            updateMany: async () => ({ count: 1 }),
+          },
+          runEvent: {
+            create: async () => ({ id: "event-1" }),
+          },
+          message: {
+            findUnique: async () => null,
+            create: async () => ({ id: "msg-failure-result" }),
+          },
+        };
+        return fnOrArray(mockTx);
+      }
+      return [];
+    }) as any;
+
+    try {
+      const stepHistory: Record<string, any> = {};
+
+      // Simulated durable Inngest step runner
+      const createStepRunner = () => ({
+        run: async (stepId: string, fn: () => Promise<any>) => {
+          if (stepId in stepHistory) {
+            return stepHistory[stepId];
+          }
+          const result = await fn();
+          stepHistory[stepId] = result;
+          return result;
+        },
+      });
+
+      // Populate prerequisites up through QA failure
+      stepHistory["resolve-base-files"] = {
+        baseFiles: {},
+        baseRev: null,
+        bypassDecision: { canBypass: false },
+        existingSpec: {},
+      };
+      stepHistory["planner-spec"] = {
+        projectName: "Bakery App",
+        summary: "Bakery",
+        targetAudience: "Foodies",
+        capabilities: ["pages-navigation"],
+        coreFeatures: [],
+        pages: [],
+      };
+      stepHistory["design-spec"] = {
+        aestheticTheme: "Warm Artisan",
+        colorPalette: { primary: "#c05621", secondary: "#ecc94b", background: "#ffffff", text: "#2d3748" },
+        typography: { fontFamily: "Inter", headingFont: "Playfair" },
+      };
+      stepHistory["architecture-spec"] = {
+        routeEndpoints: [],
+        fileStructure: [],
+        componentHierarchy: [],
+        requiresDatabase: false,
+        capabilities: ["pages-navigation"],
+      };
+      stepHistory["mark-run-running"] = {};
+      stepHistory["get-sandbox-id-and-restore"] = "mock-sandbox-id";
+      stepHistory["get-previous-messages"] = [];
+      stepHistory["check-coding-active"] = { active: true };
+      stepHistory["initial-coding-agent"] = {
+        summary: "Coded bakery landing page",
+        files: { "package.json": "{}", "app/page.tsx": "export default function Page() {}" },
+        usage: { promptTokens: 1000, completionTokens: 500 },
+        modelId: "gpt-4o",
+      };
+      stepHistory["check-post-coding-active"] = { active: true };
+      stepHistory["capture-initial-draft"] = {
+        "package.json": "{}",
+        "app/page.tsx": "export default function Page() {}",
+      };
+      stepHistory["generate-response-metadata"] = {
+        fragmentTitle: "Bakery Landing Page",
+        responseText: "Here is your bakery website.",
+      };
+      stepHistory["qa-agent"] = {
+        report: {
+          passed: false,
+          score: 60,
+          repairNeeded: false,
+          repairInstructions: "TypeScript syntax errors",
+          verificationMode: "sandbox-verified",
+          isInfrastructureTimeout: false,
+          summary: "TypeScript check failed",
+          checks: [],
+          executedCategories: ["typescript-validation"],
+        },
+        finalFiles: { "package.json": "{}", "app/page.tsx": "export default function Page() {}" },
+        finalSummary: "Initial code",
+        finalSnapshotVerified: false,
+      };
+
+      const handler = (codeAgentFunction as any).fn;
+      assert.ok(typeof handler === "function", "Inngest function handler must be defined");
+
+      const eventPayload = {
+        data: {
+          projectId: testProjectId,
+          runId: testRunId,
+          value: "Build bakery app",
+        },
+      };
+
+      // Execution Phase 1: save-result runs and finalizes the run to FAILED in DB
+      const resultPass1 = await handler({
+        event: eventPayload,
+        step: createStepRunner(),
+      });
+
+      assert.equal(resultPass1.status, "FAILED");
+      assert.equal(resultPass1.priorRevisionPreserved, true);
+      assert.equal(resultPass1.messageId, "msg-failure-result");
+
+      // Database run status is now confirmed FAILED
+      assert.equal(currentDbStatus, GenerationRunStatus.FAILED);
+      assert.equal(await isRunActiveInDb(testRunId), false, "Run is now terminal in DB");
+
+      // Execution Phase 2: Inngest re-evaluates the function from the top (replay)
+      // With check-coding-active and check-post-coding-active memoized inside step.run,
+      // the function must NOT throw RunAbortedError on replay!
+      const resultReplay = await handler({
+        event: eventPayload,
+        step: createStepRunner(),
+      });
+
+      assert.equal(resultReplay.status, "FAILED", "Replay must return FAILED status object normally");
+      assert.equal(resultReplay.priorRevisionPreserved, true);
+      assert.equal(resultReplay.messageId, "msg-failure-result");
+
+      // Phase 3: Active terminal guard verification
+      // If a run is genuinely cancelled in DB before active coding runs, check-coding-active throws RunAbortedError
+      currentDbStatus = GenerationRunStatus.CANCELLED;
+      const cancelledRunStepHistory: Record<string, any> = {
+        "resolve-base-files": { baseFiles: {}, baseRev: null, bypassDecision: { canBypass: false }, existingSpec: {} },
+        "planner-spec": { projectName: "Bakery", summary: "Bakery", targetAudience: "All", capabilities: ["pages-navigation"], coreFeatures: [], pages: [] },
+        "design-spec": { aestheticTheme: "Warm", colorPalette: { primary: "#c05621" }, typography: { fontFamily: "Inter" } },
+        "architecture-spec": { routeEndpoints: [], fileStructure: [], componentHierarchy: [], requiresDatabase: false, capabilities: ["pages-navigation"] },
+        "mark-run-running": {},
+        "get-sandbox-id-and-restore": "mock-sandbox-id",
+        "get-previous-messages": [],
+        // "check-coding-active" is NOT memoized, so it executes live against CANCELLED DB state
+      };
+
+      const cancelledStepRunner = {
+        run: async (stepId: string, fn: () => Promise<any>) => {
+          if (stepId in cancelledRunStepHistory) {
+            return cancelledRunStepHistory[stepId];
+          }
+          return fn();
+        },
+      };
+
+      await assert.rejects(
+        async () => {
+          await handler({
+            event: { data: { projectId: testProjectId, runId: testRunId, value: "prompt" } },
+            step: cancelledStepRunner,
+          });
+        },
+        (err: any) => {
+          return (
+            err instanceof RunAbortedError ||
+            (err instanceof Error && err.name === "RunAbortedError") ||
+            String(err).includes("RunAbortedError")
+          );
+        }
+      );
+    } finally {
+      prisma.generationRun.findUnique = originalFindUnique;
+      prisma.generationRun.updateMany = originalUpdateMany;
+      if (prisma.projectSpecification && originalProjectSpec) {
+        prisma.projectSpecification.findUnique = originalProjectSpec;
+      }
+      if (prisma.runEvent) {
+        if (originalRunEventFindMany) prisma.runEvent.findMany = originalRunEventFindMany;
+        if (originalRunEventUpsert) prisma.runEvent.upsert = originalRunEventUpsert;
+        if (originalRunEventCreate) prisma.runEvent.create = originalRunEventCreate;
+      }
+      prisma.$transaction = originalTx;
+      process.env.OPENAI_API_KEY = originalEnvKey;
+    }
   });
 });

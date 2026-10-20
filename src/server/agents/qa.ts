@@ -1138,44 +1138,106 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
         });
       }
 
-      // Workspace preflight check: ensure directory and package.json exist before launching compilation
+      const getRemainingBudgetMs = () =>
+        options.deadlineMs ? options.deadlineMs - Date.now() : Infinity;
+
+      // Workspace preflight check: ensure directory, package.json, and dependency readiness
       let preflightPassed = false;
-      try {
-        const preflightCmd = `test -d "${targetWorkspaceDir}" && test -f "${targetWorkspaceDir}/package.json"`;
-        const preflightRes = await executor.run(preflightCmd, { timeoutMs: 5000 });
-        if (preflightRes.exitCode === 0) {
-          preflightPassed = true;
-          checks.push({
-            name: "workspace-preflight",
-            category: "sandbox-connection",
-            status: "PASS",
-            details: `Authoritative workspace verified at ${targetWorkspaceDir}`,
-            stdout: preflightRes.stdout,
-            stderr: preflightRes.stderr,
-            exitCode: 0,
-            timeout: false,
-          });
-        } else {
-          checks.push({
-            name: "workspace-preflight",
-            category: "sandbox-connection",
-            status: "FAIL",
-            details: `Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`,
-            stdout: preflightRes.stdout,
-            stderr: preflightRes.stderr,
-            exitCode: preflightRes.exitCode,
-            timeout: false,
-          });
-          errors.push(`Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`);
-        }
-      } catch (preflightErr) {
+      const preflightStart = Date.now();
+      const preflightTimeoutMs = Math.min(15000, Math.max(5000, getRemainingBudgetMs() - 25000));
+      const preflightCmd = `test -d "${targetWorkspaceDir}" && test -f "${targetWorkspaceDir}/package.json" && ( [ -e "${targetWorkspaceDir}/node_modules" ] || ( [ -d /home/user/node_modules ] && ln -s /home/user/node_modules "${targetWorkspaceDir}/node_modules" ) || true )`;
+
+      if (getRemainingBudgetMs() < 5000) {
+        isInfrastructureTimeout = true;
         checks.push({
           name: "workspace-preflight",
           category: "sandbox-connection",
           status: "FAIL",
-          details: `Workspace preflight check threw: ${String(preflightErr)}`,
+          details: `Infrastructure timeout: insufficient deadline budget for workspace preflight (${getRemainingBudgetMs()}ms remaining, 5000ms minimum floor)`,
+          timeout: true,
+          exitCode: null,
         });
-        errors.push(`Workspace preflight check threw: ${String(preflightErr)}`);
+        errors.push("Infrastructure timeout: insufficient deadline budget for workspace preflight");
+      } else {
+        try {
+          const preflightRes = await executor.run(preflightCmd, { timeoutMs: preflightTimeoutMs });
+          const preflightElapsedMs = Date.now() - preflightStart;
+
+          if (preflightRes.exitCode === 0) {
+            preflightPassed = true;
+            checks.push({
+              name: "workspace-preflight",
+              category: "sandbox-connection",
+              status: "PASS",
+              details: `Authoritative workspace verified at ${targetWorkspaceDir} (${preflightElapsedMs}ms, timeout: ${preflightTimeoutMs}ms)`,
+              stdout: preflightRes.stdout,
+              stderr: preflightRes.stderr,
+              exitCode: 0,
+              timeout: false,
+            });
+          } else {
+            const timedOut = isTimeoutError(preflightRes.stderr) || isTimeoutError(preflightRes.stdout);
+            if (timedOut) {
+              isInfrastructureTimeout = true;
+              checks.push({
+                name: "workspace-preflight",
+                category: "sandbox-connection",
+                status: "FAIL",
+                details: `Infrastructure timeout: Workspace preflight exceeded deadline (${preflightElapsedMs}ms, limit ${preflightTimeoutMs}ms)`,
+                stdout: preflightRes.stdout,
+                stderr: preflightRes.stderr,
+                exitCode: preflightRes.exitCode,
+                timeout: true,
+              });
+              errors.push(`Infrastructure timeout: Workspace preflight exceeded deadline (${preflightElapsedMs}ms)`);
+            } else {
+              let diagnosticOutput = "";
+              try {
+                const diagRes = await executor.run(`ls -la "${targetWorkspaceDir}" 2>&1 || ls -la /home/user 2>&1`, { timeoutMs: 3000 });
+                diagnosticOutput = ` Workspace contents:\n${diagRes.stdout || diagRes.stderr}`;
+              } catch {
+                // Ignore diagnostic inspection errors
+              }
+
+              checks.push({
+                name: "workspace-preflight",
+                category: "sandbox-connection",
+                status: "FAIL",
+                details: `Workspace preflight failed (exit code ${preflightRes.exitCode}): directory or package.json missing at ${targetWorkspaceDir}.${diagnosticOutput}`,
+                stdout: preflightRes.stdout,
+                stderr: preflightRes.stderr,
+                exitCode: preflightRes.exitCode,
+                timeout: false,
+              });
+              errors.push(`Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`);
+            }
+          }
+        } catch (preflightErr: unknown) {
+          const preflightElapsedMs = Date.now() - preflightStart;
+          const timedOut = isTimeoutError(preflightErr);
+          if (timedOut) {
+            isInfrastructureTimeout = true;
+            checks.push({
+              name: "workspace-preflight",
+              category: "sandbox-connection",
+              status: "FAIL",
+              details: `Infrastructure timeout: Workspace preflight exceeded deadline (${preflightElapsedMs}ms, limit ${preflightTimeoutMs}ms): ${String(preflightErr)}`,
+              timeout: true,
+              exitCode: null,
+            });
+            errors.push(`Infrastructure timeout: Workspace preflight exceeded deadline (${preflightElapsedMs}ms)`);
+          } else {
+            checks.push({
+              name: "workspace-preflight",
+              category: "sandbox-connection",
+              status: "FAIL",
+              details: `Workspace preflight command failed (${preflightElapsedMs}ms): ${String(preflightErr)}`,
+              timeout: false,
+              exitCode: null,
+            });
+            errors.push(`Workspace preflight command failed: ${String(preflightErr)}`);
+          }
+        }
       }
 
       if (!preflightPassed) {
@@ -1210,9 +1272,6 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
           });
           errors.push("Missing prisma/schema.prisma for database verification");
         }
-
-        const getRemainingBudgetMs = () =>
-          options.deadlineMs ? options.deadlineMs - Date.now() : Infinity;
 
         // Dynamic budget enforcement: Minimum floor for TypeScript validation is 20s
         let tscPassed = false;
