@@ -452,12 +452,12 @@ describe("Phase 2: Builder & Contact Integration", () => {
   });
 
   describe("Task 4: Graceful Skip When AI Credentials Unconfigured", () => {
-    it("gracefully detects unconfigured Gemini API key without false reporting", () => {
-      const hasGemini = Boolean(process.env.GEMINI_API_KEY);
-      if (!hasGemini) {
-        assert.ok(true, "GEMINI_API_KEY is not configured in local environment; live generation skipped as required");
+    it("gracefully detects unconfigured OpenAI API key without false reporting", () => {
+      const hasOpenAI = Boolean(process.env.OPENAI_API_KEY);
+      if (!hasOpenAI) {
+        assert.ok(true, "OPENAI_API_KEY is not configured in local environment; live generation skipped as required");
       } else {
-        assert.ok(process.env.GEMINI_API_KEY!.length > 0);
+        assert.ok(process.env.OPENAI_API_KEY!.length > 0);
       }
     });
 

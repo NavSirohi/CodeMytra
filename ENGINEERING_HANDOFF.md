@@ -2,9 +2,9 @@
 
 **Official Product Name:** CodeMytra  
 **Target Domain:** codemytra.com  
-**Primary AI Engine:** Google Gemini (`gemini-2.5-flash`, `gemini-2.5-pro`)  
+**Primary AI Engine:** OpenAI (`gpt-4o`, `gpt-4o-mini`)  
 **Baseline Date:** October 2026  
-**Status:** In Active Development (Milestone P0 Baseline complete; P1 Revisions & Multi-Agent in progress)
+**Status:** In Active Development (Milestones P0-M4 Complete; OpenAI Generation Pipeline Active)
 
 ---
 
@@ -13,7 +13,7 @@
 CodeMytra is an autonomous, multi-agent AI full-stack application builder. Users describe an application concept; a coordinated hierarchy of specialized AI agents analyzes requirements, creates architectural and design specifications, implements full-stack code, validates the build, and provides an interactive sandbox preview with full code persistence and ZIP export capabilities.
 
 ### Non-Negotiable Core Rules
-1. **Gemini Across All Agents:** All intelligence layers, planner stages, design agents, code generators, and QA inspectors leverage Google Gemini models (`gemini-2.5-flash` for high-throughput coding/review and `gemini-2.5-pro` for architectural planning and complex repairs).
+1. **OpenAI Across All Active Agents:** All active intelligence layers, planner stages, design agents, code generators, and QA inspectors leverage official OpenAI models via `@inngest/agent-kit` (`gpt-4o-mini` for high-throughput design and economical planning; `gpt-4o` for complex full-stack architecture, coding, and multi-turn QA repairs). Historical Gemini models and usage metrics are preserved in the pricing catalog for immutable auditability.
 2. **Never Rewriting from Scratch:** Existing working flows (Clerk auth, project creation, UI layout, Inngest integration) are preserved and extended via clean interfaces.
 3. **Strict Credential Hygiene:** No API keys, database connection strings, or environment secrets are hardcoded or committed to git.
 4. **Isolated Data Planes:** Customer-generated applications NEVER share or connect to CodeMytra's internal platform database (`DATABASE_URL`).
@@ -47,16 +47,16 @@ CodeMytra is an autonomous, multi-agent AI full-stack application builder. Users
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                   Inngest Multi-Agent Orchestration Pipeline                │
 │                                                                             │
-│  1. Requirements Agent (Gemini 2.5 Pro) → Structured PRD (Zod Schema)       │
+│  1. Requirements Agent (OpenAI GPT-4o / GPT-4o mini) → Structured PRD       │
 │  2. Human-in-the-Loop Gate (Optional PRD review / approval)                │
-│  3. Design & Architecture Agents (Gemini 2.5 Flash / Pro)                   │
+│  3. Design & Architecture Agents (OpenAI GPT-4o / GPT-4o mini)             │
 │     → DesignSpec + ArchitectureSpec + File Ownership Manifest               │
 │  4. Implementation Coordinator (Single-writer patch scheduler)              │
-│     ├─ Frontend Agent (Gemini 2.5 Flash) → UI & Client Components           │
-│     ├─ Backend Agent (Gemini 2.5 Flash) → Route Handlers & Server Actions   │
-│     └─ Database Agent (Gemini 2.5 Flash) → Prisma Schema & Migrations       │
+│     ├─ Frontend Agent (OpenAI GPT-4o / GPT-4o mini) → UI & Client           │
+│     ├─ Backend Agent (OpenAI GPT-4o / GPT-4o mini) → API Handlers & Actions │
+│     └─ Database Agent (OpenAI GPT-4o / GPT-4o mini) → Prisma Schema & Seeds │
 │  5. Integration Agent → Atomic merge into candidate revision snapshot       │
-│  6. QA & Testing Agent (Gemini 2.5 Flash)                                    │
+│  6. QA & Testing Agent (OpenAI GPT-4o / GPT-4o mini)                        │
 │     → Sandbox build verification (`tsc`, lint, build, health check)         │
 │     └─ If failed: Bounded self-repair loop (max 2 attempts)                 │
 │  7. Immutable Revision Snapshot & Sandbox Preview Generation                │
@@ -73,20 +73,24 @@ CodeMytra is an autonomous, multi-agent AI full-stack application builder. Users
 
 ---
 
-## 3. Multi-Agent System Roles & Gemini Model Assignments
+## 3. Multi-Agent System Roles, Model Assignments & Auxiliary Routing
 
 Each agent operates with minimal required tools, a bounded context budget, and explicit input/output schemas defined via Zod.
 
-| Role | Primary Gemini Model | Inputs | Outputs | Allowed Capabilities |
+| Role | Primary OpenAI Model | Inputs | Outputs | Allowed Capabilities |
 |---|---|---|---|---|
-| **Planner / Requirements** | `gemini-2.5-pro` | User prompt, conversational context | `ProductRequirementsDocument` | Read project history, generate structured PRD |
-| **Design Agent** | `gemini-2.5-flash` | Approved PRD | `DesignSpec` (tokens, theme, layouts) | Read UI component catalog, emit design tokens |
-| **Architecture Agent** | `gemini-2.5-pro` | Approved PRD, template configs | `ArchitectureSpec` & File Ownership Map | Read template specs, emit route/model contracts |
-| **Frontend Agent** | `gemini-2.5-flash` | Specs, component boundaries | Scoped UI patches (`app/**/*.tsx`) | Read/write to client/UI files only |
-| **Backend Agent** | `gemini-2.5-flash` | Specs, API contracts | Scoped API & action patches (`app/api/**`) | Read/write to backend files only |
-| **Database Agent** | `gemini-2.5-flash` | Data requirements | Prisma schema updates & seeds | Read/write to schema & migration files |
-| **Integration Agent** | `gemini-2.5-flash` | Patches from all agents | Consolidated candidate revision | Atomic conflict resolution & manifest hashing |
-| **QA / Verifier** | `gemini-2.5-flash` | Candidate file tree, build diagnostics | `QAReport` (pass/fail, logs, repair plan) | Run sandbox checks (`tsc`, `build`), repair loops |
+| **Planner / Requirements** | `gpt-4o` (or `gpt-4o-mini`) | User prompt, conversational context | `ProductRequirementsDocument` | Read project history, generate structured PRD |
+| **Design Agent** | `gpt-4o-mini` | Approved PRD | `DesignSpec` (tokens, theme, layouts) | Read UI component catalog, emit design tokens |
+| **Architecture Agent** | `gpt-4o` | Approved PRD, template configs | `ArchitectureSpec` & File Ownership Map | Read template specs, emit route/model contracts |
+| **Frontend / Coder Agent** | `gpt-4o` (or `gpt-4o-mini`) | Specs, component boundaries | Scoped UI patches (`app/**/*.tsx`) | Read/write workspace files, execute tools |
+| **Backend / DB Agent** | `gpt-4o` | Data requirements, API specs | Prisma schema updates & route handlers | Scoped backend & database patch generation |
+| **Integration Agent** | `gpt-4o-mini` | Patches from all agents | Consolidated candidate revision | Atomic conflict resolution & manifest hashing |
+| **QA / Verifier** | `gpt-4o` | Candidate file tree, build diagnostics | `QAReport` (pass/fail, logs, repair plan) | Run sandbox checks (`tsc`, `build`), repair loops |
+
+### 3.1 User Model Selection vs. Auxiliary Routing Contracts
+- **Core Pipeline Invariant:** When a customer or caller explicitly selects a model preference (`gpt-4o`, `gpt-4o-mini`, or `auto`), that preference is strictly honored across all generation stages: Requirements Planning, Design Specification, Architecture Modeling, Code Implementation, and QA Self-Repair.
+- **CodeMytra Auto Adaptive Routing:** In `auto` mode (default), CodeMytra dynamically selects the optimal model tier per stage (`gpt-4o-mini` for token-heavy design schemas; `gpt-4o` for relational schemas, complex TypeScript logic, and compilation diagnosis).
+- **Auxiliary Generation Routing:** Auxiliary post-generation tasks (specifically `generate-response-metadata` in `src/features/inngest/functions.ts` for conversational fragment titles and customer summaries) explicitly use `gpt-4o-mini`. This intentional architectural boundary avoids consuming flagship model quotas or introducing latency for basic 10-word summaries, while strictly maintaining the user's selected model for all application code.
 
 ---
 
@@ -105,7 +109,7 @@ Each agent operates with minimal required tools, a bounded context budget, and e
 - `Fragment`: Output files and sandbox preview URL.
 
 #### Additive Models (Milestones P1 & Beyond):
-- `GenerationRun`: Tracks execution state (`CREATED`, `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`), idempotency keys, and Gemini token usage.
+- `GenerationRun`: Tracks execution state (`CREATED`, `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`), idempotency keys, and AI token/cost usage metrics (supporting active OpenAI and historical Gemini).
 - `ProjectSpecification`: Stores versioned PRDs, design specifications, and architecture manifests.
 - `ProjectRevision`: Immutable snapshots of the complete file tree with parent-child revision tracking for branching and rollback.
 - `AgentTask`: Detailed stage logs for individual agent executions (timings, token metrics, errors).
@@ -115,7 +119,7 @@ Each agent operates with minimal required tools, a bounded context budget, and e
 
 ## 5. Security & Isolation Boundaries
 
-1. **Platform Secrets Isolation:** `GEMINI_API_KEY`, `CLERK_SECRET_KEY`, `E2B_API_KEY`, and `DATABASE_URL` are strictly retained within the control plane. They are never injected into or accessible from within the E2B user code sandbox.
+1. **Platform Secrets Isolation:** `OPENAI_API_KEY`, `CLERK_SECRET_KEY`, `E2B_API_KEY`, and `DATABASE_URL` are strictly retained within the control plane. They are never injected into or accessible from within the E2B user code sandbox.
 2. **Path Traversal Protection:** All filesystem tools (`readWorkspace`, `applyPatch`) enforce canonical path checking within `/home/user` and reject directory traversal (`../`) or symlink exploits.
 3. **No Arbitrary Shell Execution:** Code generation sandboxes run under strict allowlisted commands (`bun install`, `bun build`, `tsc --noEmit`).
 4. **Redacted Observability:** Raw prompts, generated source code, and API keys are scrubbed before writing to system logs.
@@ -126,7 +130,7 @@ Each agent operates with minimal required tools, a bounded context budget, and e
 
 - **M0: Secure Baseline (COMPLETED):**
   - Removed all hardcoded API keys and template references.
-  - Parameterized Gemini model configuration.
+  - Parameterized provider model configuration.
   - Formatted `.env.example`, `.gitignore`, `next.config.ts`, and core branding.
 - **M1: Durable Revisions & State Machine (ACTIVE):**
   - Schema additions for `GenerationRun`, `ProjectRevision`.

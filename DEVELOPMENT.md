@@ -30,6 +30,7 @@ The Chai0 prototype (teacher's code) provides:
 | 2026-10-18 | Security: removed all `console.log` calls leaking raw agent output | `feat-P0-secure-baseline` |
 | 2026-10-18 | Types: fixed implicit `any` in `utils.ts`, typed all function signatures | `feat-P0-secure-baseline` |
 | 2026-10-18 | Config: unified `geminiModel` usage (removed second unconfigured `gemini()` call) | `feat-P0-secure-baseline` |
+| 2026-10-20 | Migration: migrated AI generation pipeline from Gemini to OpenAI (GPT-4o, GPT-4o mini) | `security-hardening-m4` |
 | 2026-10-18 | Branding: renamed product to CodeMytra throughout (metadata, logo, package.json) | `feat-P0-secure-baseline` |
 | 2026-10-18 | Config: comprehensive `.gitignore`, `.env.example`, `next.config.ts` with security headers | `feat-P0-secure-baseline` |
 | 2026-10-18 | DB: updated `prisma/schema.prisma` datasource with `url` and `directUrl` for Neon | `feat-P0-secure-baseline` |
@@ -54,10 +55,10 @@ PostgreSQL (Neon)
        │
        ├─ Create E2B sandbox
        ├─ Restore conversation messages
-       ├─ Run code agent (single Gemini agent with terminal/read/write tools)
+       ├─ Run multi-agent pipeline (OpenAI GPT-4o / GPT-4o mini: Planner, Designer, Architect, Coder, QA)
        ├─ Extract files from sandbox
-       ├─ Run title generator (text agent)
-       ├─ Run response generator (text agent)
+       ├─ Run title generator (GPT-4o mini text agent)
+       ├─ Run response generator (GPT-4o mini text agent)
        └─ Save Fragment (files JSON + sandbox URL) → DB
 ```
 
@@ -190,7 +191,7 @@ Exits: `FAILED`, `CANCELLED`, `NEEDS_INPUT`
 |---|---|---|
 | [Neon](https://neon.tech) | PostgreSQL database | Free tier available |
 | [Clerk](https://clerk.dev) | Authentication | Create a **development** app, not production |
-| [Google AI Studio](https://aistudio.google.com) | Gemini LLM | Free tier available |
+| [OpenAI Platform](https://platform.openai.com) | OpenAI LLM (GPT-4o, GPT-4o mini) | API key required |
 | [Inngest](https://inngest.com) | Agent orchestration | Local dev server, no account needed initially |
 | [E2B](https://e2b.dev) | Code execution sandboxes | **Create your own account** — do not reuse the teacher's key |
 

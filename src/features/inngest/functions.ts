@@ -614,6 +614,11 @@ export const codeAgentFunction = inngest.createFunction(
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 6: TITLE & RESPONSE TEXT HELPERS (Auxiliary AI Calls)
+    // Architectural Note: Auxiliary metadata (fragment title and summary text)
+    // deliberately routes to lightweight gpt-4o-mini to avoid consuming flagship
+    // token budget or adding latency for basic 10-word summaries, while the
+    // customer's selected modelPreference strictly governed all core generative stages
+    // (Planning, Design, Architecture, Coder, and QA Repair).
     // ─────────────────────────────────────────────────────────────────────────
     const auxStageStart = Date.now();
     const { fragmentTitle, responseText, auxPromptTokens, auxCompletionTokens } = await step.run(

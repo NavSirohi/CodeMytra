@@ -27,7 +27,7 @@ CodeMytra instruments every generation run with granular stage telemetry, token 
   - `durationMs`: Wall-clock execution time.
   - `promptTokens` & `completionTokens`: Token accounting extracted from real provider metadata when available.
   - `usageMeasured`: Explicit boolean indicating whether provider tokens were supplied (missing usage is never reported as measured zero).
-  - `modelId`: The exact model evaluated (e.g., `gemini-2.5-flash`, `gemini-2.5-pro`), never substituted with an arbitrary default when unknown.
+  - `modelId`: The exact model evaluated (e.g., `gpt-4o`, `gpt-4o-mini`, or historical `gemini-2.5-flash`), never substituted with an arbitrary default when unknown.
   - `estimatedCostUsd`: Stage cost calculated dynamically from active rates when usage is measured.
   - `pricingAssumptions`: Transparent snapshot of the exact `$/1M` input and output token rates applied.
 - **Sandbox Lifecycle Metrics**:
@@ -40,10 +40,12 @@ CodeMytra instruments every generation run with granular stage telemetry, token 
   - All metrics include an explicit disclaimer: *"Estimated model cost based on configured token rates; not actual provider billing expenditure."*
 
 ### 2.2 Dynamic, Configurable Pricing Model
-CodeMytra avoids hardcoding arbitrary dollar costs into agent code. Rates are dynamically configurable via `MODEL_PRICING_CONFIG_JSON` environment variable with fallback to baseline provider published tiers:
+CodeMytra avoids hardcoding arbitrary dollar costs into agent code. Rates are dynamically configurable via `MODEL_PRICING_CONFIG_JSON` environment variable with fallback to baseline provider published tiers (with historical models retained for auditability):
 
 ```json
 {
+  "gpt-4o": { "inputPerMillionUsd": 2.50, "outputPerMillionUsd": 10.00 },
+  "gpt-4o-mini": { "inputPerMillionUsd": 0.15, "outputPerMillionUsd": 0.60 },
   "gemini-2.5-flash": { "inputPerMillionUsd": 0.075, "outputPerMillionUsd": 0.30 },
   "gemini-2.5-pro": { "inputPerMillionUsd": 1.25, "outputPerMillionUsd": 5.00 }
 }
@@ -76,7 +78,7 @@ Follow-up requests that only modify surface-level styling or component layout do
 | `MAX_INPUT_FILES_FOR_CONTEXT` | 30 | `MAX_INPUT_FILES_FOR_CONTEXT` | Prevents prompt token bloat on large projects |
 
 ### 3.4 Cooperative vs Preemptive Timeout Mechanics
-- **Out-of-Process Execution**: External AI providers (e.g. Google Gemini REST/SDK inference) and sandbox executions (e.g. Next.js compiler or build commands inside E2B containers) execute out-of-process. Standard cloud runtimes and HTTP clients cannot be preemptively interrupted mid-flight without aborting sockets or killing entire containers.
+- **Out-of-Process Execution**: External AI providers (e.g. OpenAI REST/SDK inference) and sandbox executions (e.g. Next.js compiler or build commands inside E2B containers) execute out-of-process. Standard cloud runtimes and HTTP clients cannot be preemptively interrupted mid-flight without aborting sockets or killing entire containers.
 - **Cooperative Deadlines**: The configured `MAX_GENERATION_DURATION_MS` (default 300,000 ms / 5 minutes) acts as a **cooperative deadline budget**, not a preemptive OS-level thread-kill or guaranteed hard wall-clock interruption.
 - **Enforcement Architecture**:
   1. **Persisted Anchor**: Run start time (`startedAt`) is persisted in PostgreSQL so Inngest workflow retries derive an unchanged deadline rather than resetting the budget.
@@ -92,10 +94,10 @@ Follow-up requests that only modify surface-level styling or component layout do
 - **Internal SDK Compatibility Assumption**:
   1. AgentKit evaluates `await getStepTools()`.
   2. When the ALS store is unbound, `getStepTools()` returns `undefined`.
-  3. When `step` is `undefined`, AgentKit takes its native direct provider branch: it executes a direct HTTPS/REST request to the provider model (e.g. Google Gemini API) rather than delegating to `step.ai.infer()`.
+  3. When `step` is `undefined`, AgentKit takes its native direct provider branch: it executes a direct HTTPS/REST request to the provider model (e.g. OpenAI API via `@inngest/agent-kit/openai`) rather than delegating to `step.ai.infer()`.
   4. The outer Inngest step (`step.run("planner-spec")`) preserves its durable step identity, cleanly memoizes the returned specification into Inngest's execution ledger, and guarantees deterministic replay safety and idempotency.
 - **Supported Alternative**:
-  If a future minor update of Inngest or AgentKit alters this ambient ALS symbol lookup, CodeMytra supports replacing `@inngest/agent-kit` single-turn calls with direct Google Gemini SDK invocations (`getGeminiModel().generateContent()` or native HTTPS `fetch()`). Direct provider invocation operates completely outside Inngest's internal `AsyncLocalStorage` symbol, providing an architectural alternative with zero ambient context dependencies.
+  If a future minor update of Inngest or AgentKit alters this ambient ALS symbol lookup, CodeMytra supports replacing `@inngest/agent-kit` single-turn calls with direct OpenAI SDK invocations (`getOpenAIModel()` or native HTTPS `fetch()` to `https://api.openai.com/v1/chat/completions`). Direct provider invocation operates completely outside Inngest's internal `AsyncLocalStorage` symbol, providing an architectural alternative with zero ambient context dependencies.
 
 ---
 
@@ -122,8 +124,8 @@ Follow-up requests that only modify surface-level styling or component layout do
 - **Illustrative Benchmark Metrics**:
   - **Total Duration**: ~38.4 seconds (illustrative)
   - **Tokens**: ~14,200 prompt tokens, ~4,100 completion tokens (illustrative)
-  - **Model Mix**: `gemini-2.5-flash` (economical high-speed generation)
-  - **Estimated Cost**: ~$0.0023 USD (indicative estimate)
+  - **Model Mix**: `gpt-4o-mini` (economical high-speed generation)
+  - **Estimated Cost**: ~$0.0046 USD (indicative estimate)
   - **Sandbox Setup Time**: ~1.8 seconds (illustrative)
   - **QA Result**: Passed (Lint clean, Next.js build clean, 0 static errors)
 - **Key Artifacts Created**:
@@ -147,8 +149,8 @@ Follow-up requests that only modify surface-level styling or component layout do
 - **Illustrative Benchmark Metrics**:
   - **Total Duration**: ~54.2 seconds (illustrative)
   - **Tokens**: ~22,600 prompt tokens, ~6,800 completion tokens (illustrative)
-  - **Model Mix**: `gemini-2.5-flash` for planning/UI, `gemini-2.5-pro` for relational architecture
-  - **Estimated Cost**: ~$0.0128 USD (indicative estimate)
+  - **Model Mix**: `gpt-4o-mini` for planning/UI, `gpt-4o` for relational architecture and complex coding
+  - **Estimated Cost**: ~$0.038 USD (indicative estimate)
   - **Sandbox Setup Time**: ~2.1 seconds (illustrative)
   - **QA Result**: Passed (`database-connectivity` verified, `model-crud-verification` verified on disposable sandbox instance)
 - **Key Artifacts Created**:
@@ -174,8 +176,8 @@ Follow-up requests that only modify surface-level styling or component layout do
 - **Illustrative Benchmark Metrics**:
   - **Total Duration**: ~16.8 seconds (illustrative, ~69% latency reduction vs greenfield)
   - **Tokens**: ~5,200 prompt tokens, ~1,400 completion tokens (illustrative, ~76% token reduction)
-  - **Model Mix**: `gemini-2.5-flash`
-  - **Estimated Cost**: ~$0.0008 USD (indicative estimate, ~93% cost reduction)
+  - **Model Mix**: `gpt-4o-mini` (targeted diff)
+  - **Estimated Cost**: ~$0.0016 USD (indicative estimate, ~95% cost reduction)
   - **QA Result**: Passed (Build clean, Revision V2 promoted successfully)
 
 ---

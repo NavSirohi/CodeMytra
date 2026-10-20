@@ -27,7 +27,7 @@ You describe what you want to build. CodeMytra's orchestrated team of specialise
 | Frontend + Backend | Next.js 16 (App Router, Server Actions) |
 | Database           | Neon PostgreSQL + Prisma 7              |
 | Authentication     | Clerk                                   |
-| AI Orchestration   | Inngest + Google Gemini                 |
+| AI Orchestration   | Inngest + OpenAI (GPT-4o, GPT-4o mini)  |
 | Code Sandboxes     | E2B                                     |
 | Hosting            | Vercel                                  |
 | Version Control    | GitHub                                  |
@@ -40,15 +40,15 @@ You describe what you want to build. CodeMytra's orchestrated team of specialise
 | ----------------------------- | ------------------------ |
 | User authentication (Clerk)   | ✅ Working               |
 | Project creation and listing  | ✅ Working               |
-| Single-agent code generation  | ✅ Working               |
+| Multi-agent code generation   | ✅ Working (OpenAI)      |
 | Sandbox file persistence      | ✅ Working               |
 | Code viewer + iframe preview  | ✅ Working               |
 | Hardcoded credentials removed | ✅ Fixed                 |
-| Project revision snapshots    | 🔧 In Progress           |
-| Multi-agent orchestration     | 🔧 In Progress           |
+| Project revision snapshots    | ✅ Working               |
+| Multi-agent orchestration     | ✅ Working               |
 | PRD review and approval flow  | 📋 Planned               |
-| Full-stack template (with DB) | 📋 Planned               |
-| ZIP export                    | 📋 Planned               |
+| Full-stack template (with DB) | ✅ Working               |
+| ZIP export                    | ✅ Working               |
 | Credit metering + billing     | 📋 Planned (Razorpay)    |
 | Customer app deployment       | ⏸ Deferred (Coming Soon) |
 
@@ -62,7 +62,7 @@ You describe what you want to build. CodeMytra's orchestrated team of specialise
 - `npm` (do **not** mix with `yarn` or `pnpm`)
 - A [Neon](https://neon.tech) PostgreSQL database
 - A [Clerk](https://clerk.dev) development application
-- A [Google AI Studio](https://aistudio.google.com) Gemini API key
+- An [OpenAI](https://platform.openai.com) API key
 - An [Inngest](https://inngest.com) account (or use the local dev server)
 - Your own [E2B](https://e2b.dev) account and API key
 
