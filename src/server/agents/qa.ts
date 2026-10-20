@@ -710,6 +710,7 @@ export interface ValidateProjectOptions {
   customExecutor?: QACommandExecutor;
   workspaceDir?: string;
   runner?: "bun" | "npm";
+  deadlineMs?: number;
 }
 
 /**
@@ -978,6 +979,18 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
   // 7. Live Sandbox / Custom Executor Verification: Database, TypeScript & Production Build
   let executedSandboxChecks = false;
+  let isInfrastructureTimeout = false;
+
+  const isTimeoutError = (errOrDetails: unknown): boolean => {
+    const text = String(errOrDetails || "").toLowerCase();
+    return (
+      text.includes("deadline_exceeded") ||
+      text.includes("timeout") ||
+      text.includes("timed out") ||
+      text.includes("time out")
+    );
+  };
+
   if ((sandboxId && runSandboxCommands) || options.customExecutor) {
     try {
       let executor: QACommandExecutor;
@@ -1029,93 +1042,236 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
         });
       }
 
-      // Executable Database Verification (only when application requires persistence)
-      if (requiresDb && files["prisma/schema.prisma"]) {
-        const dbResult = await executeDatabaseVerificationPipeline(executor, {
-          workspaceDir: targetWorkspaceDir,
-          models: archSpec?.databaseModels,
-          runner,
-        });
-        checks.push(...dbResult.checks);
-        errors.push(...dbResult.errors);
-      } else if (requiresDb) {
-        checks.push({
-          name: "database-schema-live-validation",
-          category: "database-validation",
-          status: "FAIL",
-          details: "Application requires data persistence but prisma/schema.prisma is missing",
-        });
-        errors.push("Missing prisma/schema.prisma for database verification");
-      }
-
-      // TypeScript check
-      const tscCmd = runner === "bun"
-        ? `cd "${targetWorkspaceDir}" && bun run tsc --noEmit`
-        : `cd "${targetWorkspaceDir}" && npx tsc --noEmit`;
+      // Workspace preflight check: ensure directory and package.json exist before launching compilation
+      let preflightPassed = false;
       try {
-        const tscResult = await executor.run(tscCmd, { timeoutMs: 30000 });
-        if (tscResult.exitCode === 0) {
+        const preflightCmd = `test -d "${targetWorkspaceDir}" && test -f "${targetWorkspaceDir}/package.json"`;
+        const preflightRes = await executor.run(preflightCmd, { timeoutMs: 5000 });
+        if (preflightRes.exitCode === 0) {
+          preflightPassed = true;
           checks.push({
-            name: "typescript-validation",
-            category: "typescript-validation",
+            name: "workspace-preflight",
+            category: "sandbox-connection",
             status: "PASS",
-            details: "TypeScript compiled with zero errors",
+            details: `Authoritative workspace verified at ${targetWorkspaceDir}`,
           });
         } else {
-          const tscErr = extractCompilerDiagnostics(tscResult.stdout, tscResult.stderr, "TypeScript typecheck failed");
           checks.push({
-            name: "typescript-validation",
-            category: "typescript-validation",
+            name: "workspace-preflight",
+            category: "sandbox-connection",
             status: "FAIL",
-            details: tscErr,
+            details: `Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`,
           });
-          errors.push(`TypeScript error:\n${tscErr}`);
+          errors.push(`Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`);
         }
-      } catch (tscCmdErr: unknown) {
-        const err = tscCmdErr as { stdout?: string; stderr?: string; message?: string };
-        const tscErr = extractCompilerDiagnostics(err?.stdout, err?.stderr, String(err?.message || tscCmdErr));
+      } catch (preflightErr) {
+        checks.push({
+          name: "workspace-preflight",
+          category: "sandbox-connection",
+          status: "FAIL",
+          details: `Workspace preflight check threw: ${String(preflightErr)}`,
+        });
+        errors.push(`Workspace preflight check threw: ${String(preflightErr)}`);
+      }
+
+      if (!preflightPassed) {
         checks.push({
           name: "typescript-validation",
           category: "typescript-validation",
-          status: "FAIL",
-          details: tscErr,
+          status: "SKIPPED",
+          details: "Skipped due to workspace preflight failure",
         });
-        errors.push(`TypeScript validation failed to execute:\n${tscErr}`);
-      }
-
-      // Production build check
-      const buildCmd = runner === "bun"
-        ? `cd "${targetWorkspaceDir}" && bun run build`
-        : `cd "${targetWorkspaceDir}" && npm run build`;
-      try {
-        const buildResult = await executor.run(buildCmd, { timeoutMs: 60000 });
-        if (buildResult.exitCode === 0) {
-          checks.push({
-            name: "production-build",
-            category: "production-build",
-            status: "PASS",
-            details: "Production build succeeded",
-          });
-        } else {
-          const buildErr = extractCompilerDiagnostics(buildResult.stdout, buildResult.stderr, "Build failed");
-          checks.push({
-            name: "production-build",
-            category: "production-build",
-            status: "FAIL",
-            details: buildErr,
-          });
-          errors.push(`Production build error:\n${buildErr}`);
-        }
-      } catch (buildCmdErr: unknown) {
-        const err = buildCmdErr as { stdout?: string; stderr?: string; message?: string };
-        const buildErr = extractCompilerDiagnostics(err?.stdout, err?.stderr, String(err?.message || buildCmdErr));
         checks.push({
           name: "production-build",
           category: "production-build",
-          status: "FAIL",
-          details: buildErr,
+          status: "SKIPPED",
+          details: "Skipped due to workspace preflight failure",
         });
-        errors.push(`Production build command failed:\n${buildErr}`);
+      } else {
+        // Executable Database Verification (only when application requires persistence)
+        if (requiresDb && files["prisma/schema.prisma"]) {
+          const dbResult = await executeDatabaseVerificationPipeline(executor, {
+            workspaceDir: targetWorkspaceDir,
+            models: archSpec?.databaseModels,
+            runner,
+          });
+          checks.push(...dbResult.checks);
+          errors.push(...dbResult.errors);
+        } else if (requiresDb) {
+          checks.push({
+            name: "database-schema-live-validation",
+            category: "database-validation",
+            status: "FAIL",
+            details: "Application requires data persistence but prisma/schema.prisma is missing",
+          });
+          errors.push("Missing prisma/schema.prisma for database verification");
+        }
+
+        const getRemainingBudgetMs = () =>
+          options.deadlineMs ? options.deadlineMs - Date.now() : Infinity;
+
+        // Dynamic budget enforcement: Minimum floor for TypeScript validation is 20s
+        let tscPassed = false;
+        if (getRemainingBudgetMs() < 20000) {
+          isInfrastructureTimeout = true;
+          checks.push({
+            name: "typescript-validation",
+            category: "typescript-validation",
+            status: "FAIL",
+            details: `Infrastructure timeout: insufficient budget remaining for TypeScript validation (${getRemainingBudgetMs()}ms remaining, 20000ms minimum floor)`,
+          });
+          errors.push("Infrastructure timeout: insufficient budget remaining for TypeScript validation");
+          checks.push({
+            name: "production-build",
+            category: "production-build",
+            status: "SKIPPED",
+            details: "Skipped due to insufficient deadline budget",
+          });
+        } else {
+          const tscTimeoutMs = Math.min(30000, Math.max(5000, getRemainingBudgetMs() - 15000));
+          const tscCmd = runner === "bun"
+            ? `cd "${targetWorkspaceDir}" && bun run tsc --noEmit`
+            : `cd "${targetWorkspaceDir}" && npx tsc --noEmit`;
+
+          try {
+            const tscResult = await executor.run(tscCmd, { timeoutMs: tscTimeoutMs });
+            if (tscResult.exitCode === 0) {
+              tscPassed = true;
+              checks.push({
+                name: "typescript-validation",
+                category: "typescript-validation",
+                status: "PASS",
+                details: "TypeScript compiled with zero errors",
+              });
+            } else {
+              const timedOut = isTimeoutError(tscResult.stderr) || isTimeoutError(tscResult.stdout);
+              if (timedOut) {
+                isInfrastructureTimeout = true;
+                await executor.run("pkill -f tsc || true", { timeoutMs: 3000 }).catch(() => {});
+                checks.push({
+                  name: "typescript-validation",
+                  category: "typescript-validation",
+                  status: "FAIL",
+                  details: "Infrastructure timeout: TypeScript validation exceeded deadline budget",
+                });
+                errors.push("Infrastructure timeout: TypeScript validation exceeded deadline budget");
+              } else {
+                const tscErr = extractCompilerDiagnostics(tscResult.stdout, tscResult.stderr, "TypeScript typecheck failed");
+                checks.push({
+                  name: "typescript-validation",
+                  category: "typescript-validation",
+                  status: "FAIL",
+                  details: tscErr,
+                });
+                errors.push(`TypeScript error:\n${tscErr}`);
+              }
+            }
+          } catch (tscCmdErr: unknown) {
+            const err = tscCmdErr as { stdout?: string; stderr?: string; message?: string };
+            const timedOut = isTimeoutError(err?.message) || isTimeoutError(err?.stderr);
+            if (timedOut) {
+              isInfrastructureTimeout = true;
+              await executor.run("pkill -f tsc || true", { timeoutMs: 3000 }).catch(() => {});
+              checks.push({
+                name: "typescript-validation",
+                category: "typescript-validation",
+                status: "FAIL",
+                details: "Infrastructure timeout: TypeScript validation exceeded deadline budget",
+              });
+              errors.push("Infrastructure timeout: TypeScript validation exceeded deadline budget");
+            } else {
+              const tscErr = extractCompilerDiagnostics(err?.stdout, err?.stderr, String(err?.message || tscCmdErr));
+              checks.push({
+                name: "typescript-validation",
+                category: "typescript-validation",
+                status: "FAIL",
+                details: tscErr,
+              });
+              errors.push(`TypeScript validation failed to execute:\n${tscErr}`);
+            }
+          }
+
+          // Prerequisite gating: Only run production build if TypeScript validation fully passed
+          if (!tscPassed) {
+            checks.push({
+              name: "production-build",
+              category: "production-build",
+              status: "SKIPPED",
+              details: "Skipped because prerequisite TypeScript validation failed or timed out",
+            });
+          } else if (getRemainingBudgetMs() < 25000) {
+            isInfrastructureTimeout = true;
+            checks.push({
+              name: "production-build",
+              category: "production-build",
+              status: "FAIL",
+              details: `Infrastructure timeout: insufficient budget remaining for production build (${getRemainingBudgetMs()}ms remaining, 25000ms minimum floor)`,
+            });
+            errors.push("Infrastructure timeout: insufficient budget remaining for production build");
+          } else {
+            const buildTimeoutMs = Math.min(60000, Math.max(10000, getRemainingBudgetMs() - 5000));
+            const buildCmd = runner === "bun"
+              ? `cd "${targetWorkspaceDir}" && bun run build`
+              : `cd "${targetWorkspaceDir}" && npm run build`;
+
+            try {
+              const buildResult = await executor.run(buildCmd, { timeoutMs: buildTimeoutMs });
+              if (buildResult.exitCode === 0) {
+                checks.push({
+                  name: "production-build",
+                  category: "production-build",
+                  status: "PASS",
+                  details: "Production build succeeded",
+                });
+              } else {
+                const timedOut = isTimeoutError(buildResult.stderr) || isTimeoutError(buildResult.stdout);
+                if (timedOut) {
+                  isInfrastructureTimeout = true;
+                  await executor.run("pkill -f 'next build' || pkill -f 'bun.*build' || true", { timeoutMs: 3000 }).catch(() => {});
+                  checks.push({
+                    name: "production-build",
+                    category: "production-build",
+                    status: "FAIL",
+                    details: "Infrastructure timeout: Production build exceeded deadline budget",
+                  });
+                  errors.push("Infrastructure timeout: Production build exceeded deadline budget");
+                } else {
+                  const buildErr = extractCompilerDiagnostics(buildResult.stdout, buildResult.stderr, "Build failed");
+                  checks.push({
+                    name: "production-build",
+                    category: "production-build",
+                    status: "FAIL",
+                    details: buildErr,
+                  });
+                  errors.push(`Production build error:\n${buildErr}`);
+                }
+              }
+            } catch (buildCmdErr: unknown) {
+              const err = buildCmdErr as { stdout?: string; stderr?: string; message?: string };
+              const timedOut = isTimeoutError(err?.message) || isTimeoutError(err?.stderr);
+              if (timedOut) {
+                isInfrastructureTimeout = true;
+                await executor.run("pkill -f 'next build' || pkill -f 'bun.*build' || true", { timeoutMs: 3000 }).catch(() => {});
+                checks.push({
+                  name: "production-build",
+                  category: "production-build",
+                  status: "FAIL",
+                  details: "Infrastructure timeout: Production build exceeded deadline budget",
+                });
+                errors.push("Infrastructure timeout: Production build exceeded deadline budget");
+              } else {
+                const buildErr = extractCompilerDiagnostics(err?.stdout, err?.stderr, String(err?.message || buildCmdErr));
+                checks.push({
+                  name: "production-build",
+                  category: "production-build",
+                  status: "FAIL",
+                  details: buildErr,
+                });
+                errors.push(`Production build command failed:\n${buildErr}`);
+              }
+            }
+          }
+        }
       }
     } catch (sandboxConnErr) {
       checks.push({
@@ -1137,7 +1293,6 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     : 100;
 
   const verificationMode = executedSandboxChecks ? "sandbox-verified" : "static-only";
-
   const executedCategories = Array.from(new Set(checks.map((c) => c.category))) as QACheckCategory[];
 
   let factualSummary = "";
@@ -1151,15 +1306,19 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       : `Static source analysis failed: ${errors.join("; ")}`;
   }
 
+  // When failure is an infrastructure timeout, repairNeeded is strictly false (AI cannot fix infra timeouts)
+  const repairNeeded = !passed && !isInfrastructureTimeout;
+
   const report: QAReport = {
     passed,
     score,
     checks,
-    repairNeeded: !passed,
-    repairInstructions: !passed
+    repairNeeded,
+    repairInstructions: !passed && !isInfrastructureTimeout
       ? `Validation failed with the following issues:\n${errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
       : undefined,
     verificationMode,
+    isInfrastructureTimeout,
     summary: factualSummary,
     executedCategories,
   };

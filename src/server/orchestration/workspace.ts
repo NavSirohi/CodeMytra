@@ -85,52 +85,103 @@ export async function writeWorkspaceFiles(
   }
 }
 
+export interface PreviewServerOptions {
+  timeoutMs?: number;
+  maxAttempts?: number;
+  pollIntervalMs?: number;
+}
+
+export class PreviewReadinessError extends Error {
+  constructor(message: string, public readonly logSnippet?: string) {
+    super(message);
+    this.name = "PreviewReadinessError";
+  }
+}
+
+export interface PreviewSandboxRunner {
+  commands: {
+    run(command: string, options?: { timeoutMs?: number }): Promise<{ exitCode?: number; stdout?: string; stderr?: string }>;
+  };
+}
+
 /**
  * Ensures that the sandbox Next.js development server is active, listening on port 3000,
  * and responsive to HTTP requests before returning the public preview URL to the user.
- * Syncs workspace files to /home/user (to satisfy template root watchers) and spawns
- * the dev server in the background if not currently active.
+ * 
+ * 1. Proactively clears any stale or conflicting processes on port 3000.
+ * 2. Starts the development server directly within PROJECT_WORKSPACE_DIR (/home/user/workspace).
+ * 3. Uses bounded independent HTTP polling to verify responsiveness without SDK-level timeout hangs.
+ * 4. Extracts server logs and throws PreviewReadinessError if the server fails to become ready.
  */
-export async function ensureSandboxPreviewServer(sandbox: Sandbox): Promise<void> {
-  const syncAndCheckScript = `
-    # Sync files from workspace to /home/user for preview watchers
-    if [ -d "${PROJECT_WORKSPACE_DIR}" ]; then
-      cp -rn "${PROJECT_WORKSPACE_DIR}"/* /home/user/ 2>/dev/null || true
-    fi
+export async function ensureSandboxPreviewServer(
+  sandbox: Sandbox | PreviewSandboxRunner,
+  options?: PreviewServerOptions
+): Promise<void> {
+  const maxAttempts = options?.maxAttempts ?? 12;
+  const pollIntervalMs = options?.pollIntervalMs ?? 1000;
 
-    # Check if port 3000 is responding
-    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")
-    if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "304" ] || [ "$HTTP_STATUS" = "302" ] || [ "$HTTP_STATUS" = "307" ] || [ "$HTTP_STATUS" = "308" ]; then
-      echo "ALREADY_ACTIVE:$HTTP_STATUS"
-      exit 0
-    fi
-
-    # Not responding on port 3000: start dev server in background
-    cd "${PROJECT_WORKSPACE_DIR}"
-    if command -v bun >/dev/null 2>&1; then
-      nohup bun run dev --port 3000 > /tmp/next-dev.log 2>&1 &
-    else
-      nohup npm run dev -- --port 3000 > /tmp/next-dev.log 2>&1 &
-    fi
-
-    # Poll up to 15 seconds for HTTP responsiveness
-    for i in $(seq 1 15); do
-      sleep 1
-      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")
-      if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "304" ] || [ "$HTTP_STATUS" = "302" ] || [ "$HTTP_STATUS" = "307" ] || [ "$HTTP_STATUS" = "308" ]; then
-        echo "STARTED:$HTTP_STATUS"
-        exit 0
-      fi
-    done
-
-    echo "TIMEOUT:$HTTP_STATUS"
-    exit 0
-  `;
-
+  // 1. Check if port 3000 is already active and serving our application
   try {
-    await sandbox.commands.run(syncAndCheckScript, { timeoutMs: 25000 });
-  } catch (err) {
-    console.warn("[ensureSandboxPreviewServer] Dev server check encountered non-fatal error:", err);
+    const probeRes = await sandbox.commands.run(
+      'curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:3000 || echo "000"',
+      { timeoutMs: 3500 }
+    );
+    const probeStatus = (probeRes.stdout || "").trim();
+    if (["200", "304", "302", "307", "308"].includes(probeStatus)) {
+      return;
+    }
+  } catch {
+    // Probe failed or timed out; continue to port clearance and fresh server start
   }
+
+  // 2. Clear rogue processes holding port 3000
+  try {
+    await sandbox.commands.run(
+      "fuser -k 3000/tcp 2>/dev/null || pkill -f 'next dev' || pkill -f 'bun.*dev' || true",
+      { timeoutMs: 5000 }
+    );
+  } catch {
+    // Non-fatal cleanup attempt
+  }
+
+  // 3. Start dev server in the canonical workspace in the background
+  const startCmd = `cd "${PROJECT_WORKSPACE_DIR}" && (command -v bun >/dev/null 2>&1 && nohup bun run dev --port 3000 > /tmp/preview.log 2>&1 & || nohup npm run dev -- --port 3000 > /tmp/preview.log 2>&1 &)`;
+  await sandbox.commands.run(startCmd, { timeoutMs: 6000 });
+
+  // 4. Bounded independent polling
+  let lastStatus = "000";
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+
+    try {
+      const pollRes = await sandbox.commands.run(
+        'curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:3000 || echo "000"',
+        { timeoutMs: 3000 }
+      );
+      lastStatus = (pollRes.stdout || "").trim();
+      if (["200", "304", "302", "307", "308"].includes(lastStatus)) {
+        return;
+      }
+    } catch {
+      // Individual poll timeout or network error; proceed to next attempt
+    }
+  }
+
+  // 5. Readiness timeout: capture dev server log and report failure
+  let logSnippet = "No preview log found";
+  try {
+    const logRes = await sandbox.commands.run("cat /tmp/preview.log 2>/dev/null | tail -n 40 || true", {
+      timeoutMs: 4000,
+    });
+    logSnippet = logRes.stdout?.trim() || logSnippet;
+  } catch {
+    // Log read failure
+  }
+
+  throw new PreviewReadinessError(
+    `Preview server failed to respond on port 3000 (status: ${lastStatus}) after ${maxAttempts} attempts. Dev log:\n${logSnippet}`,
+    logSnippet
+  );
 }
+
 

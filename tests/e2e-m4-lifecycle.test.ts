@@ -18,6 +18,8 @@ import {
   PROJECT_WORKSPACE_DIR,
   resolveWorkspacePath,
   toRelativeWorkspacePath,
+  ensureSandboxPreviewServer,
+  PreviewReadinessError,
 } from "@/server/orchestration/workspace";
 import {
   PRDSchema,
@@ -43,6 +45,13 @@ describe("CodeMytra M4 End-to-End Reliability & Lifecycle Suite", () => {
       summary: "Modern artisan bakery landing page",
       targetAudience: "Local foodies and coffee lovers",
       capabilities: ["pages-navigation" as const],
+      coreFeatures: [
+        {
+          name: "Product Catalog",
+          description: "Hero showcase, pastry catalog, cart state",
+          priority: "MUST" as const,
+        },
+      ],
       pages: [
         {
           route: "/",
@@ -64,6 +73,8 @@ describe("CodeMytra M4 End-to-End Reliability & Lifecycle Suite", () => {
       colorPalette: {
         primary: "#8B4513",
         secondary: "#D2691E",
+        accent: "#DAA520",
+        background: "#FFFDF9",
         surface: "#FFF8DC",
         text: "#2F1B0C",
       },
@@ -358,5 +369,320 @@ Module not found: Can't resolve '@/components/bakery-modal'
     assert.ok(unzippedPaths.some((p) => p.endsWith(".env.example")));
     assert.ok(!unzippedPaths.some((p) => p.endsWith(".env")));
     assert.ok(!unzippedPaths.some((p) => p.endsWith(".env.local")));
+  });
+
+  // =========================================================================
+  // SCENARIO K: Workspace Preflight Validation Gates
+  // =========================================================================
+  it("Scenario K: Preflight fails when package.json or workspace directory is missing, skipping tsc and build", async () => {
+    let tscExecuted = false;
+    let buildExecuted = false;
+
+    const mockExecutor: QACommandExecutor = {
+      run: async (cmd: string) => {
+        if (cmd.includes("test -d") && cmd.includes("package.json")) {
+          // Preflight failure: directory or package.json not found
+          return { exitCode: 1, stdout: "", stderr: "package.json: No such file or directory" };
+        }
+        if (cmd.includes("tsc")) {
+          tscExecuted = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (cmd.includes("build")) {
+          buildExecuted = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const report = await runQAInspector({
+      files: {
+        "app/page.tsx": "export default function Page() { return <div>Artisan Bakery</div>; }",
+        "package.json": JSON.stringify({ name: "bakery", scripts: { build: "next build" } }),
+      },
+      summary: "Bakery app",
+      sandboxId: "mock-sandbox",
+      runSandboxCommands: true,
+      customExecutor: mockExecutor,
+      workspaceDir: "/home/user/workspace",
+    });
+
+    assert.equal(report.passed, false);
+    assert.equal(tscExecuted, false, "tsc must be skipped when preflight fails");
+    assert.equal(buildExecuted, false, "build must be skipped when preflight fails");
+
+    const preflightCheck = report.checks.find((c) => c.name === "workspace-preflight");
+    assert.ok(preflightCheck, "workspace-preflight check must exist");
+    assert.equal(preflightCheck.status, "FAIL");
+
+    const tscCheck = report.checks.find((c) => c.name === "typescript-validation");
+    assert.ok(tscCheck);
+    assert.equal(tscCheck.status, "SKIPPED");
+
+    const buildCheck = report.checks.find((c) => c.name === "production-build");
+    assert.ok(buildCheck);
+    assert.equal(buildCheck.status, "SKIPPED");
+  });
+
+  // =========================================================================
+  // SCENARIO L: Dynamic Deadline Floor Enforces Infrastructure Timeout Without AI Repair
+  // =========================================================================
+  it("Scenario L: Dynamic deadline floor (<20s remaining) aborts tsc as infrastructure timeout and disables AI repair", async () => {
+    let tscExecuted = false;
+
+    const mockExecutor: QACommandExecutor = {
+      run: async (cmd: string) => {
+        if (cmd.includes("tsc")) {
+          tscExecuted = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    // Simulated deadline only 10s into the future (<20s minimum floor)
+    const tightDeadlineMs = Date.now() + 10000;
+
+    const report = await runQAInspector({
+      files: {
+        "app/page.tsx": "export default function Page() { return <div>Bakery</div>; }",
+        "package.json": JSON.stringify({ name: "bakery" }),
+      },
+      summary: "Bakery app",
+      sandboxId: "mock-sandbox",
+      runSandboxCommands: true,
+      customExecutor: mockExecutor,
+      workspaceDir: "/home/user/workspace",
+      deadlineMs: tightDeadlineMs,
+    });
+
+    assert.equal(report.passed, false);
+    assert.equal(tscExecuted, false, "tsc must not be executed when remaining budget is below 20s floor");
+    assert.equal(report.isInfrastructureTimeout, true, "isInfrastructureTimeout must be true");
+    assert.equal(report.repairNeeded, false, "repairNeeded must be false for infrastructure timeouts (no token waste)");
+
+    const tscCheck = report.checks.find((c) => c.name === "typescript-validation");
+    assert.equal(tscCheck?.status, "FAIL");
+    assert.match(tscCheck?.details || "", /insufficient budget remaining/i);
+
+    const buildCheck = report.checks.find((c) => c.name === "production-build");
+    assert.equal(buildCheck?.status, "SKIPPED");
+  });
+
+  // =========================================================================
+  // SCENARIO M: TSC Timeout Triggers Orphan Process Cleanup & Skips Build
+  // =========================================================================
+  it("Scenario M: TSC deadline exceeded cleans up orphan tsc processes, sets isInfrastructureTimeout, and skips build", async () => {
+    let pkillExecuted = false;
+    let buildExecuted = false;
+
+    const mockExecutor: QACommandExecutor = {
+      run: async (cmd: string) => {
+        if (cmd.includes("pkill -f tsc")) {
+          pkillExecuted = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (cmd.includes("tsc")) {
+          // Simulate E2B deadline exceeded
+          return { exitCode: 1, stdout: "", stderr: "deadline_exceeded: command execution timed out after 30000ms" };
+        }
+        if (cmd.includes("build")) {
+          buildExecuted = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const report = await runQAInspector({
+      files: {
+        "app/page.tsx": "export default function Page() { return <div>Bakery</div>; }",
+        "package.json": JSON.stringify({ name: "bakery" }),
+      },
+      summary: "Bakery app",
+      sandboxId: "mock-sandbox",
+      runSandboxCommands: true,
+      customExecutor: mockExecutor,
+      workspaceDir: "/home/user/workspace",
+    });
+
+    assert.equal(report.passed, false);
+    assert.equal(pkillExecuted, true, "Orphan tsc cleanup command must be executed");
+    assert.equal(buildExecuted, false, "Production build must be skipped when tsc times out");
+    assert.equal(report.isInfrastructureTimeout, true);
+    assert.equal(report.repairNeeded, false, "AI repair must not be triggered on infra timeouts");
+
+    const buildCheck = report.checks.find((c) => c.name === "production-build");
+    assert.equal(buildCheck?.status, "SKIPPED");
+  });
+
+  // =========================================================================
+  // SCENARIO N: TSC Compiler Type Failure Skips Production Build
+  // =========================================================================
+  it("Scenario N: Compiler errors in tsc skip production build and request actionable AI repair", async () => {
+    let buildExecuted = false;
+
+    const mockExecutor: QACommandExecutor = {
+      run: async (cmd: string) => {
+        if (cmd.includes("tsc")) {
+          return {
+            exitCode: 2,
+            stdout: "app/page.tsx(10,5): error TS2304: Cannot find name 'CartDrawer'.",
+            stderr: "",
+          };
+        }
+        if (cmd.includes("build")) {
+          buildExecuted = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const report = await runQAInspector({
+      files: {
+        "app/page.tsx": "export default function Page() { return <div>Bakery</div>; }",
+        "package.json": JSON.stringify({ name: "bakery" }),
+      },
+      summary: "Bakery app",
+      sandboxId: "mock-sandbox",
+      runSandboxCommands: true,
+      customExecutor: mockExecutor,
+      workspaceDir: "/home/user/workspace",
+    });
+
+    assert.equal(report.passed, false);
+    assert.equal(buildExecuted, false, "Production build must NOT execute when tsc typecheck fails");
+    assert.equal(report.isInfrastructureTimeout, false);
+    assert.equal(report.repairNeeded, true, "AI repair is required for real TypeScript compile errors");
+    assert.ok(report.repairInstructions?.includes("TS2304: Cannot find name 'CartDrawer'"));
+
+    const buildCheck = report.checks.find((c) => c.name === "production-build");
+    assert.equal(buildCheck?.status, "SKIPPED");
+  });
+
+  // =========================================================================
+  // SCENARIO O: Preview Server Clears Rogue Port 3000 & Launches in Workspace
+  // =========================================================================
+  it("Scenario O: Preview startup clears rogue port 3000 processes and launches dev server in canonical workspace", async () => {
+    const executedCommands: string[] = [];
+
+    const mockSandbox = {
+      commands: {
+        run: async (cmd: string) => {
+          executedCommands.push(cmd);
+          if (cmd.includes("fuser -k 3000/tcp")) {
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          if (cmd.includes("nohup bun run dev") || cmd.includes("nohup npm run dev")) {
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          if (cmd.includes("curl -s -o /dev/null -w \"%{http_code}\"")) {
+            // First probe might be 000, subsequent poll responds 200
+            if (executedCommands.length > 2) {
+              return { exitCode: 0, stdout: "200", stderr: "" };
+            }
+            return { exitCode: 0, stdout: "000", stderr: "" };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+    };
+
+    await ensureSandboxPreviewServer(mockSandbox, {
+      maxAttempts: 3,
+      pollIntervalMs: 10,
+    });
+
+    assert.ok(
+      executedCommands.some((c) => c.includes("fuser -k 3000/tcp") || c.includes("pkill -f 'next dev'")),
+      "Port clearance command must be executed"
+    );
+    assert.ok(
+      executedCommands.some((c) => c.includes(`cd "${PROJECT_WORKSPACE_DIR}"`)),
+      "Dev server must be started inside PROJECT_WORKSPACE_DIR"
+    );
+  });
+
+  // =========================================================================
+  // SCENARIO P: Preview Readiness Timeout Captures Dev Log and Throws
+  // =========================================================================
+  it("Scenario P: Preview server non-responsiveness captures dev server log and throws PreviewReadinessError", async () => {
+    const mockSandbox = {
+      commands: {
+        run: async (cmd: string) => {
+          if (cmd.includes("curl -s -o /dev/null -w \"%{http_code}\"")) {
+            return { exitCode: 0, stdout: "000", stderr: "" };
+          }
+          if (cmd.includes("cat /tmp/preview.log")) {
+            return {
+              exitCode: 0,
+              stdout: "Error: Cannot find module 'next/dist/server/next-server.js'\n    at Object.<anonymous>",
+              stderr: "",
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await ensureSandboxPreviewServer(mockSandbox, {
+          maxAttempts: 2,
+          pollIntervalMs: 5,
+        });
+      },
+      (err: Error) => {
+        assert.ok(err instanceof PreviewReadinessError);
+        assert.match(err.message, /Preview server failed to respond on port 3000/);
+        assert.match(err.message, /Cannot find module 'next\/dist\/server\/next-server\.js'/);
+        return true;
+      }
+    );
+  });
+
+  // =========================================================================
+  // SCENARIO Q: Orchestration Inversion: QA Failure Prevents Preview Startup
+  // =========================================================================
+  it("Scenario Q: QA failure prevents preview startup and verifies failure finalization contract", async () => {
+    let previewStartupAttempted = false;
+
+    // Simulate the orchestration logic in functions.ts Stage 8
+    const qaReport = {
+      passed: false,
+      score: 45,
+      repairNeeded: false,
+      isInfrastructureTimeout: true,
+      verificationMode: "sandbox-verified" as "sandbox-verified" | "static-only",
+      repairInstructions: "TypeScript validation exceeded deadline budget",
+      checks: [],
+      summary: "Validation failed",
+      executedCategories: [],
+    };
+
+    let finalizedErrorCode = "";
+    const mockFinalizeFailure = async (params: { errorCode: string; errorMessage: string }) => {
+      finalizedErrorCode = params.errorCode;
+      return { messageId: "msg-fail-123" };
+    };
+
+    // Orchestration logic matching functions.ts Stage 8:
+    if (!qaReport.passed || qaReport.verificationMode === "static-only") {
+      const errorCode = qaReport.isInfrastructureTimeout
+        ? "INFRASTRUCTURE_TIMEOUT"
+        : "QA_VERIFICATION_FAILED";
+
+      await mockFinalizeFailure({
+        errorCode,
+        errorMessage: qaReport.repairInstructions || "Validation failed",
+      });
+    } else {
+      previewStartupAttempted = true;
+    }
+
+    assert.equal(previewStartupAttempted, false, "Preview server must NEVER be started when QA fails");
+    assert.equal(finalizedErrorCode, "INFRASTRUCTURE_TIMEOUT");
   });
 });

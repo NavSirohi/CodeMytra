@@ -21,7 +21,6 @@ import {
 import {
   finalizeGenerationSuccess,
   finalizeGenerationFailure,
-  FinalizeGenerationSuccessResult,
   isRunActiveInDb,
 } from "@/server/orchestration/finalization";
 import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
@@ -775,6 +774,7 @@ export const codeAgentFunction = inngest.createFunction(
         runSandboxCommands: true,
         archSpec,
         capabilities: prd.capabilities,
+        deadlineMs,
       });
 
       // Bounded self-repair (1 repair iteration)
@@ -849,6 +849,7 @@ Conclude with an updated <task_summary>...</task_summary>.
             runSandboxCommands: true,
             archSpec,
             capabilities: prd.capabilities,
+            deadlineMs,
           });
         } catch (repairErr) {
           if (
@@ -912,26 +913,23 @@ Conclude with an updated <task_summary>...</task_summary>.
     const { report: qaReport, finalFiles, finalSummary } = qaResult;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 8: PERSISTENCE & PREVIEW
+    // STAGE 8: PERSISTENCE & PREVIEW (Executed strictly when QA verification succeeds)
     // ─────────────────────────────────────────────────────────────────────────
-    const sandboxUrl = await step.run("get-sandbox-url", async () => {
-      const sandbox = await connectSandbox(sandboxId);
-      await ensureSandboxPreviewServer(sandbox);
-      return `http://${sandbox.getHost(3000)}`;
-    });
+    if (!qaReport.passed || qaReport.verificationMode === "static-only") {
+      const failureReason = qaReport.verificationMode === "static-only"
+        ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
+        : (qaReport.repairInstructions || "Validation checks failed");
 
-    const finalizationResult = await step.run("save-result", async () => {
-      const saveStageStart = Date.now();
+      const errorCode = qaReport.isInfrastructureTimeout
+        ? "INFRASTRUCTURE_TIMEOUT"
+        : "QA_VERIFICATION_FAILED";
 
-      if (!qaReport.passed || qaReport.verificationMode === "static-only") {
-        const failureReason = qaReport.verificationMode === "static-only"
-          ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
-          : (qaReport.repairInstructions || "Validation checks failed");
-
-        const failResult = await finalizeGenerationFailure({
+      const failResult = await step.run("save-result", async () => {
+        const saveStageStart = Date.now();
+        const res = await finalizeGenerationFailure({
           projectId,
           generationRunId: runId,
-          errorCode: "QA_VERIFICATION_FAILED",
+          errorCode,
           errorMessage: failureReason,
         });
 
@@ -941,12 +939,56 @@ Conclude with an updated <task_summary>...</task_summary>.
           stageName: "save-result",
           startedAt: saveStageStart,
           finishedAt: Date.now(),
-          details: { passed: false, errorCode: "QA_VERIFICATION_FAILED" },
+          details: { passed: false, errorCode },
         });
 
         await aggregateAndPersistRunMetrics(runId, projectId, "FAILED");
+        return res;
+      });
 
-        return failResult;
+      return {
+        status: "FAILED" as const,
+        error: failureReason,
+        priorRevisionPreserved: true,
+        messageId: failResult.messageId,
+      };
+    }
+
+    // QA passed: start preview server and finalize project revision
+    const finalizationResult = await step.run("save-result", async () => {
+      const saveStageStart = Date.now();
+      let sandboxUrl = "";
+      try {
+        const sandbox = await connectSandbox(sandboxId);
+        await ensureSandboxPreviewServer(sandbox);
+        sandboxUrl = `http://${sandbox.getHost(3000)}`;
+      } catch (previewErr) {
+        const msg = previewErr instanceof Error ? previewErr.message : String(previewErr);
+        console.error("[save-result] Preview server startup failed:", msg);
+        const failResult = await finalizeGenerationFailure({
+          projectId,
+          generationRunId: runId,
+          errorCode: "PREVIEW_SERVER_FAILED",
+          errorMessage: `Preview server failed to start: ${msg}`,
+        });
+
+        await recordStageMetric({
+          runId,
+          projectId,
+          stageName: "save-result",
+          startedAt: saveStageStart,
+          finishedAt: Date.now(),
+          details: { passed: false, errorCode: "PREVIEW_SERVER_FAILED" },
+        });
+
+        await aggregateAndPersistRunMetrics(runId, projectId, "FAILED");
+        return {
+          failed: true as const,
+          messageId: failResult.messageId,
+          error: `Preview server failed to start: ${msg}`,
+          sandboxUrl: "",
+          successResult: null,
+        };
       }
 
       const successResult = await finalizeGenerationSuccess({
@@ -970,23 +1012,25 @@ Conclude with an updated <task_summary>...</task_summary>.
 
       await aggregateAndPersistRunMetrics(runId, projectId, "COMPLETED");
 
-      return successResult;
+      return {
+        failed: false as const,
+        sandboxUrl,
+        successResult,
+        messageId: successResult.messageId,
+        error: null,
+      };
     });
 
-    if (!qaReport.passed || qaReport.verificationMode === "static-only") {
-      const failureReason = qaReport.verificationMode === "static-only"
-        ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
-        : (qaReport.repairInstructions || "Validation checks failed");
-
+    if (finalizationResult.failed) {
       return {
         status: "FAILED" as const,
-        error: failureReason,
+        error: finalizationResult.error || "Preview server failed to start",
         priorRevisionPreserved: true,
         messageId: finalizationResult.messageId,
       };
     }
 
-    const successResult = finalizationResult as FinalizeGenerationSuccessResult;
+    const { sandboxUrl, successResult } = finalizationResult;
 
     return {
       status: "COMPLETED" as const,
@@ -994,9 +1038,9 @@ Conclude with an updated <task_summary>...</task_summary>.
       title: fragmentTitle,
       files: finalFiles,
       summary: finalSummary,
-      revisionId: successResult.revision.id,
-      revisionNumber: successResult.revision.revisionNumber,
-      messageId: successResult.messageId,
+      revisionId: successResult!.revision.id,
+      revisionNumber: successResult!.revision.revisionNumber,
+      messageId: successResult!.messageId,
     };
   }
 );

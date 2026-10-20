@@ -187,6 +187,7 @@ export const QAReportSchema = z.object({
   repairNeeded: z.boolean(),
   repairInstructions: z.string().optional(),
   verificationMode: z.enum(["sandbox-verified", "static-only"]).default("static-only"),
+  isInfrastructureTimeout: z.boolean().default(false),
   summary: z.string().default("Verification executed"),
   executedCategories: z.array(QACheckCategoryEnum).default([]),
 });
