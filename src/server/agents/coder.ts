@@ -7,7 +7,7 @@ import {
   createState,
 } from "@inngest/agent-kit";
 import { z } from "zod";
-import { getGeminiModel } from "@/server/providers/gemini";
+import { getOpenAIModel } from "@/server/providers/openai";
 import {
   PRD,
   DesignSpec,
@@ -466,11 +466,11 @@ export async function runCodingAgent(
 
   const selectedModel = model || (
     stepPrefix?.includes("repair")
-      ? "gemini-2.5-pro"
-      : "gemini-2.5-flash"
+      ? "gpt-4o"
+      : "gpt-4o-mini"
   );
 
-  const geminiModel = getGeminiModel({
+  const openAIModel = getOpenAIModel({
     model: selectedModel,
   });
 
@@ -484,7 +484,7 @@ export async function runCodingAgent(
     name: "code-agent",
     description: "Authoritative full-stack implementation agent",
     system: systemPrompt,
-    model: geminiModel,
+    model: openAIModel,
     tools: [
       // 1. Terminal Tool (operates inside project workspace with strict security and output limits)
       createTool({

@@ -21,7 +21,7 @@ import {
   checkGenerationDeadline,
   boundOperationTimeout,
 } from "../src/server/orchestration/stage-optimizer";
-import { getGeminiModel } from "../src/server/providers/gemini";
+import { getOpenAIModel } from "../src/server/providers/openai";
 import { PRD, ArchitectureSpec } from "../src/server/agent-contracts/schemas";
 import { initializeRunStartTime } from "../src/features/inngest/functions";
 
@@ -346,27 +346,27 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
   });
 
   describe("Task 2: Connect Model Selection to Real Execution", () => {
-    it("confirms recorded model equals the model actually passed to the Gemini provider", () => {
-      process.env.GEMINI_API_KEY = process.env.GEMINI_API_KEY || "test-gemini-key";
+    it("confirms recorded model equals the model actually passed to the OpenAI provider", () => {
+      process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-openai-key";
 
-      // 1. Architecture stage escalates to Pro
+      // 1. Architecture stage escalates to gpt-4o
       const archModel = selectModelForStage("architecture");
-      assert.equal(archModel, "gemini-2.5-pro");
-      const archAdapter = getGeminiModel({ model: archModel });
+      assert.equal(archModel, "gpt-4o");
+      const archAdapter = getOpenAIModel({ model: archModel });
       // Verify modelId passed into provider adapter equals selected model
-      assert.equal((archAdapter as any).modelId, "gemini-2.5-pro");
+      assert.equal((archAdapter as any).modelId, "gpt-4o");
 
-      // 2. Design stage selects economical Flash
+      // 2. Design stage selects economical gpt-4o-mini
       const designModel = selectModelForStage("design");
-      assert.equal(designModel, "gemini-2.5-flash");
-      const designAdapter = getGeminiModel({ model: designModel });
-      assert.equal((designAdapter as any).modelId, "gemini-2.5-flash");
+      assert.equal(designModel, "gpt-4o-mini");
+      const designAdapter = getOpenAIModel({ model: designModel });
+      assert.equal((designAdapter as any).modelId, "gpt-4o-mini");
 
-      // 3. Repair stage escalates to Pro
+      // 3. Repair stage escalates to gpt-4o
       const repairModel = selectModelForStage("repair", { isRepairAttempt: true });
-      assert.equal(repairModel, "gemini-2.5-pro");
-      const repairAdapter = getGeminiModel({ model: repairModel });
-      assert.equal((repairAdapter as any).modelId, "gemini-2.5-pro");
+      assert.equal(repairModel, "gpt-4o");
+      const repairAdapter = getOpenAIModel({ model: repairModel });
+      assert.equal((repairAdapter as any).modelId, "gpt-4o");
     });
   });
 
@@ -566,6 +566,22 @@ describe("Performance, Observability & Cost Corrections (PR 1)", () => {
         promptTokens: 1200,
         completionTokens: 450,
         totalTokens: 1650,
+      });
+
+      // From OpenAI raw chat completion response
+      const rawOpenAIJson = extractUsageMetadata({
+        raw: JSON.stringify({
+          usage: {
+            prompt_tokens: 2500,
+            completion_tokens: 600,
+            total_tokens: 3100,
+          },
+        }),
+      });
+      assert.deepEqual(rawOpenAIJson, {
+        promptTokens: 2500,
+        completionTokens: 600,
+        totalTokens: 3100,
       });
 
       // Missing metadata returns undefined (not zeros)

@@ -1,4 +1,4 @@
-import { getGeminiModel } from "@/server/providers/gemini";
+import { getOpenAIModel } from "@/server/providers/openai";
 import { PRD, DesignSpec, DesignSpecSchema } from "@/server/agent-contracts/schemas";
 import { prisma } from "@/lib/db";
 import { Prisma } from "@/generated/prisma/client";
@@ -46,10 +46,11 @@ export interface DesignerOptions {
 }
 
 export async function runDesignAgent(prd: PRD, options?: DesignerOptions): Promise<DesignSpec> {
-  const selectedModel = options?.model || "gemini-2.5-flash";
-  const model = getGeminiModel({
+  const selectedModel = options?.model || "gpt-4o-mini";
+  const model = getOpenAIModel({
     model: selectedModel,
     temperature: options?.temperature ?? 0.3,
+    responseFormat: { type: "json_object" },
   });
 
   const agent = createAgent({

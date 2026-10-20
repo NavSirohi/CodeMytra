@@ -235,44 +235,48 @@ describe("P1: Inngest Step Isolation & Planner Orchestration", () => {
         "AgentKit getStepTools() must resolve undefined inside runWithoutStepContext"
       );
 
-      // 3. Verify real AgentKit agent execution with gemini adapter
-      // Mock global fetch to return valid Gemini REST candidate
+      // 3. Verify real AgentKit agent execution with openai adapter
+      // Mock global fetch to return valid OpenAI Chat Completion
       const originalFetch = globalThis.fetch;
       globalThis.fetch = async () => {
         return new Response(
           JSON.stringify({
-            candidates: [
+            id: "chatcmpl-test-sdk",
+            object: "chat.completion",
+            choices: [
               {
-                content: {
-                  role: "model",
-                  parts: [
-                    {
-                      text: JSON.stringify({
-                        projectName: "Verified Invoice App",
-                        pages: ["/dashboard"],
-                      }),
-                    },
-                  ],
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: JSON.stringify({
+                    projectName: "Verified Invoice App",
+                    pages: ["/dashboard"],
+                  }),
                 },
+                finish_reason: "stop",
               },
             ],
+            usage: { prompt_tokens: 120, completion_tokens: 45, total_tokens: 165 },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } }
         );
       };
 
       try {
-        const geminiAdapter = {
-          format: "gemini",
-          model: "gemini-2.5-pro",
-          url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+        const openaiAdapter = {
+          format: "openai-chat",
+          model: "gpt-4o-mini",
+          url: "https://api.openai.com/v1/chat/completions",
           authKey: "synthetic-key",
+          onCall: (_: any, body: any) => {
+            body.model = "gpt-4o-mini";
+          },
         };
 
         const agent = createAgent({
           name: "planner-agent-sdk-verified",
           system: "Generate PRD",
-          model: geminiAdapter as any,
+          model: openaiAdapter as any,
         });
 
         // Run agent inside runWithoutStepContext
@@ -333,28 +337,25 @@ describe("P1: Inngest Step Isolation & Planner Orchestration", () => {
   });
 
   it("verifies supported alternative: direct provider invocation has zero ALS ambient context dependencies", async () => {
-    // Verify that direct provider invocation (e.g. Google Gemini REST/SDK) works identically
+    // Verify that direct provider invocation (e.g. OpenAI Chat Completions REST/SDK) works identically
     // without inspecting or relying on Node.js AsyncLocalStorage or Inngest internal symbols
     const originalFetch = globalThis.fetch;
     let fetchCalled = false;
 
     globalThis.fetch = (async (url: string) => {
       fetchCalled = true;
-      assert.ok(String(url).includes("generativelanguage.googleapis.com"));
+      assert.ok(String(url).includes("api.openai.com"));
       return new Response(
         JSON.stringify({
-          candidates: [
+          id: "chatcmpl-direct",
+          choices: [
             {
-              content: {
-                role: "model",
-                parts: [
-                  {
-                    text: JSON.stringify({
-                      title: "Direct Provider App",
-                      modules: ["Auth", "Dashboard"],
-                    }),
-                  },
-                ],
+              message: {
+                role: "assistant",
+                content: JSON.stringify({
+                  title: "Direct Provider App",
+                  modules: ["Auth", "Dashboard"],
+                }),
               },
             },
           ],
@@ -366,13 +367,16 @@ describe("P1: Inngest Step Isolation & Planner Orchestration", () => {
     try {
       // Direct provider invocation helper: independent of Inngest internals
       const invokeDirectProvider = async (prompt: string) => {
-        const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", {
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+          headers: { "Content-Type": "application/json", Authorization: "Bearer sk-synthetic" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
+          }),
         });
         const json = await res.json();
-        return JSON.parse(json.candidates[0].content.parts[0].text);
+        return JSON.parse(json.choices[0].message.content);
       };
 
       const result = await invokeDirectProvider("Generate specification");

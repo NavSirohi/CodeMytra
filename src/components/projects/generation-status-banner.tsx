@@ -64,7 +64,7 @@ export function GenerationStatusBanner({ projectId }: { projectId: string }) {
       {isRunning && (
         <>
           <Loader2 className="size-3.5 animate-spin text-blue-500" />
-          <span>Implementation Agent: Building your Next.js application with Gemini...</span>
+          <span>Implementation Agent: Building your Next.js application with OpenAI...</span>
         </>
       )}
 

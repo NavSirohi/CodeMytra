@@ -13,12 +13,12 @@ import { inngest } from "../src/features/inngest/client";
 import { prisma } from "../src/lib/db";
 import { OutboxStatus } from "../src/generated/prisma/client";
 
-describe("P0: Model Registry, Server Validation & Pipeline Propagation", () => {
-  it("defines complete shared model registry with expected entries and metadata", () => {
+describe("P0: Model Registry, Server Validation & Pipeline Propagation (OpenAI)", () => {
+  it("defines complete shared OpenAI model registry with expected entries and metadata", () => {
     assert.deepEqual([...AVAILABLE_MODEL_IDS], [
       "auto",
-      "gemini-2.5-pro",
-      "gemini-2.5-flash",
+      "gpt-4o",
+      "gpt-4o-mini",
     ]);
 
     for (const modelId of AVAILABLE_MODEL_IDS) {
@@ -33,17 +33,16 @@ describe("P0: Model Registry, Server Validation & Pipeline Propagation", () => {
   });
 
   it("strictly validates model preferences and rejects unsupported models", () => {
-    // Valid models
+    // Valid active OpenAI models
     assert.equal(isValidModelPreference("auto"), true);
-    assert.equal(isValidModelPreference("gemini-2.5-pro"), true);
-    assert.equal(isValidModelPreference("gemini-2.5-flash"), true);
+    assert.equal(isValidModelPreference("gpt-4o"), true);
+    assert.equal(isValidModelPreference("gpt-4o-mini"), true);
 
-    // Invalid / unsupported models
-    assert.equal(isValidModelPreference("gpt-4"), false);
-    assert.equal(isValidModelPreference("gpt-4o"), false);
+    // Invalid / unsupported models (including deprecated Gemini models from active selection)
+    assert.equal(isValidModelPreference("gemini-2.5-pro"), false);
+    assert.equal(isValidModelPreference("gemini-2.5-flash"), false);
     assert.equal(isValidModelPreference("claude-3-5-sonnet"), false);
     assert.equal(isValidModelPreference("gemini-1.5-pro"), false);
-    assert.equal(isValidModelPreference("gemini-2.0-flash"), false);
     assert.equal(isValidModelPreference(""), false);
     assert.equal(isValidModelPreference(null), false);
     assert.equal(isValidModelPreference(undefined), false);
@@ -51,71 +50,74 @@ describe("P0: Model Registry, Server Validation & Pipeline Propagation", () => {
     assert.equal(isValidModelPreference({}), false);
   });
 
-  it("normalizes unknown or omitted inputs safely to 'auto'", () => {
-    assert.equal(normalizeModelPreference("gemini-2.5-pro"), "gemini-2.5-pro");
-    assert.equal(normalizeModelPreference("gemini-2.5-flash"), "gemini-2.5-flash");
+  it("normalizes unknown or omitted inputs safely to 'auto', protecting historical records", () => {
+    assert.equal(normalizeModelPreference("gpt-4o"), "gpt-4o");
+    assert.equal(normalizeModelPreference("gpt-4o-mini"), "gpt-4o-mini");
     assert.equal(normalizeModelPreference("auto"), "auto");
+    // Historical Gemini preferences safely normalize to auto for new execution
+    assert.equal(normalizeModelPreference("gemini-2.5-pro"), "auto");
+    assert.equal(normalizeModelPreference("gemini-2.5-flash"), "auto");
     assert.equal(normalizeModelPreference(null), "auto");
     assert.equal(normalizeModelPreference(undefined), "auto");
     assert.equal(normalizeModelPreference("non-existent-model"), "auto");
   });
 
   describe("Stage Optimizer Model Routing", () => {
-    it("routes to gemini-2.5-pro across planning, architecture, coding, and repair when user selects Pro", () => {
-      const pref: ModelPreference = "gemini-2.5-pro";
-      assert.equal(selectModelForStage("planning", { modelPreference: pref }), "gemini-2.5-pro");
-      assert.equal(selectModelForStage("design", { modelPreference: pref }), "gemini-2.5-pro");
-      assert.equal(selectModelForStage("architecture", { modelPreference: pref }), "gemini-2.5-pro");
-      assert.equal(selectModelForStage("coding", { modelPreference: pref }), "gemini-2.5-pro");
-      assert.equal(selectModelForStage("repair", { isRepairAttempt: true, modelPreference: pref }), "gemini-2.5-pro");
+    it("routes to gpt-4o across planning, architecture, coding, and repair when user selects GPT-4o", () => {
+      const pref: ModelPreference = "gpt-4o";
+      assert.equal(selectModelForStage("planning", { modelPreference: pref }), "gpt-4o");
+      assert.equal(selectModelForStage("design", { modelPreference: pref }), "gpt-4o");
+      assert.equal(selectModelForStage("architecture", { modelPreference: pref }), "gpt-4o");
+      assert.equal(selectModelForStage("coding", { modelPreference: pref }), "gpt-4o");
+      assert.equal(selectModelForStage("repair", { isRepairAttempt: true, modelPreference: pref }), "gpt-4o");
     });
 
-    it("routes to gemini-2.5-flash across all stages when user selects Flash (including architecture & repair)", () => {
-      const pref: ModelPreference = "gemini-2.5-flash";
-      assert.equal(selectModelForStage("planning", { modelPreference: pref }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("design", { modelPreference: pref }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("architecture", { modelPreference: pref }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("coding", { modelPreference: pref }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("repair", { isRepairAttempt: true, modelPreference: pref }), "gemini-2.5-flash");
+    it("routes to gpt-4o-mini across all stages when user selects GPT-4o mini", () => {
+      const pref: ModelPreference = "gpt-4o-mini";
+      assert.equal(selectModelForStage("planning", { modelPreference: pref }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("design", { modelPreference: pref }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("architecture", { modelPreference: pref }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("coding", { modelPreference: pref }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("repair", { isRepairAttempt: true, modelPreference: pref }), "gpt-4o-mini");
     });
 
     it("uses adaptive routing when modelPreference is 'auto' or omitted", () => {
-      // Planning: Flash for simple, Pro for complex fullstack
-      assert.equal(selectModelForStage("planning", { isComplexFullstack: false }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("planning", { isComplexFullstack: true }), "gemini-2.5-pro");
+      // Planning: gpt-4o-mini for simple, gpt-4o for complex fullstack
+      assert.equal(selectModelForStage("planning", { isComplexFullstack: false }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("planning", { isComplexFullstack: true }), "gpt-4o");
 
-      // Design: always Flash
-      assert.equal(selectModelForStage("design"), "gemini-2.5-flash");
+      // Design: always gpt-4o-mini
+      assert.equal(selectModelForStage("design"), "gpt-4o-mini");
 
-      // Architecture: always Pro
-      assert.equal(selectModelForStage("architecture"), "gemini-2.5-pro");
+      // Architecture: always gpt-4o
+      assert.equal(selectModelForStage("architecture"), "gpt-4o");
 
-      // Coding: Flash for simple, Pro for complex fullstack
-      assert.equal(selectModelForStage("coding", { isComplexFullstack: false }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("coding", { isComplexFullstack: true }), "gemini-2.5-pro");
+      // Coding: gpt-4o-mini for simple, gpt-4o for complex fullstack
+      assert.equal(selectModelForStage("coding", { isComplexFullstack: false }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("coding", { isComplexFullstack: true }), "gpt-4o");
 
-      // Repair: Flash without flag, Pro on repair attempt
-      assert.equal(selectModelForStage("repair", { isRepairAttempt: false }), "gemini-2.5-flash");
-      assert.equal(selectModelForStage("repair", { isRepairAttempt: true }), "gemini-2.5-pro");
+      // Repair: gpt-4o-mini without flag, gpt-4o on repair attempt
+      assert.equal(selectModelForStage("repair", { isRepairAttempt: false }), "gpt-4o-mini");
+      assert.equal(selectModelForStage("repair", { isRepairAttempt: true }), "gpt-4o");
     });
 
     it("demonstrates each user-facing model selection produces measurably distinct provider configurations", () => {
       // Compare architecture stage across the 3 user options:
       const autoArch = selectModelForStage("architecture", { modelPreference: "auto" });
-      const flashArch = selectModelForStage("architecture", { modelPreference: "gemini-2.5-flash" });
-      const proArch = selectModelForStage("architecture", { modelPreference: "gemini-2.5-pro" });
+      const miniArch = selectModelForStage("architecture", { modelPreference: "gpt-4o-mini" });
+      const proArch = selectModelForStage("architecture", { modelPreference: "gpt-4o" });
 
-      assert.equal(autoArch, "gemini-2.5-pro");
-      assert.equal(flashArch, "gemini-2.5-flash"); // Flash forced even for architecture!
-      assert.equal(proArch, "gemini-2.5-pro");
-      assert.notEqual(flashArch, autoArch);
+      assert.equal(autoArch, "gpt-4o");
+      assert.equal(miniArch, "gpt-4o-mini");
+      assert.equal(proArch, "gpt-4o");
+      assert.notEqual(miniArch, autoArch);
 
       // Compare coding stage across simple project:
       const autoCoding = selectModelForStage("coding", { isComplexFullstack: false, modelPreference: "auto" });
-      const proCoding = selectModelForStage("coding", { isComplexFullstack: false, modelPreference: "gemini-2.5-pro" });
+      const proCoding = selectModelForStage("coding", { isComplexFullstack: false, modelPreference: "gpt-4o" });
 
-      assert.equal(autoCoding, "gemini-2.5-flash");
-      assert.equal(proCoding, "gemini-2.5-pro"); // Pro forced even for simple coding!
+      assert.equal(autoCoding, "gpt-4o-mini");
+      assert.equal(proCoding, "gpt-4o");
       assert.notEqual(autoCoding, proCoding);
     });
   });
@@ -128,7 +130,7 @@ describe("P0: Model Registry, Server Validation & Pipeline Propagation", () => {
       // Mock inngest.send
       (inngest as unknown as { send: (arg: unknown) => Promise<unknown> }).send = async (arg: unknown) => {
         sentEvents.push(arg as { name: string; data: Record<string, unknown> });
-        return { ids: ["mock-msg-id"] };
+        return { ids: ["mock-msg-id-1"] };
       };
 
       const originalQueryRawUnsafe = prisma.$queryRawUnsafe;
@@ -137,32 +139,33 @@ describe("P0: Model Registry, Server Validation & Pipeline Propagation", () => {
       };
 
       try {
-        const syntheticEvent = {
+        const testEvent = {
           id: "outbox-test-1",
           eventName: "code-agent/run",
           payload: {
-            runId: "run-test-pro-1",
+            runId: "run-test-1",
             projectId: "proj-test-1",
-            prompt: "Build an invoice tracker",
+            prompt: "Build an inventory tracker",
             baseRevisionId: null,
-            modelPreference: "gemini-2.5-pro",
+            modelPreference: "gpt-4o",
           },
           status: OutboxStatus.PROCESSING,
           attempts: 1,
-          lastError: null,
+          claimToken: "tok-test-1",
           claimedAt: new Date(),
           nextAttemptAt: null,
-          claimToken: "token-test-1",
+          lastError: null,
           createdAt: new Date(),
           processedAt: null,
         };
 
-        const result = await executeClaimedEvent(syntheticEvent);
+        const result = await executeClaimedEvent(testEvent);
         assert.equal(result.success, true);
         assert.equal(sentEvents.length, 1);
         assert.equal(sentEvents[0].name, "code-agent/run");
-        assert.equal(sentEvents[0].data.modelPreference, "gemini-2.5-pro");
-        assert.equal(sentEvents[0].data.runId, "run-test-pro-1");
+        assert.equal(sentEvents[0].data.runId, "run-test-1");
+        assert.equal(sentEvents[0].data.projectId, "proj-test-1");
+        assert.equal(sentEvents[0].data.modelPreference, "gpt-4o");
       } finally {
         (inngest as unknown as { send: typeof originalSend }).send = originalSend;
         (prisma as unknown as { $queryRawUnsafe: typeof originalQueryRawUnsafe }).$queryRawUnsafe = originalQueryRawUnsafe;

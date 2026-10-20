@@ -80,14 +80,14 @@ describe("Task 5: Real Generic-Generation Acceptance Suite", { timeout: 300000 }
   const hasLiveCredentials = Boolean(
     process.env.E2B_API_KEY &&
     process.env.E2B_TEMPLATE_ID &&
-    process.env.GEMINI_API_KEY
+    process.env.OPENAI_API_KEY
   );
 
   for (const scenario of ACCEPTANCE_SCENARIOS) {
     it(`executes genuine production generation, follow-up, QA, and export for "${scenario.name}"`, async (t) => {
       if (!hasLiveCredentials) {
         t.skip(
-          `SKIPPED: Missing live cloud credentials (E2B_API_KEY, E2B_TEMPLATE_ID, GEMINI_API_KEY) for ${scenario.name}`
+          `SKIPPED: Missing live cloud credentials (E2B_API_KEY, E2B_TEMPLATE_ID, OPENAI_API_KEY) for ${scenario.name}`
         );
         return;
       }

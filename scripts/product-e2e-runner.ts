@@ -127,12 +127,12 @@ async function main() {
 
   const e2bKey = process.env.E2B_API_KEY;
   const e2bTemplateId = process.env.E2B_TEMPLATE_ID;
-  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
 
   const missingCreds: string[] = [];
   if (!e2bKey) missingCreds.push("E2B_API_KEY");
   if (!e2bTemplateId) missingCreds.push("E2B_TEMPLATE_ID");
-  if (!geminiKey) missingCreds.push("GEMINI_API_KEY");
+  if (!openaiKey) missingCreds.push("OPENAI_API_KEY");
 
   if (missingCreds.length > 0) {
     console.log("--------------------------------------------------------------------------------");

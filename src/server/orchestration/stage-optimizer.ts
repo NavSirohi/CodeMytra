@@ -1,5 +1,5 @@
 import { PRD, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
-import { GeminiModelTier } from "@/server/providers/gemini";
+import { OpenAIModelTier } from "@/server/providers/openai";
 import { ModelPreference } from "@/lib/models";
 
 /**
@@ -22,41 +22,41 @@ export const GENERATION_LIMITS: GenerationLimits = {
 export interface SelectModelOptions {
   isComplexFullstack?: boolean;
   isRepairAttempt?: boolean;
-  modelPreference?: ModelPreference;
+  modelPreference?: ModelPreference | string;
 }
 
 /**
- * Strategy for selecting economical vs capable models based on stage, complexity,
+ * Strategy for selecting economical vs capable OpenAI models based on stage, complexity,
  * and user-selected model preference.
  */
 export function selectModelForStage(
   stage: "planning" | "design" | "architecture" | "coding" | "repair",
   options?: SelectModelOptions
-): GeminiModelTier {
+): OpenAIModelTier {
   // Explicit user preference overrides adaptive routing
-  if (options?.modelPreference === "gemini-2.5-pro") {
-    return "gemini-2.5-pro";
+  if (options?.modelPreference === "gpt-4o") {
+    return "gpt-4o";
   }
-  if (options?.modelPreference === "gemini-2.5-flash") {
-    return "gemini-2.5-flash";
+  if (options?.modelPreference === "gpt-4o-mini") {
+    return "gpt-4o-mini";
   }
 
   // Default / "auto" adaptive model routing:
   // Economical model by default for fast, lightweight stages
   if (stage === "design") {
-    return "gemini-2.5-flash";
+    return "gpt-4o-mini";
   }
   if (stage === "planning") {
-    return options?.isComplexFullstack ? "gemini-2.5-pro" : "gemini-2.5-flash";
+    return options?.isComplexFullstack ? "gpt-4o" : "gpt-4o-mini";
   }
-  // Escalate to Pro for complex architecture decisions or after a verification failure in repair
+  // Escalate to GPT-4o for complex architecture decisions or after a verification failure in repair
   if (stage === "architecture" || (stage === "repair" && options?.isRepairAttempt)) {
-    return "gemini-2.5-pro";
+    return "gpt-4o";
   }
   if (stage === "coding") {
-    return options?.isComplexFullstack ? "gemini-2.5-pro" : "gemini-2.5-flash";
+    return options?.isComplexFullstack ? "gpt-4o" : "gpt-4o-mini";
   }
-  return "gemini-2.5-flash";
+  return "gpt-4o-mini";
 }
 
 export class GenerationTimeoutError extends Error {
@@ -74,7 +74,7 @@ export class GenerationTimeoutError extends Error {
  * Persisted Run Deadline & Timeout Context.
  *
  * NOTE ON EXTERNAL PROVIDER NON-PREEMPTIVE CANCELLATION:
- * External AI providers (e.g. Google Gemini API via SDK/HTTP) and sandbox subprocesses
+ * External AI providers (e.g. OpenAI API via HTTP/SDK) and sandbox subprocesses
  * (e.g. npm install, next build inside E2B container) execute out-of-process.
  * Standard cloud SDKs and child-process wrappers cannot be preemptively interrupted mid-flight
  * without aborting underlying TCP sockets or killing entire containers.

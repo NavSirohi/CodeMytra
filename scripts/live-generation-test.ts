@@ -69,16 +69,16 @@ async function main() {
 
   const e2bKey = process.env.E2B_API_KEY;
   const e2bTemplate = process.env.E2B_TEMPLATE_ID;
-  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
 
-  if (!e2bKey || !e2bTemplate || !geminiKey) {
+  if (!e2bKey || !e2bTemplate || !openaiKey) {
     console.log("\n" + "-".repeat(80));
     console.log("STATUS: [SKIPPED] Missing credentials for live generation acceptance suite");
     console.log("-".repeat(80));
     console.log("The following environment variables are required for live cloud verification:");
     if (!e2bKey) console.log("  - E2B_API_KEY");
     if (!e2bTemplate) console.log("  - E2B_TEMPLATE_ID");
-    if (!geminiKey) console.log("  - GEMINI_API_KEY");
+    if (!openaiKey) console.log("  - OPENAI_API_KEY");
     console.log("\nNote: Unit & database tests (npm test) provide offline deterministic proof.");
     console.log("The suite verifies the 4 generic scenarios through the unified multi-agent engine:");
     console.log("  1. Static Developer Portfolio (no DB, clean responsive UI, contact form)");

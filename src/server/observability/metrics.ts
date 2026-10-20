@@ -17,19 +17,26 @@ export interface PricingConfig {
 }
 
 /**
- * Standard baseline model pricing (Google Gemini rates as of 2026).
- * Flash: $0.075 / 1M input (<128k), $0.30 / 1M output
- * Pro: $1.25 / 1M input (<128k), $5.00 / 1M output
+ * Standard baseline model pricing (OpenAI rates as of 2026, with historical Gemini retention).
+ * gpt-4o: $2.50 / 1M input, $10.00 / 1M output
+ * gpt-4o-mini: $0.15 / 1M input, $0.60 / 1M output
+ * Historical Gemini rates preserved for immutable accuracy of historical records:
+ * gemini-2.5-flash: $0.075 / 1M input, $0.30 / 1M output
+ * gemini-2.5-pro: $1.25 / 1M input, $5.00 / 1M output
  */
 export const DEFAULT_PRICING_CONFIG: PricingConfig = {
   rates: {
+    // Active OpenAI Models
+    "gpt-4o": { inputPerMillionUsd: 2.50, outputPerMillionUsd: 10.00 },
+    "gpt-4o-mini": { inputPerMillionUsd: 0.15, outputPerMillionUsd: 0.60 },
+    // Historical Models (Preserved for immutable cost auditability)
     "gemini-2.5-flash": { inputPerMillionUsd: 0.075, outputPerMillionUsd: 0.30 },
     "gemini-2.5-pro": { inputPerMillionUsd: 1.25, outputPerMillionUsd: 5.00 },
     "gemini-2.0-flash": { inputPerMillionUsd: 0.10, outputPerMillionUsd: 0.40 },
     "gemini-1.5-flash": { inputPerMillionUsd: 0.075, outputPerMillionUsd: 0.30 },
     "gemini-1.5-pro": { inputPerMillionUsd: 1.25, outputPerMillionUsd: 5.00 },
   },
-  defaultRate: { inputPerMillionUsd: 0.10, outputPerMillionUsd: 0.40 },
+  defaultRate: { inputPerMillionUsd: 0.15, outputPerMillionUsd: 0.60 },
 };
 
 export const COST_DISCLAIMER =
@@ -74,30 +81,30 @@ export function calculateCost(
     };
   }
 
+  // Helper to find model rate without substring collision (e.g. gpt-4o shadowing gpt-4o-mini)
+  const resolveRate = (): ModelRate => {
+    if (pricingConfig.rates[modelId]) {
+      return pricingConfig.rates[modelId];
+    }
+    const lower = modelId.toLowerCase();
+    const sortedKeys = Object.keys(pricingConfig.rates).sort((a, b) => b.length - a.length);
+    const key =
+      sortedKeys.find((k) => lower === k.toLowerCase()) ||
+      sortedKeys.find((k) => lower.includes(k.toLowerCase()));
+    return key ? pricingConfig.rates[key] : pricingConfig.defaultRate;
+  };
+
   // If token counts are missing/undefined, do not report missing usage as measured zero
   if (promptTokens === undefined || completionTokens === undefined) {
-    // We can identify the rate that would apply to this model, but cost cannot be measured
-    const normalizedKey = Object.keys(pricingConfig.rates).find((k) =>
-      modelId.toLowerCase().includes(k.toLowerCase())
-    );
-    const rateUsed = normalizedKey
-      ? pricingConfig.rates[normalizedKey]
-      : pricingConfig.defaultRate;
-
     return {
       costUsd: undefined,
-      rateUsed,
+      rateUsed: resolveRate(),
       usageMeasured: false,
     };
   }
 
   // Both model and token counts are known
-  const normalizedKey = Object.keys(pricingConfig.rates).find((k) =>
-    modelId.toLowerCase().includes(k.toLowerCase())
-  );
-  const rateUsed = normalizedKey
-    ? pricingConfig.rates[normalizedKey]
-    : pricingConfig.defaultRate;
+  const rateUsed = resolveRate();
 
   const inputCost = (promptTokens / 1_000_000) * rateUsed.inputPerMillionUsd;
   const outputCost = (completionTokens / 1_000_000) * rateUsed.outputPerMillionUsd;
@@ -111,7 +118,7 @@ export function calculateCost(
 }
 
 /**
- * Extracts real provider usage metadata when supplied.
+ * Extracts real provider usage metadata when supplied (supporting OpenAI and historical Gemini).
  */
 export function extractUsageMetadata(rawResult: unknown): {
   promptTokens?: number;
@@ -122,19 +129,53 @@ export function extractUsageMetadata(rawResult: unknown): {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const anyResult = rawResult as any;
 
-  // 1. Direct usage object (Inngest AgentKit RunCompletedEvent, etc.)
-  if (anyResult.usage && typeof anyResult.usage === "object") {
-    const u = anyResult.usage;
-    if (typeof u.promptTokens === "number" || typeof u.completionTokens === "number") {
-      return {
-        promptTokens: u.promptTokens,
-        completionTokens: u.completionTokens,
-        totalTokens: u.totalTokens ?? ((u.promptTokens || 0) + (u.completionTokens || 0)),
-      };
+  // 1. Direct usage object (Inngest AgentKit or standard OpenAI chat completion usage)
+  const candidateUsages = [
+    anyResult.usage,
+    anyResult.raw?.usage,
+    typeof anyResult.raw === "string"
+      ? (() => {
+          try {
+            return JSON.parse(anyResult.raw)?.usage;
+          } catch {
+            return undefined;
+          }
+        })()
+      : undefined,
+  ];
+
+  for (const u of candidateUsages) {
+    if (u && typeof u === "object") {
+      const prompt =
+        typeof u.prompt_tokens === "number"
+          ? u.prompt_tokens
+          : typeof u.promptTokens === "number"
+          ? u.promptTokens
+          : undefined;
+      const completion =
+        typeof u.completion_tokens === "number"
+          ? u.completion_tokens
+          : typeof u.completionTokens === "number"
+          ? u.completionTokens
+          : undefined;
+      const total =
+        typeof u.total_tokens === "number"
+          ? u.total_tokens
+          : typeof u.totalTokens === "number"
+          ? u.totalTokens
+          : undefined;
+
+      if (prompt !== undefined || completion !== undefined) {
+        return {
+          promptTokens: prompt,
+          completionTokens: completion,
+          totalTokens: total ?? ((prompt || 0) + (completion || 0)),
+        };
+      }
     }
   }
 
-  // 2. Raw JSON string from Gemini API
+  // 2. Raw JSON string from Gemini API (historical)
   if (typeof anyResult.raw === "string") {
     try {
       const parsed = JSON.parse(anyResult.raw);
@@ -151,7 +192,7 @@ export function extractUsageMetadata(rawResult: unknown): {
     }
   }
 
-  // 3. Parsed usageMetadata on raw object
+  // 3. Parsed usageMetadata on raw object (historical Gemini)
   if (anyResult.raw && typeof anyResult.raw === "object" && anyResult.raw.usageMetadata) {
     const um = anyResult.raw.usageMetadata;
     return {

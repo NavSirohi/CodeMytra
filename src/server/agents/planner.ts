@@ -1,4 +1,4 @@
-import { getGeminiModel } from "@/server/providers/gemini";
+import { getOpenAIModel } from "@/server/providers/openai";
 import { PRD, PRDSchema, DesignSpec, ArchitectureSpec } from "@/server/agent-contracts/schemas";
 import { prisma } from "@/lib/db";
 import { SpecStatus, Prisma } from "@/generated/prisma/client";
@@ -69,10 +69,11 @@ export async function runPlannerAgent(
   context?: PlannerContext,
   options?: PlannerOptions
 ): Promise<PRD> {
-  const selectedModel = options?.model || "gemini-2.5-pro";
-  const model = getGeminiModel({
+  const selectedModel = options?.model || "gpt-4o-mini";
+  const model = getOpenAIModel({
     model: selectedModel,
     temperature: options?.temperature ?? 0.2,
+    responseFormat: { type: "json_object" },
   });
 
   const isFollowUp = Boolean(context?.existingPRD || (context?.existingFiles && Object.keys(context.existingFiles).length > 0));

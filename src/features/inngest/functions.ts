@@ -3,7 +3,8 @@ import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
 import { MessageRole, GenerationRunStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
-import { getGeminiModel } from "@/server/providers/gemini";
+import { getOpenAIModel, isOpenAIPermanentError } from "@/server/providers/openai";
+import { NonRetriableError } from "inngest";
 import { FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/lib/prompt";
 import { agentOutputText, connectSandbox } from "./utils";
 import { transitionRun } from "@/server/orchestration/state-machine";
@@ -184,7 +185,12 @@ export const codeAgentFunction = inngest.createFunction(
             (error.message.includes("timed out") ||
              error.message.includes("GenerationTimeoutError"))) ||
           (error instanceof Error && error.name === "GenerationTimeoutError");
-        const errorCode = isTimeout ? "GENERATION_TIMEOUT" : "WORKFLOW_EXECUTION_FAILED";
+        const isProviderConfigError = isOpenAIPermanentError(error);
+        const errorCode = isTimeout
+          ? "GENERATION_TIMEOUT"
+          : isProviderConfigError
+          ? "PROVIDER_CONFIGURATION_ERROR"
+          : "WORKFLOW_EXECUTION_FAILED";
 
         await finalizeGenerationFailure({
           generationRunId: runId,
@@ -225,6 +231,12 @@ export const codeAgentFunction = inngest.createFunction(
       throw new Error("Missing required persisted runId for generation execution");
     }
 
+    if (!process.env.OPENAI_API_KEY) {
+      throw new NonRetriableError(
+        "OPENAI_API_KEY is not configured. Add your OpenAI API key to environment variables."
+      );
+    }
+
     // Concurrency-safe persisted start-time initialization
     const persistedStart = await initializeRunStartTime(runId);
     const { deadlineMs, startedAtMs } = establishRunDeadline(persistedStart);
@@ -260,7 +272,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 1: REQUIREMENTS & PLANNING (Planner Agent with Gemini 2.5 Pro)
+    // STAGE 1: REQUIREMENTS & PLANNING (Planner Agent with OpenAI)
     // ─────────────────────────────────────────────────────────────────────────
     const prd = await step.run("planner-spec", async () => {
       checkGenerationDeadline(deadlineMs, "planning");
@@ -328,7 +340,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 2: DESIGN SPECIFICATION (Design Agent with Gemini 2.5 Flash)
+    // STAGE 2: DESIGN SPECIFICATION (Design Agent with OpenAI)
     // ─────────────────────────────────────────────────────────────────────────
     const designSpec = await step.run("design-spec", async () => {
       checkGenerationDeadline(deadlineMs, "design");
@@ -386,7 +398,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STAGE 3: ARCHITECTURE & CONTRACTS (Architecture Agent with Gemini 2.5 Pro)
+    // STAGE 3: ARCHITECTURE & CONTRACTS (Architecture Agent with OpenAI)
     // ─────────────────────────────────────────────────────────────────────────
     const archSpec = await step.run("architecture-spec", async () => {
       checkGenerationDeadline(deadlineMs, "architecture");
@@ -607,12 +619,12 @@ export const codeAgentFunction = inngest.createFunction(
     const { fragmentTitle, responseText, auxPromptTokens, auxCompletionTokens } = await step.run(
       "generate-response-metadata",
       async () => {
-        const geminiModel = getGeminiModel({
-          model: "gemini-2.5-flash",
+        const openAIModel = getOpenAIModel({
+          model: "gpt-4o-mini",
         });
 
         const makeTextAgent = (name: string, system: string) =>
-          createAgent({ name, system, model: geminiModel });
+          createAgent({ name, system, model: openAIModel });
 
         const fragmentTitleGenerator = makeTextAgent(
           "fragment-title-generator",
@@ -656,7 +668,7 @@ export const codeAgentFunction = inngest.createFunction(
       runId,
       projectId,
       stageName: "auxiliary-text",
-      modelId: "gemini-2.5-flash",
+      modelId: "gpt-4o-mini",
       startedAt: auxStageStart,
       finishedAt: Date.now(),
       promptTokens: auxPromptTokens,

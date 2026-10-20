@@ -39,12 +39,12 @@ async function main() {
 
   const e2bKey = process.env.E2B_API_KEY;
   const e2bTemplateId = process.env.E2B_TEMPLATE_ID;
-  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
 
   const missing: string[] = [];
   if (!e2bKey) missing.push("E2B_API_KEY");
   if (!e2bTemplateId) missing.push("E2B_TEMPLATE_ID");
-  if (!geminiKey) missing.push("GEMINI_API_KEY");
+  if (!openaiKey) missing.push("OPENAI_API_KEY");
 
   if (missing.length > 0) {
     console.log("⚠️  PRE-FLIGHT STATUS: Missing credentials for live cloud execution.");
@@ -52,10 +52,10 @@ async function main() {
     for (const v of missing) {
       console.log(`  - ${v}`);
     }
-    console.log("\nPer engineering agreement, the teacher's credentials were scrubbed and");
+    console.log("\nPer engineering agreement, the owner's credentials are not committed and");
     console.log("no API keys are hardcoded in the repository.");
     console.log("\nTo execute this live scenario:");
-    console.log("1. Add your keys to .env (e.g. from https://e2b.dev and https://aistudio.google.com)");
+    console.log("1. Add your keys to .env (e.g. from https://e2b.dev and https://platform.openai.com)");
     console.log("2. Run: npx tsx scripts/verify-live-e2e.ts\n");
     console.log("Pipeline status: READY FOR LIVE CREDENTIALS");
     process.exit(0);
