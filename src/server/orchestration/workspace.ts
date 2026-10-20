@@ -152,10 +152,15 @@ export async function ensureSandboxPreviewServer(
   }
 
   // 3. Start dev server in canonical workspace in the background
-  const startCmd = `cd "${PROJECT_WORKSPACE_DIR}" && ` +
+  const startCmd =
+    `cd "${PROJECT_WORKSPACE_DIR}" && ` +
     `( [ -e node_modules ] || ( [ -d /home/user/node_modules ] && ln -s /home/user/node_modules node_modules ) || true ) && ` +
     `( [ -f next.config.mjs ] && rm -f next.config.ts next.config.js || true ) && ` +
-    `(command -v bun >/dev/null 2>&1 && nohup bun run dev -- -H 0.0.0.0 -p 3000 > /tmp/preview.log 2>&1 & || nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/preview.log 2>&1 &)`;
+    `if command -v bun >/dev/null 2>&1; then ` +
+    `nohup bun run dev -- -H 0.0.0.0 -p 3000 </dev/null > /tmp/preview.log 2>&1 & ` +
+    `else ` +
+    `nohup npm run dev -- -H 0.0.0.0 -p 3000 </dev/null > /tmp/preview.log 2>&1 & ` +
+    `fi`;
   await sandbox.commands.run(startCmd, { timeoutMs: 6000 });
 
   // 4. Bounded independent polling

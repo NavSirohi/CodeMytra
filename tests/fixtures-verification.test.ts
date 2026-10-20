@@ -827,5 +827,74 @@ export default function Page() {
       assert.match(importCheck.details || "", /@\/components\/NonExistent/);
     });
   });
+
+  // =========================================================================
+  // ISSUE 4 & 5: Preview Lifecycle Syntax & Functional Completeness
+  // =========================================================================
+  describe("Issue 4 & 5: Preview Lifecycle Syntax & Functional Completeness", () => {
+    it("Issue 4: ensures preview server startup uses valid shell syntax without syntax errors", async () => {
+      const { spawnSync } = await import("child_process");
+      // Test the shell syntax pattern used by ensureSandboxPreviewServer
+      const testScript = `
+        PROJECT_WORKSPACE_DIR="/tmp/test-preview-syntax"
+        mkdir -p "$PROJECT_WORKSPACE_DIR"
+        cd "$PROJECT_WORKSPACE_DIR"
+        if command -v bun >/dev/null 2>&1; then
+          echo "bun-ok" </dev/null >/dev/null 2>&1 &
+        else
+          echo "npm-ok" </dev/null >/dev/null 2>&1 &
+        fi
+      `;
+      const res = spawnSync("sh", ["-c", testScript]);
+      assert.equal(res.status, 0, "Shell syntax must execute with exit code 0 without parse errors");
+    });
+
+    it("Issue 5: verifies coder prompt enforces complete implementation without placeholders and secure password handling", () => {
+      const mockPrd = PRDSchema.parse({
+        projectName: "booking-portal",
+        summary: "Doctor appointment booking portal with interactive calendar and patient management.",
+        targetAudience: "Clinic patients",
+        capabilities: ["pages-navigation", "data-persistence", "crud-operations"],
+        coreFeatures: [{ name: "Calendar", description: "Interactive appointment booking", priority: "MUST" }],
+        pages: [{ route: "/", title: "Home", purpose: "Main portal", keyComponents: ["AppointmentCalendar"] }],
+        dataEntities: [],
+        userFlows: [{ name: "Book", steps: ["Select date", "Confirm"] }],
+      });
+
+      const mockDesign = DesignSpecSchema.parse({
+        aestheticTheme: "Clean Clinic",
+        colorPalette: { primary: "#0284c7", secondary: "#0f172a", accent: "#38bdf8", background: "#f8fafc", surface: "#ffffff", text: "#0f172a" },
+        typography: { headingFont: "Inter", bodyFont: "Inter" },
+        layoutStyle: "Professional clinic portal",
+      });
+
+      const mockArch = ArchitectureSpecSchema.parse({
+        routeEndpoints: [{ path: "/", type: "page", purpose: "Booking portal" }],
+        capabilities: ["pages-navigation", "data-persistence", "crud-operations"],
+        requiresDatabase: true,
+        databaseModels: [{ modelName: "User", fields: ["id", "email", "name", "role"] }],
+        backendOperations: [],
+        businessConstraints: ["Strict validation"],
+        fileOwnership: { frontend: ["app/page.tsx"], backend: ["app/api/users/route.ts"], database: ["prisma/schema.prisma"] },
+        dependencies: ["lucide-react"],
+      });
+
+      const prompt = buildContextEnhancedPrompt(
+        mockPrd,
+        mockDesign,
+        mockArch
+      );
+
+      // Issue 5 verification: No placeholders directive
+      assert.match(prompt, /COMPLETE FUNCTIONAL IMPLEMENTATION \(NO PLACEHOLDERS\)/i);
+      assert.match(prompt, /Never generate empty placeholders, stub components, or explanatory placeholder text/i);
+      assert.match(prompt, /interactive month\/week calendar grids/i);
+
+      // Issue 5 verification: Security & password safety
+      assert.match(prompt, /SECURITY & SENSITIVE DATA/i);
+      assert.match(prompt, /Never store plaintext passwords in database models or expose passwords in API routes/i);
+    });
+  });
 });
+
 

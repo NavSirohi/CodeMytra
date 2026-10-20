@@ -584,9 +584,13 @@ ${modelInterfaces}
    - Put "use client"; on line 1 of interactive components.
 
 7. Put the primary landing content and user interface in app/page.tsx. ALWAYS put "use client"; on line 1 of any interactive component or page using useState, useEffect, onClick, or browser events.
-8. Use standard, verified Lucide React icons (e.g., ShoppingBag, Coffee, Clock, MapPin, Phone, Mail, Star, Check, ChevronRight, Menu, X, Search, Heart, ArrowRight, User, Settings, Info, AlertCircle). NEVER invent or hallucinate icon names.
-9. Do NOT import non-existent external npm packages. Use only standard React, Next.js, and Lucide icons.
-10. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
+8. COMPLETE FUNCTIONAL IMPLEMENTATION (NO PLACEHOLDERS):
+   - Never generate empty placeholders, stub components, or explanatory placeholder text (e.g. "Calendar management functionality will be displayed here" or "// TODO: Add booking grid").
+   - Always implement genuine, interactive UI components: full interactive month/week calendar grids, active day/slot pickers, event modals, sortable data tables, and live status badges.
+   - SECURITY & SENSITIVE DATA: Never store plaintext passwords in database models or expose passwords in API routes. For user management, use safe identity fields ({ id, email, name, role }), and validate inputs strictly.
+9. Use standard, verified Lucide React icons (e.g., ShoppingBag, Coffee, Clock, MapPin, Phone, Mail, Star, Check, ChevronRight, Menu, X, Search, Heart, ArrowRight, User, Settings, Info, AlertCircle, Calendar, Plus, Trash2, Edit, Filter, ChevronLeft, Eye). NEVER invent or hallucinate icon names.
+10. Do NOT import non-existent external npm packages. Use only standard React, Next.js, and Lucide icons.
+11. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
 `;
 }
 
