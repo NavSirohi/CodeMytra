@@ -84,3 +84,53 @@ export async function writeWorkspaceFiles(
     await sandbox.files.write(targetPath, content);
   }
 }
+
+/**
+ * Ensures that the sandbox Next.js development server is active, listening on port 3000,
+ * and responsive to HTTP requests before returning the public preview URL to the user.
+ * Syncs workspace files to /home/user (to satisfy template root watchers) and spawns
+ * the dev server in the background if not currently active.
+ */
+export async function ensureSandboxPreviewServer(sandbox: Sandbox): Promise<void> {
+  const syncAndCheckScript = `
+    # Sync files from workspace to /home/user for preview watchers
+    if [ -d "${PROJECT_WORKSPACE_DIR}" ]; then
+      cp -rn "${PROJECT_WORKSPACE_DIR}"/* /home/user/ 2>/dev/null || true
+    fi
+
+    # Check if port 3000 is responding
+    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")
+    if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "304" ] || [ "$HTTP_STATUS" = "302" ] || [ "$HTTP_STATUS" = "307" ] || [ "$HTTP_STATUS" = "308" ]; then
+      echo "ALREADY_ACTIVE:$HTTP_STATUS"
+      exit 0
+    fi
+
+    # Not responding on port 3000: start dev server in background
+    cd "${PROJECT_WORKSPACE_DIR}"
+    if command -v bun >/dev/null 2>&1; then
+      nohup bun run dev --port 3000 > /tmp/next-dev.log 2>&1 &
+    else
+      nohup npm run dev -- --port 3000 > /tmp/next-dev.log 2>&1 &
+    fi
+
+    # Poll up to 15 seconds for HTTP responsiveness
+    for i in $(seq 1 15); do
+      sleep 1
+      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")
+      if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "304" ] || [ "$HTTP_STATUS" = "302" ] || [ "$HTTP_STATUS" = "307" ] || [ "$HTTP_STATUS" = "308" ]; then
+        echo "STARTED:$HTTP_STATUS"
+        exit 0
+      fi
+    done
+
+    echo "TIMEOUT:$HTTP_STATUS"
+    exit 0
+  `;
+
+  try {
+    await sandbox.commands.run(syncAndCheckScript, { timeoutMs: 25000 });
+  } catch (err) {
+    console.warn("[ensureSandboxPreviewServer] Dev server check encountered non-fatal error:", err);
+  }
+}
+

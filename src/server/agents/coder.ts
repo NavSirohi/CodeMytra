@@ -435,8 +435,8 @@ File Boundaries:
 6. If requiresDb is FALSE (static application / landing page):
    - Keep the app lean and fast. Do NOT generate unnecessary prisma schema, broken sqlite config, or backend database files.
    - Implement all rich interactive features (e.g. menus, product carts, interactive filters, contact forms) using React client state in "app/page.tsx" or modular components.
-7. Put the primary landing content and user interface in app/page.tsx (use "use client"; for interactive state).
-8. Use Tailwind CSS with clean, accessible classes matching the design token colors.
+7. Put the primary landing content and user interface in app/page.tsx. ALWAYS put "use client"; on line 1 of any interactive component or page using useState, useEffect, onClick, or browser events.
+8. Use standard, verified Lucide React icons (e.g., ShoppingBag, Coffee, Clock, MapPin, Phone, Mail, Star, Check, ChevronRight, Menu, X, Search, Heart, ArrowRight, User, Settings, Info, AlertCircle). NEVER invent or hallucinate icon names.
 9. Do NOT import non-existent external npm packages. Use only standard React, Next.js, and Lucide icons.
 10. When performing follow-up modifications, PRESERVE all existing working features while integrating requested additions.
 `;
@@ -458,7 +458,6 @@ export async function runCodingAgent(
     architectureSpec,
     baseFiles = {},
     previousMessages = [],
-    step,
     stepPrefix = "code-agent",
     model,
     generationRunId,
@@ -467,13 +466,10 @@ export async function runCodingAgent(
     tokenBudget,
   } = options;
 
-  let toolCallCounter = 0;
-
-  const runStep = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
-    const stepId = `${stepPrefix}-${name}-${++toolCallCounter}`;
-    if (step && typeof step.run === "function") {
-      return (await step.run(stepId, fn)) as T;
-    }
+  const runStep = async <T>(_name: string, fn: () => Promise<T>): Promise<T> => {
+    // Tool calls within autonomous LLM loops must execute directly as asynchronous actions.
+    // They must never register dynamic nested Inngest step.run calls, which breaks deterministic
+    // replay discovery ("Could not find step ... to run; timed out").
     return await fn();
   };
 

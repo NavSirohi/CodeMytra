@@ -111,6 +111,8 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
       build: "next build",
       start: "next start",
       lint: "eslint",
+      tsc: "tsc",
+      typecheck: "tsc --noEmit",
       ...(needsDb
         ? {
             "db:push": "prisma db push",

@@ -15,6 +15,52 @@ export interface QACommandExecutor {
   run(command: string, options?: { timeoutMs?: number }): Promise<{ exitCode: number; stdout: string; stderr: string }>;
 }
 
+/**
+ * Extracts actionable compiler and build diagnostics (TypeScript errors, Next.js build errors,
+ * missing modules, and syntax errors) from command stdout/stderr output.
+ * Preserves exact file paths, line numbers, and error descriptions for the repair agent.
+ */
+export function extractCompilerDiagnostics(stdout?: string, stderr?: string, fallback = "Validation failed"): string {
+  const combined = [stdout || "", stderr || ""].join("\n").trim();
+  if (!combined) return fallback;
+
+  const lines = combined.split("\n");
+  const diagnosticLines = lines
+    .map((l) => l.trim())
+    .filter((l) => {
+      return (
+        /error TS\d+:/i.test(l) ||
+        /\.(tsx?|jsx?):\s*error/i.test(l) ||
+        /\.(tsx?|jsx?)\(\d+,\d+\):/i.test(l) ||
+        /Failed to compile/i.test(l) ||
+        /Module not found/i.test(l) ||
+        /Type error:/i.test(l) ||
+        /SyntaxError:/i.test(l) ||
+        /Cannot find module/i.test(l) ||
+        /Cannot find name/i.test(l) ||
+        /Property .* does not exist/i.test(l) ||
+        /ReferenceError:/i.test(l) ||
+        /Export .* was not found/i.test(l) ||
+        /Error:\s+/i.test(l)
+      );
+    });
+
+  if (diagnosticLines.length > 0) {
+    return diagnosticLines.slice(0, 15).join("\n");
+  }
+
+  // Fallback: take first 10 non-empty, non-shell lines
+  const meaningfulLines = lines
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("> ") && !l.startsWith("$ "));
+
+  if (meaningfulLines.length > 0) {
+    return meaningfulLines.slice(0, 15).join("\n");
+  }
+
+  return combined.slice(0, 1000);
+}
+
 export interface DatabaseVerificationPipelineOptions {
   workspaceDir: string;
   models?: Array<{ modelName: string; fields?: string[]; relations?: string[] }>;
@@ -951,7 +997,27 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
       } else {
         const sandbox = await Sandbox.connect(sandboxId);
         executor = {
-          run: (cmd, opts) => sandbox.commands.run(cmd, opts),
+          run: async (cmd, opts) => {
+            try {
+              const res = await sandbox.commands.run(cmd, opts);
+              return {
+                exitCode: res.exitCode ?? 0,
+                stdout: res.stdout || "",
+                stderr: res.stderr || "",
+              };
+            } catch (cmdErr: unknown) {
+              const err = cmdErr as { exitCode?: number; stdout?: string; stderr?: string; message?: string };
+              // Intercept CommandExitError thrown by E2B SDK on non-zero exit code
+              if (err && typeof err.exitCode === "number") {
+                return {
+                  exitCode: err.exitCode,
+                  stdout: err.stdout || "",
+                  stderr: err.stderr || err.message || "",
+                };
+              }
+              throw cmdErr;
+            }
+          },
         };
         targetWorkspaceDir = PROJECT_WORKSPACE_DIR;
         executedSandboxChecks = true;
@@ -996,23 +1062,25 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
             details: "TypeScript compiled with zero errors",
           });
         } else {
-          const tscErr = (tscResult.stderr || tscResult.stdout || "TypeScript typecheck failed").slice(0, 500);
+          const tscErr = extractCompilerDiagnostics(tscResult.stdout, tscResult.stderr, "TypeScript typecheck failed");
           checks.push({
             name: "typescript-validation",
             category: "typescript-validation",
             status: "FAIL",
             details: tscErr,
           });
-          errors.push(`TypeScript error: ${tscErr}`);
+          errors.push(`TypeScript error:\n${tscErr}`);
         }
-      } catch (tscCmdErr) {
+      } catch (tscCmdErr: unknown) {
+        const err = tscCmdErr as { stdout?: string; stderr?: string; message?: string };
+        const tscErr = extractCompilerDiagnostics(err?.stdout, err?.stderr, String(err?.message || tscCmdErr));
         checks.push({
           name: "typescript-validation",
           category: "typescript-validation",
           status: "FAIL",
-          details: String(tscCmdErr),
+          details: tscErr,
         });
-        errors.push(`TypeScript validation failed to execute: ${String(tscCmdErr)}`);
+        errors.push(`TypeScript validation failed to execute:\n${tscErr}`);
       }
 
       // Production build check
@@ -1029,23 +1097,25 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
             details: "Production build succeeded",
           });
         } else {
-          const buildErr = (buildResult.stderr || buildResult.stdout || "Build failed").slice(0, 500);
+          const buildErr = extractCompilerDiagnostics(buildResult.stdout, buildResult.stderr, "Build failed");
           checks.push({
             name: "production-build",
             category: "production-build",
             status: "FAIL",
             details: buildErr,
           });
-          errors.push(`Production build error: ${buildErr}`);
+          errors.push(`Production build error:\n${buildErr}`);
         }
-      } catch (buildCmdErr) {
+      } catch (buildCmdErr: unknown) {
+        const err = buildCmdErr as { stdout?: string; stderr?: string; message?: string };
+        const buildErr = extractCompilerDiagnostics(err?.stdout, err?.stderr, String(err?.message || buildCmdErr));
         checks.push({
           name: "production-build",
           category: "production-build",
           status: "FAIL",
-          details: String(buildCmdErr),
+          details: buildErr,
         });
-        errors.push(`Production build command failed: ${String(buildCmdErr)}`);
+        errors.push(`Production build command failed:\n${buildErr}`);
       }
     } catch (sandboxConnErr) {
       checks.push({

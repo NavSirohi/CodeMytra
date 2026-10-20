@@ -79,7 +79,7 @@ export function GenerationStatusBanner({ projectId }: { projectId: string }) {
         <>
           <AlertCircle className="size-3.5 text-destructive" />
           <span>
-            Generation failed: {run.errorMessage || "Validation check failed"}. Your previous working version is preserved.
+            Generation failed: {run.errorMessage || "Validation check failed"}
           </span>
         </>
       )}

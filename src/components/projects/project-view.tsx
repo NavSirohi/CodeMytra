@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useMemo } from "react";
 import Link from "next/link";
-import { Code, EyeIcon, Download, Rocket, History } from "lucide-react";
+import { Code, EyeIcon, Download, Rocket, History, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Hint } from "@/components/ui/hint";
@@ -44,6 +44,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
   const { data: project, isPending, isError, error } = useGetProjectById(projectId);
   const { data: activeRun } = useGetActiveGenerationRun(projectId);
   const isGenerating = isGenerationActiveStatus(activeRun?.status);
+  const isFailed = activeRun?.status === "FAILED";
   const { data: messages } = useGetMessages(projectId);
 
   // Deterministically find latest assistant fragment from active conversation
@@ -379,6 +380,18 @@ export function ProjectView({ projectId }: { projectId: string }) {
                       onViewCode={() => setTabState("code")}
                       projectId={projectId}
                     />
+                  ) : isFailed ? (
+                    <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
+                      <div className="size-12 rounded-xl bg-destructive/15 border border-destructive/30 flex items-center justify-center text-red-400">
+                        <AlertCircle className="size-6 text-red-400" />
+                      </div>
+                      <p className="text-sm font-medium text-red-300">
+                        Generation Failed
+                      </p>
+                      <p className="text-xs max-w-sm text-[#8a9a8e] leading-relaxed">
+                        {activeRun?.errorMessage || "The agent generation run failed and could not produce a working preview. Check the prompt or retry with a refined request."}
+                      </p>
+                    </div>
                   ) : (
                     <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
                       <div className="size-12 rounded-xl bg-[#284938]/30 border border-[#284938]/60 flex items-center justify-center text-[#81aa80]">
@@ -409,6 +422,16 @@ export function ProjectView({ projectId }: { projectId: string }) {
                 >
                   {activeFragment?.files && Object.keys(activeFragment.files).length > 0 ? (
                     <FileExplorer files={activeFragment.files} />
+                  ) : isFailed ? (
+                    <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
+                      <div className="size-12 rounded-xl bg-destructive/15 border border-destructive/30 flex items-center justify-center text-red-400">
+                        <AlertCircle className="size-6 text-red-400" />
+                      </div>
+                      <p className="text-sm font-medium text-red-300">No Code Available</p>
+                      <p className="text-xs max-w-sm text-[#8a9a8e]">
+                        The generation run failed before completing verification. Please submit a new message to retry generation.
+                      </p>
+                    </div>
                   ) : (
                     <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
                       <div className="size-12 rounded-xl bg-[#202d24] border border-[#2e3e33] flex items-center justify-center text-[#81aa80]">

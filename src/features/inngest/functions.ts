@@ -35,6 +35,7 @@ import {
   initializeSandboxWorkspace,
   resolveWorkspacePath,
   PROJECT_WORKSPACE_DIR,
+  ensureSandboxPreviewServer,
 } from "@/server/orchestration/workspace";
 import { getBaseProjectFiles, MissingDatabaseModelsError } from "@/server/templates/foundation";
 import {
@@ -641,7 +642,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
     const codingStageStart = Date.now();
 
-    const { summary, files, usage: codingUsage, modelId: coderModelUsed } = await runCodingAgent({
+    const { summary, files, usage: codingUsage, modelId: coderModelUsed } = await step.run("initial-coding-agent", () => runCodingAgent({
       sandboxId,
       prompt: promptValue,
       prd,
@@ -649,14 +650,14 @@ export const codeAgentFunction = inngest.createFunction(
       architectureSpec: archSpec,
       baseFiles: relevantBaseFiles,
       previousMessages,
-      step,
+      // Never pass Inngest step into dynamic AgentKit tool callbacks.
       stepPrefix: "initial-coding",
       model: coderModel,
       generationRunId: runId,
       deadlineMs,
       maxIterations: GENERATION_LIMITS.maxCodingIterations,
       tokenBudget: GENERATION_LIMITS.maxRunTokenBudget,
-    });
+    }));
 
     const isPostCodingActive = await isRunActiveInDb(runId);
     if (!isPostCodingActive) {
@@ -823,7 +824,7 @@ Conclude with an updated <task_summary>...</task_summary>.
               { role: "user", content: promptValue },
               { role: "assistant", content: currentSummary },
             ],
-            step,
+            // QA itself is a durable step; tool callbacks must not register nested steps.
             stepPrefix: "qa-repair-1",
             model: repairModel,
             generationRunId: runId,
@@ -915,6 +916,7 @@ Conclude with an updated <task_summary>...</task_summary>.
     // ─────────────────────────────────────────────────────────────────────────
     const sandboxUrl = await step.run("get-sandbox-url", async () => {
       const sandbox = await connectSandbox(sandboxId);
+      await ensureSandboxPreviewServer(sandbox);
       return `http://${sandbox.getHost(3000)}`;
     });
 

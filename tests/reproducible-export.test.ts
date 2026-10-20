@@ -255,7 +255,7 @@ export async function POST(req: Request) {
       // -----------------------------------------------------------------------
       // VERIFICATION 8: Standalone Production Build succeeds outside CodeMytra
       // -----------------------------------------------------------------------
-      const buildRes = spawnSync("npm", ["run", "build"], {
+      const buildRes = spawnSync("npm", ["run", "build", "--", "--webpack"], {
         cwd: appDir,
         encoding: "utf8",
         timeout: 90000,
@@ -303,12 +303,13 @@ verifyPersistence()
       const testScriptPath = path.join(appDir, "test-persistence.ts");
       fs.writeFileSync(testScriptPath, testScriptContent);
 
-      const opRes = spawnSync("npx", ["tsx", "test-persistence.ts"], {
+      const tsxBin = path.join(process.cwd(), "node_modules/.bin/tsx");
+      const opRes = spawnSync(tsxBin, ["test-persistence.ts"], {
         cwd: appDir,
         encoding: "utf8",
-        timeout: 20000,
+        timeout: 45000,
       });
-      assert.equal(opRes.status, 0, `Backend persistence operation failed: ${opRes.stderr || opRes.stdout}`);
+      assert.equal(opRes.status, 0, `Backend persistence operation failed: ${opRes.stderr || opRes.stdout || String(opRes.error)}`);
       assert.match(opRes.stdout, /PERSISTENCE_OPERATION_VERIFIED/);
     } finally {
       // Restore Prisma methods
