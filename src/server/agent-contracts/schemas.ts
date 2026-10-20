@@ -178,6 +178,10 @@ export const QACheckSchema = z.object({
   category: QACheckCategoryEnum,
   status: z.enum(["PASS", "FAIL", "SKIPPED"]),
   details: z.string().optional(),
+  stdout: z.string().optional(),
+  stderr: z.string().optional(),
+  exitCode: z.number().nullable().optional(),
+  timeout: z.boolean().optional(),
 });
 
 export const QAReportSchema = z.object({

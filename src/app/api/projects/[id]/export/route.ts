@@ -15,10 +15,12 @@ export async function GET(
     const { id: projectId } = await params;
     const { searchParams } = new URL(request.url);
     const revisionId = searchParams.get("revisionId") || undefined;
+    const draftId = searchParams.get("draftId") || (searchParams.get("draft") === "true" ? "latest" : undefined);
 
     const { filename, buffer } = await generateProjectZip({
       projectId,
       revisionId,
+      draftId,
       userId: user.id,
     });
 

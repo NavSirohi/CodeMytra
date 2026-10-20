@@ -38,6 +38,7 @@ model Project {
 
   messages       Message[]
   revisions      ProjectRevision[] @relation("ProjectRevisions")
+  drafts         GenerationDraft[]
   generationRuns GenerationRun[]
   specification  ProjectSpecification?
   idempotencyKey String?
@@ -120,6 +121,7 @@ model GenerationRun {
   updatedAt        DateTime            @updatedAt
 
   revisions ProjectRevision[]
+  draft     GenerationDraft?
   tasks     AgentTask[]
   events    RunEvent[]
   message   Message?
@@ -253,4 +255,30 @@ model RateLimitRecord {
   createdAt DateTime @default(now())
 
   @@index([keyHash, createdAt])
+}
+
+enum DraftValidationStatus {
+  UNVALIDATED
+  VALIDATING
+  PASSED
+  FAILED
+}
+
+model GenerationDraft {
+  id               String                @id @default(cuid())
+  generationRunId  String                @unique
+  generationRun    GenerationRun         @relation(fields: [generationRunId], references: [id], onDelete: Cascade)
+  projectId        String
+  project          Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  files            Json                  // Actual generated source files snapshot: { [filePath]: fileContent }
+  manifest         Json?                 // Sanitized file metadata: count, size, sha hashes
+  validationStatus DraftValidationStatus @default(UNVALIDATED)
+  diagnostics      Json?                 // Validation errors, compiler diagnostics, failure details
+  summary          String?
+  source           String                @default("coding-agent") // "coding-agent" | "qa-repair"
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  @@index([projectId, createdAt])
+  @@index([generationRunId])
 }

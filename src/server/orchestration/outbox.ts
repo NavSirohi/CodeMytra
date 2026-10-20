@@ -298,9 +298,17 @@ export async function reconcileStaleGenerationRuns(
 
     for (const run of candidateRuns) {
       // 1. Queue Delay, Retries & Progression Check:
-      // If the run started recently or recorded progression (updatedAt or RunEvent within timeout window),
+      // If the run started recently or recorded progression (updatedAt, startedAt, or RunEvent within timeout window),
       // it is legitimately progressing despite an older createdAt. Never fail it!
-      const latestActivityTime = run.events[0]?.createdAt ?? run.updatedAt ?? run.startedAt ?? run.createdAt;
+      const activityTimestamps = [
+        run.events[0]?.createdAt?.getTime(),
+        run.updatedAt?.getTime(),
+        run.startedAt?.getTime(),
+        run.createdAt?.getTime(),
+      ].filter((t): t is number => typeof t === "number" && !isNaN(t));
+
+      const latestActivityMs = Math.max(...activityTimestamps);
+      const latestActivityTime = new Date(latestActivityMs);
       if (latestActivityTime >= timeoutThreshold) {
         continue;
       }

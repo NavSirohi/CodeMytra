@@ -81,10 +81,34 @@ export function ProjectView({ projectId }: { projectId: string }) {
     };
   }, [currentRev]);
 
-  // Active fragment: manual selection takes precedence; otherwise latest assistant fragment or current revision
+  // Derive unverified draft fragment (persisted when coding completed, even if QA failed)
+  const draftFragment: ProjectFragment | null = useMemo(() => {
+    const draft = (activeRun as unknown as { draft?: { id: string; files: unknown; summary?: string | null; createdAt: string; updatedAt: string; validationStatus: string } })?.draft;
+    if (!draft || !draft.files) return null;
+    const files = parseFragmentFiles(draft.files);
+    if (Object.keys(files).length === 0) return null;
+    return {
+      id: draft.id,
+      messageId: "unverified-draft",
+      sandboxUrl: "",
+      title: draft.summary ? `${draft.summary.slice(0, 40)}... (Draft)` : "Unverified Draft",
+      files,
+      createdAt: new Date(draft.createdAt),
+      updatedAt: new Date(draft.updatedAt),
+      selectionType: "draft-artifact",
+      revisionId: null,
+      draftId: draft.id,
+      isDraft: true,
+      validationStatus: draft.validationStatus,
+    };
+  }, [activeRun]);
+
+  // Active fragment: manual selection takes precedence; otherwise latest assistant fragment, current revision, or unverified draft
   const activeFragment: ProjectFragment | null = selectedFragment
     ? selectedFragment
-    : latestAssistantFragment || currentRevFragment;
+    : (isFailed && draftFragment && !latestAssistantFragment)
+    ? draftFragment
+    : latestAssistantFragment || currentRevFragment || draftFragment;
 
   // Stable callback for explicit user selection of a fragment card in the chat
   const handleManualSelectFragment = useCallback((fragment: ProjectFragment) => {
@@ -124,10 +148,22 @@ export function ProjectView({ projectId }: { projectId: string }) {
   // Switch back to latest intended active revision/fragment deterministically
   const handleResetToLatest = useCallback(() => {
     setIsManualSelection(false);
-    setSelectedFragment(latestAssistantFragment || currentRevFragment);
-  }, [latestAssistantFragment, currentRevFragment]);
+    setSelectedFragment(latestAssistantFragment || currentRevFragment || draftFragment);
+  }, [latestAssistantFragment, currentRevFragment, draftFragment]);
 
   const handleExport = () => {
+    // 0. Explicit draft artifact or failure state with draft
+    if (
+      activeFragment?.selectionType === "draft-artifact" ||
+      activeFragment?.isDraft ||
+      (isFailed && draftFragment)
+    ) {
+      const draftId = activeFragment?.draftId || draftFragment?.draftId || draftFragment?.id;
+      const param = draftId ? `?draftId=${encodeURIComponent(draftId)}` : "?draft=true";
+      window.open(`/api/projects/${projectId}/export${param}`, "_blank");
+      return;
+    }
+
     if (!activeFragment) {
       window.open(`/api/projects/${projectId}/export`, "_blank");
       return;
@@ -374,12 +410,48 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   value="preview"
                   className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden bg-[#17201a]"
                 >
-                  {activeFragment ? (
+                  {activeFragment && !activeFragment.isDraft && activeFragment.sandboxUrl ? (
                     <FragmentWeb
                       data={activeFragment}
                       onViewCode={() => setTabState("code")}
                       projectId={projectId}
                     />
+                  ) : (isFailed && draftFragment) || activeFragment?.isDraft ? (
+                    <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-4">
+                      <div className="size-12 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400">
+                        <AlertCircle className="size-6 text-amber-400" />
+                      </div>
+                      <div className="space-y-1 max-w-md">
+                        <p className="text-sm font-medium text-amber-200">
+                          Preview Unavailable — Verification Incomplete
+                        </p>
+                        <p className="text-xs text-[#8a9a8e] leading-relaxed">
+                          {activeRun?.errorMessage || "Automated build and verification checks encountered errors or timed out. Live runtime preview is not available."}
+                        </p>
+                        <p className="text-xs text-amber-300/80">
+                          All generated source code was preserved as an unverified draft artifact.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-3 pt-2">
+                        <Button
+                          onClick={() => setTabState("code")}
+                          size="sm"
+                          className="bg-[#284938] hover:bg-[#34624b] text-white text-xs gap-1.5"
+                        >
+                          <Code className="size-3.5" />
+                          <span>Inspect Draft Code ({Object.keys(draftFragment?.files || activeFragment?.files || {}).length} files)</span>
+                        </Button>
+                        <Button
+                          onClick={handleExport}
+                          variant="outline"
+                          size="sm"
+                          className="border-amber-700/50 text-amber-200 hover:bg-amber-900/30 text-xs gap-1.5"
+                        >
+                          <Download className="size-3.5" />
+                          <span>Download Draft ZIP</span>
+                        </Button>
+                      </div>
+                    </div>
                   ) : isFailed ? (
                     <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
                       <div className="size-12 rounded-xl bg-destructive/15 border border-destructive/30 flex items-center justify-center text-red-400">
@@ -421,7 +493,30 @@ export function ProjectView({ projectId }: { projectId: string }) {
                   className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden bg-[#17201a]"
                 >
                   {activeFragment?.files && Object.keys(activeFragment.files).length > 0 ? (
-                    <FileExplorer files={activeFragment.files} />
+                    <div className="flex flex-col h-full min-h-0">
+                      {activeFragment.isDraft && (
+                        <div className="flex items-center justify-between px-3 py-2 bg-amber-950/40 border-b border-amber-800/40 text-amber-300 text-xs shrink-0">
+                          <div className="flex items-center gap-2">
+                            <AlertCircle className="size-4 text-amber-400 shrink-0" />
+                            <span>
+                              <strong>Unverified Draft ({activeFragment.validationStatus || "UNVERIFIED"}):</strong> Automated verification failed or timed out, but generated source code is preserved.
+                            </span>
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={handleExport}
+                            className="h-6 text-[11px] border-amber-700/50 text-amber-200 hover:bg-amber-900/40 gap-1"
+                          >
+                            <Download className="size-3" />
+                            Download Draft ZIP
+                          </Button>
+                        </div>
+                      )}
+                      <div className="flex-1 min-h-0">
+                        <FileExplorer files={activeFragment.files} />
+                      </div>
+                    </div>
                   ) : isFailed ? (
                     <div className="flex h-full flex-col items-center justify-center p-8 text-center text-[#8a9a8e] gap-3">
                       <div className="size-12 rounded-xl bg-destructive/15 border border-destructive/30 flex items-center justify-center text-red-400">
@@ -501,19 +596,50 @@ export function ProjectView({ projectId }: { projectId: string }) {
 
               <div className="flex-1 min-h-0">
                 {tabState === "preview" ? (
-                  activeFragment ? (
+                  activeFragment && !activeFragment.isDraft && activeFragment.sandboxUrl ? (
                     <FragmentWeb
                       data={activeFragment}
                       onViewCode={() => setTabState("code")}
                       projectId={projectId}
                     />
+                  ) : (isFailed && draftFragment) || activeFragment?.isDraft ? (
+                    <div className="flex h-full flex-col items-center justify-center p-6 text-center text-[#8a9a8e] gap-3">
+                      <AlertCircle className="size-6 text-amber-400" />
+                      <p className="text-xs font-medium text-amber-200">
+                        Preview Unavailable (Draft Preserved)
+                      </p>
+                      <Button
+                        onClick={() => setTabState("code")}
+                        size="sm"
+                        className="bg-[#284938] hover:bg-[#34624b] text-white text-xs"
+                      >
+                        Inspect Draft Code
+                      </Button>
+                    </div>
                   ) : (
                     <div className="flex h-full items-center justify-center text-xs text-[#8a9a8e] p-6 text-center">
                       Preview Initializing
                     </div>
                   )
                 ) : activeFragment?.files && Object.keys(activeFragment.files).length > 0 ? (
-                  <FileExplorer files={activeFragment.files} />
+                  <div className="flex flex-col h-full min-h-0">
+                    {activeFragment.isDraft && (
+                      <div className="flex items-center justify-between px-2.5 py-1.5 bg-amber-950/40 border-b border-amber-800/40 text-amber-300 text-[11px] shrink-0">
+                        <span>Unverified Draft</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={handleExport}
+                          className="h-5 text-[10px] px-2 border-amber-700/50 text-amber-200"
+                        >
+                          Draft ZIP
+                        </Button>
+                      </div>
+                    )}
+                    <div className="flex-1 min-h-0">
+                      <FileExplorer files={activeFragment.files} />
+                    </div>
+                  </div>
                 ) : (
                   <div className="flex h-full items-center justify-center text-xs text-[#8a9a8e] p-6 text-center">
                     Files Assembling

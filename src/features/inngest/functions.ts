@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/db";
 import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
-import { MessageRole, GenerationRunStatus, Prisma } from "@/generated/prisma/client";
+import { MessageRole, GenerationRunStatus, DraftValidationStatus, Prisma } from "@/generated/prisma/client";
 import { createAgent } from "@inngest/agent-kit";
 import { getOpenAIModel, isOpenAIPermanentError } from "@/server/providers/openai";
 import { NonRetriableError } from "inngest";
@@ -23,6 +23,9 @@ import {
   finalizeGenerationFailure,
   isRunActiveInDb,
 } from "@/server/orchestration/finalization";
+import {
+  upsertGenerationDraft,
+} from "@/server/orchestration/drafts";
 import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
 import { runDesignAgent, saveDesignSpec } from "@/server/agents/designer";
 import { runArchitectureAgent, saveArchitectureSpec } from "@/server/agents/architect";
@@ -679,6 +682,42 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     // ─────────────────────────────────────────────────────────────────────────
+    // DRAFT PERSISTENCE: CAPTURE AND PERSIST INITIAL DRAFT BEFORE QA
+    // Architectural Note: Source code must never be lost if QA times out or fails.
+    // Captures the exact workspace files from E2B sandbox immediately following
+    // coding agent execution and persists the unverified draft artifact.
+    // ─────────────────────────────────────────────────────────────────────────
+    await step.run("capture-initial-draft", async () => {
+      let draftFiles = files || {};
+      try {
+        const snapshot = await captureSandboxSnapshot(sandboxId);
+        if (snapshot.files && Object.keys(snapshot.files).length > 0) {
+          draftFiles = snapshot.files;
+        }
+      } catch (snapErr) {
+        console.warn(`[Draft] Sandbox snapshot capture had warning, falling back to coder output: ${String(snapErr)}`);
+      }
+
+      await upsertGenerationDraft({
+        generationRunId: runId,
+        projectId,
+        files: draftFiles,
+        validationStatus: DraftValidationStatus.UNVALIDATED,
+        summary,
+        source: "coding-agent",
+      });
+
+      await recordRunEvent(
+        runId,
+        "CODING",
+        "Integration Agent",
+        `Persisted initial unverified draft (${Object.keys(draftFiles).length} files) to database`
+      );
+
+      return draftFiles;
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
     // STAGE 6: TITLE & RESPONSE TEXT HELPERS (Auxiliary AI Calls)
     // Architectural Note: Auxiliary metadata (fragment title and summary text)
     // deliberately routes to lightweight gpt-4o-mini to avoid consuming flagship
@@ -834,6 +873,26 @@ Conclude with an updated <task_summary>...</task_summary>.
           });
           currentFiles = repairResult.files;
           currentSummary = repairResult.summary;
+
+          // Capture actual sandbox files after repair modifications and update persisted draft
+          try {
+            const repairSnapshot = await captureSandboxSnapshot(sandboxId);
+            if (repairSnapshot.files && Object.keys(repairSnapshot.files).length > 0) {
+              currentFiles = repairSnapshot.files;
+            }
+          } catch {
+            // Keep repairResult.files
+          }
+
+          await upsertGenerationDraft({
+            generationRunId: runId,
+            projectId,
+            files: currentFiles,
+            validationStatus: DraftValidationStatus.VALIDATING,
+            summary: currentSummary,
+            source: "qa-repair-agent",
+          });
+
           if (repairResult.usage) {
             repairPromptTokens = repairResult.usage.promptTokens;
             repairCompletionTokens = repairResult.usage.completionTokens;

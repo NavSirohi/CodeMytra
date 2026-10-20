@@ -365,6 +365,7 @@ export const getActiveGenerationRun = async (projectId: string) => {
       events: {
         orderBy: { createdAt: "asc" },
       },
+      draft: true,
     },
   });
 
@@ -383,13 +384,22 @@ export const getActiveGenerationRun = async (projectId: string) => {
     GenerationRunStatus.VALIDATING,
   ];
 
-  // If a run is in an active status but has exceeded the maximum duration budget + grace period,
+  // If a run is in an active status but has exceeded the maximum duration budget + grace period
+  // since its latest activity (run events, updatedAt, startedAt, createdAt),
   // it has been abandoned by an unrecoverable failure (e.g., worker crash, network partition).
   // Automatically reconcile the run to FAILED so no project remains permanently RUNNING.
+  const activityTimestamps = [
+    run.events[run.events.length - 1]?.createdAt?.getTime(),
+    run.updatedAt?.getTime(),
+    run.startedAt?.getTime(),
+    run.createdAt?.getTime(),
+  ].filter((t): t is number => typeof t === "number" && !isNaN(t));
+
+  const latestActivityMs = Math.max(...activityTimestamps);
   const STALE_RUN_GRACE_PERIOD_MS = 60 * 1000;
   const isStale =
     activeStatuses.includes(run.status) &&
-    Date.now() - run.createdAt.getTime() >
+    Date.now() - latestActivityMs >
       GENERATION_LIMITS.maxGenerationDurationMs + STALE_RUN_GRACE_PERIOD_MS;
 
   if (isStale) {
@@ -408,6 +418,7 @@ export const getActiveGenerationRun = async (projectId: string) => {
           events: {
             orderBy: { createdAt: "asc" },
           },
+          draft: true,
         },
       });
     } catch (reconcileErr) {

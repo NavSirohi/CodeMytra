@@ -61,6 +61,62 @@ export function extractCompilerDiagnostics(stdout?: string, stderr?: string, fal
   return combined.slice(0, 1000);
 }
 
+/**
+ * Formats structured, actionable repair instructions for the repair coding agent.
+ * Avoids repetitive generic messages by presenting exact check failures, command exit codes,
+ * timeout classifications, and authentic compiler diagnostics / error output.
+ */
+export function formatRepairInstructions(
+  checks: Array<{
+    name: string;
+    category: string;
+    status: string;
+    details?: string;
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number | null;
+    timeout?: boolean;
+  }>,
+  errors: string[]
+): string {
+  const failedChecks = checks.filter((c) => c.status === "FAIL");
+  const sections: string[] = [];
+
+  if (errors.length > 0) {
+    sections.push(
+      `Validation failed with the following issues:\n${errors
+        .map((e, i) => `${i + 1}. ${e}`)
+        .join("\n")}`
+    );
+  }
+
+  const checkDetails: string[] = [];
+  for (const check of failedChecks) {
+    const lines: string[] = [`[Check: ${check.name} (${check.category})]`];
+    if (typeof check.exitCode === "number") {
+      lines.push(`Exit Code: ${check.exitCode}`);
+    }
+    if (check.timeout) {
+      lines.push(`Status: Command exceeded execution timeout budget`);
+    }
+    if (check.details) {
+      lines.push(`Details: ${check.details}`);
+    }
+    if (check.stderr && check.stderr.trim()) {
+      lines.push(`Stderr:\n${check.stderr.trim().slice(0, 1500)}`);
+    } else if (check.stdout && check.stdout.trim() && check.exitCode !== 0) {
+      lines.push(`Stdout:\n${check.stdout.trim().slice(0, 1500)}`);
+    }
+    checkDetails.push(lines.join("\n"));
+  }
+
+  if (checkDetails.length > 0) {
+    sections.push(`Diagnostic Details:\n${checkDetails.join("\n\n")}`);
+  }
+
+  return sections.join("\n\n");
+}
+
 export interface DatabaseVerificationPipelineOptions {
   workspaceDir: string;
   models?: Array<{ modelName: string; fields?: string[]; relations?: string[] }>;
@@ -305,6 +361,10 @@ export async function executeDatabaseVerificationPipeline(
         details: valPassed
           ? "Prisma schema validated successfully"
           : (valRes.stderr || valRes.stdout || "Prisma schema validation failed").slice(0, 500),
+        stdout: valRes.stdout,
+        stderr: valRes.stderr,
+        exitCode: valRes.exitCode,
+        timeout: false,
       });
       if (!valPassed) {
         errors.push(`Prisma schema validation failed: ${(valRes.stderr || valRes.stdout).slice(0, 300)}`);
@@ -335,6 +395,10 @@ export async function executeDatabaseVerificationPipeline(
         details: genPassed
           ? "Prisma client generated successfully"
           : (genRes.stderr || genRes.stdout || "Prisma client generation failed").slice(0, 500),
+        stdout: genRes.stdout,
+        stderr: genRes.stderr,
+        exitCode: genRes.exitCode,
+        timeout: false,
       });
       if (!genPassed) {
         errors.push(`Prisma client generation failed: ${(genRes.stderr || genRes.stdout).slice(0, 300)}`);
@@ -365,6 +429,10 @@ export async function executeDatabaseVerificationPipeline(
         details: pushPassed
           ? `Safe database schema synchronization succeeded on isolated disposable database (${safeDbFileName})`
           : (pushRes.stderr || pushRes.stdout || "Database push failed").slice(0, 500),
+        stdout: pushRes.stdout,
+        stderr: pushRes.stderr,
+        exitCode: pushRes.exitCode,
+        timeout: false,
       });
       if (!pushPassed) {
         errors.push(`Database initialization on disposable database failed: ${(pushRes.stderr || pushRes.stdout).slice(0, 300)}`);
@@ -397,6 +465,10 @@ export async function executeDatabaseVerificationPipeline(
         details: connPassed
           ? "Database engine connectivity verified (SELECT 1 succeeded on disposable database)"
           : (connRes.stderr || connRes.stdout || "Database connectivity check failed").slice(0, 500),
+        stdout: connRes.stdout,
+        stderr: connRes.stderr,
+        exitCode: connRes.exitCode,
+        timeout: false,
       });
       if (!connPassed) {
         errors.push(`Database connectivity check failed: ${(connRes.stderr || connRes.stdout).slice(0, 300)}`);
@@ -430,6 +502,10 @@ export async function executeDatabaseVerificationPipeline(
           details: delegatePassed
             ? `Verified Prisma model delegate availability and query execution on model "${primaryModel.modelName}" in disposable database`
             : (delegateRes.stderr || delegateRes.stdout || "Model delegate verification failed").slice(0, 500),
+          stdout: delegateRes.stdout,
+          stderr: delegateRes.stderr,
+          exitCode: delegateRes.exitCode,
+          timeout: false,
         });
         // Backwards compatibility alias
         checks.push({
@@ -439,6 +515,10 @@ export async function executeDatabaseVerificationPipeline(
           details: delegatePassed
             ? `Verified Prisma model operations on model "${primaryModel.modelName}"`
             : (delegateRes.stderr || delegateRes.stdout || "Model operations verification failed").slice(0, 500),
+          stdout: delegateRes.stdout,
+          stderr: delegateRes.stderr,
+          exitCode: delegateRes.exitCode,
+          timeout: false,
         });
         if (!delegatePassed) {
           errors.push(`Database model delegate check failed: ${(delegateRes.stderr || delegateRes.stdout).slice(0, 300)}`);
@@ -518,6 +598,10 @@ verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
             details: crudPassed
               ? `Verified generic model-operation smoke test (Create, Read, Update, Delete) on eligible model "${smokeModelName}" in disposable database`
               : (crudRes.stderr || crudRes.stdout || "Generic smoke test failed").slice(0, 500),
+            stdout: crudRes.stdout,
+            stderr: crudRes.stderr,
+            exitCode: crudRes.exitCode,
+            timeout: false,
           });
           // Backward-compatibility alias
           checks.push({
@@ -527,6 +611,10 @@ verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
             details: crudPassed
               ? `Verified complete CRUD operations (Create, Read, Update, Delete) on model "${smokeModelName}" in disposable database`
               : (crudRes.stderr || crudRes.stdout || "CRUD operations verification failed").slice(0, 500),
+            stdout: crudRes.stdout,
+            stderr: crudRes.stderr,
+            exitCode: crudRes.exitCode,
+            timeout: false,
           });
           if (!crudPassed) {
             errors.push(`Database generic smoke test failed: ${(crudRes.stderr || crudRes.stdout).slice(0, 300)}`);
@@ -578,6 +666,10 @@ verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
             details: rulePassed
               ? "Application-specific functional verification and business rules verified on disposable database"
               : (ruleRes.stderr || ruleRes.stdout || "Business rule verification failed").slice(0, 500),
+            stdout: ruleRes.stdout,
+            stderr: ruleRes.stderr,
+            exitCode: ruleRes.exitCode,
+            timeout: false,
           });
           checks.push({
             name: "database-business-rule-verification",
@@ -586,6 +678,10 @@ verifyCRUD().catch(e => { console.error(e); process.exit(1); });`;
             details: rulePassed
               ? "Domain business rule verification succeeded"
               : (ruleRes.stderr || ruleRes.stdout || "Business rule verification failed").slice(0, 500),
+            stdout: ruleRes.stdout,
+            stderr: ruleRes.stderr,
+            exitCode: ruleRes.exitCode,
+            timeout: false,
           });
           if (!rulePassed) {
             errors.push(`Application-specific functional verification failed: ${(ruleRes.stderr || ruleRes.stdout).slice(0, 300)}`);
@@ -1054,6 +1150,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
             category: "sandbox-connection",
             status: "PASS",
             details: `Authoritative workspace verified at ${targetWorkspaceDir}`,
+            stdout: preflightRes.stdout,
+            stderr: preflightRes.stderr,
+            exitCode: 0,
+            timeout: false,
           });
         } else {
           checks.push({
@@ -1061,6 +1161,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
             category: "sandbox-connection",
             status: "FAIL",
             details: `Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`,
+            stdout: preflightRes.stdout,
+            stderr: preflightRes.stderr,
+            exitCode: preflightRes.exitCode,
+            timeout: false,
           });
           errors.push(`Workspace preflight failed: directory or package.json missing at ${targetWorkspaceDir}`);
         }
@@ -1142,6 +1246,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                 category: "typescript-validation",
                 status: "PASS",
                 details: "TypeScript compiled with zero errors",
+                stdout: tscResult.stdout,
+                stderr: tscResult.stderr,
+                exitCode: 0,
+                timeout: false,
               });
             } else {
               const timedOut = isTimeoutError(tscResult.stderr) || isTimeoutError(tscResult.stdout);
@@ -1153,6 +1261,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                   category: "typescript-validation",
                   status: "FAIL",
                   details: "Infrastructure timeout: TypeScript validation exceeded deadline budget",
+                  stdout: tscResult.stdout,
+                  stderr: tscResult.stderr,
+                  exitCode: tscResult.exitCode,
+                  timeout: true,
                 });
                 errors.push("Infrastructure timeout: TypeScript validation exceeded deadline budget");
               } else {
@@ -1162,12 +1274,16 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                   category: "typescript-validation",
                   status: "FAIL",
                   details: tscErr,
+                  stdout: tscResult.stdout,
+                  stderr: tscResult.stderr,
+                  exitCode: tscResult.exitCode,
+                  timeout: false,
                 });
                 errors.push(`TypeScript error:\n${tscErr}`);
               }
             }
           } catch (tscCmdErr: unknown) {
-            const err = tscCmdErr as { stdout?: string; stderr?: string; message?: string };
+            const err = tscCmdErr as { stdout?: string; stderr?: string; message?: string; exitCode?: number };
             const timedOut = isTimeoutError(err?.message) || isTimeoutError(err?.stderr);
             if (timedOut) {
               isInfrastructureTimeout = true;
@@ -1177,6 +1293,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                 category: "typescript-validation",
                 status: "FAIL",
                 details: "Infrastructure timeout: TypeScript validation exceeded deadline budget",
+                stdout: err?.stdout,
+                stderr: err?.stderr || err?.message,
+                exitCode: typeof err?.exitCode === "number" ? err.exitCode : null,
+                timeout: true,
               });
               errors.push("Infrastructure timeout: TypeScript validation exceeded deadline budget");
             } else {
@@ -1186,6 +1306,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                 category: "typescript-validation",
                 status: "FAIL",
                 details: tscErr,
+                stdout: err?.stdout,
+                stderr: err?.stderr || err?.message,
+                exitCode: typeof err?.exitCode === "number" ? err.exitCode : null,
+                timeout: false,
               });
               errors.push(`TypeScript validation failed to execute:\n${tscErr}`);
             }
@@ -1206,6 +1330,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
               category: "production-build",
               status: "FAIL",
               details: `Infrastructure timeout: insufficient budget remaining for production build (${getRemainingBudgetMs()}ms remaining, 25000ms minimum floor)`,
+              timeout: true,
             });
             errors.push("Infrastructure timeout: insufficient budget remaining for production build");
           } else {
@@ -1222,6 +1347,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                   category: "production-build",
                   status: "PASS",
                   details: "Production build succeeded",
+                  stdout: buildResult.stdout,
+                  stderr: buildResult.stderr,
+                  exitCode: 0,
+                  timeout: false,
                 });
               } else {
                 const timedOut = isTimeoutError(buildResult.stderr) || isTimeoutError(buildResult.stdout);
@@ -1233,6 +1362,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                     category: "production-build",
                     status: "FAIL",
                     details: "Infrastructure timeout: Production build exceeded deadline budget",
+                    stdout: buildResult.stdout,
+                    stderr: buildResult.stderr,
+                    exitCode: buildResult.exitCode,
+                    timeout: true,
                   });
                   errors.push("Infrastructure timeout: Production build exceeded deadline budget");
                 } else {
@@ -1242,12 +1375,16 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                     category: "production-build",
                     status: "FAIL",
                     details: buildErr,
+                    stdout: buildResult.stdout,
+                    stderr: buildResult.stderr,
+                    exitCode: buildResult.exitCode,
+                    timeout: false,
                   });
                   errors.push(`Production build error:\n${buildErr}`);
                 }
               }
             } catch (buildCmdErr: unknown) {
-              const err = buildCmdErr as { stdout?: string; stderr?: string; message?: string };
+              const err = buildCmdErr as { stdout?: string; stderr?: string; message?: string; exitCode?: number };
               const timedOut = isTimeoutError(err?.message) || isTimeoutError(err?.stderr);
               if (timedOut) {
                 isInfrastructureTimeout = true;
@@ -1257,6 +1394,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                   category: "production-build",
                   status: "FAIL",
                   details: "Infrastructure timeout: Production build exceeded deadline budget",
+                  stdout: err?.stdout,
+                  stderr: err?.stderr || err?.message,
+                  exitCode: typeof err?.exitCode === "number" ? err.exitCode : null,
+                  timeout: true,
                 });
                 errors.push("Infrastructure timeout: Production build exceeded deadline budget");
               } else {
@@ -1266,6 +1407,10 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
                   category: "production-build",
                   status: "FAIL",
                   details: buildErr,
+                  stdout: err?.stdout,
+                  stderr: err?.stderr || err?.message,
+                  exitCode: typeof err?.exitCode === "number" ? err.exitCode : null,
+                  timeout: false,
                 });
                 errors.push(`Production build command failed:\n${buildErr}`);
               }
@@ -1315,7 +1460,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     checks,
     repairNeeded,
     repairInstructions: !passed && !isInfrastructureTimeout
-      ? `Validation failed with the following issues:\n${errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
+      ? formatRepairInstructions(checks, errors)
       : undefined,
     verificationMode,
     isInfrastructureTimeout,

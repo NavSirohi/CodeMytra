@@ -3,6 +3,7 @@ import {
   MessageRole,
   MessageType,
   GenerationRunStatus,
+  DraftValidationStatus,
   Prisma,
   ProjectRevision,
 } from "@/generated/prisma/client";
@@ -201,6 +202,14 @@ export async function finalizeGenerationSuccess(
       },
     });
 
+    // Update draft validationStatus to PASSED if draft exists
+    if (tx.generationDraft) {
+      await tx.generationDraft.updateMany({
+        where: { generationRunId },
+        data: { validationStatus: DraftValidationStatus.PASSED },
+      });
+    }
+
     // 5. Record Run Event
     await tx.runEvent.create({
       data: {
@@ -395,6 +404,17 @@ export async function finalizeGenerationFailure(
         completedAt: new Date(),
       },
     });
+
+    // Update draft validationStatus to FAILED if draft exists
+    if (tx.generationDraft) {
+      await tx.generationDraft.updateMany({
+        where: { generationRunId },
+        data: {
+          validationStatus: DraftValidationStatus.FAILED,
+          diagnostics: { errorCode, errorMessage } as unknown as Prisma.InputJsonObject,
+        },
+      });
+    }
 
     // 5. Record FAILED event exactly once
     await tx.runEvent.create({
