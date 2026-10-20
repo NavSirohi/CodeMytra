@@ -690,5 +690,54 @@ describe("Priority 0: Outbox Terminal Exhaustion & Delivery Resilience", () => {
       prisma.$queryRawUnsafe = originalQueryRaw;
     }
   });
+
+  it("verifies outbox terminal fencing check prevents superseded worker from prematurely failing GenerationRun", async () => {
+    const originalQueryRaw = prisma.$queryRawUnsafe;
+    const originalInngestSend = inngest.send;
+    const originalTx = prisma.$transaction;
+
+    let finalizationAttempted = false;
+    prisma.$transaction = (async () => {
+      finalizationAttempted = true;
+      return {};
+    }) as any;
+
+    inngest.send = (async () => {
+      throw new Error("Worker A network partition");
+    }) as any;
+
+    // Simulate Worker A's fenced FAILED update returning 0 affected rows (claimToken superseded by Worker B)
+    prisma.$queryRawUnsafe = (async (query: string) => {
+      if (query.includes("status = 'FAILED'")) {
+        return []; // 0 rows affected
+      }
+      return [];
+    }) as any;
+
+    try {
+      const mockEvent = {
+        id: "evt-fenced-terminal",
+        eventName: "code-agent/run",
+        payload: {
+          runId: "run-concurrent-safe",
+          projectId: "proj-concurrent-safe",
+          prompt: "Build analytics app",
+          baseRevisionId: null,
+        },
+        status: OutboxStatus.PROCESSING,
+        attempts: MAX_OUTBOX_ATTEMPTS,
+        claimToken: "tok-worker-A-expired",
+      };
+
+      const result = await executeClaimedEvent(mockEvent as any);
+      assert.equal(result.success, false);
+      assert.equal(finalizationAttempted, false, "Superseded worker must not finalize GenerationRun");
+    } finally {
+      inngest.send = originalInngestSend;
+      prisma.$queryRawUnsafe = originalQueryRaw;
+      prisma.$transaction = originalTx;
+    }
+  });
 });
+
 

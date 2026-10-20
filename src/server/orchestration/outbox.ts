@@ -131,7 +131,7 @@ WHERE id = $1 AND status = 'PROCESSING' AND ($2::text IS NULL OR "claimToken" = 
     );
     const nextAttemptAt = isExhausted ? null : new Date(Date.now() + delayMs);
 
-    await prisma.$queryRawUnsafe(
+    const failedRows = await prisma.$queryRawUnsafe<{ id: string }[]>(
       `UPDATE "OutboxEvent"
 SET 
   status = 'FAILED',
@@ -139,16 +139,21 @@ SET
   "claimedAt" = NULL,
   "claimToken" = NULL,
   "lastError" = $3
-WHERE id = $1 AND status = 'PROCESSING' AND ($4::text IS NULL OR "claimToken" = $4);`,
+WHERE id = $1 AND status = 'PROCESSING' AND ($4::text IS NULL OR "claimToken" = $4)
+RETURNING id;`,
       event.id,
       nextAttemptAt,
       isExhausted ? `Terminal failure (max ${MAX_OUTBOX_ATTEMPTS} attempts exhausted): ${errorMessage}` : errorMessage,
       claimToken
     );
 
+    const failedApplied = Array.isArray(failedRows) && failedRows.length > 0;
+
     // Terminal Outbox Exhaustion: Reconcile with GenerationRun so customer generation never
     // remains indefinitely in a QUEUED or RUNNING state.
-    if (isExhausted) {
+    // FENCING VERIFICATION: Check the affected-row result of the fenced update before terminal reconciliation.
+    // An outdated worker whose lease or claim token has been superseded must NOT incorrectly finalize a generation.
+    if (isExhausted && failedApplied) {
       try {
         const payload = (
           typeof event.payload === "string"
@@ -170,6 +175,10 @@ WHERE id = $1 AND status = 'PROCESSING' AND ($4::text IS NULL OR "claimToken" = 
           reconcileErr
         );
       }
+    } else if (isExhausted && !failedApplied) {
+      console.warn(
+        `[Outbox] Terminal exhaustion reconciliation skipped for event ${event.id}: worker fencing token superseded or lease expired`
+      );
     }
 
     console.error(`[Outbox] Dispatch failed for event ${event.id}:`, errorMessage);
@@ -216,15 +225,28 @@ const ACTIVE_GENERATION_STATUSES: GenerationRunStatus[] = [
   GenerationRunStatus.VALIDATING,
 ];
 
+export interface StaleRunReconciliationResult {
+  checked: number;
+  reconciled: number;
+  failed: number;
+  runIds: string[];
+}
+
 /**
  * Reconciles abandoned active generation runs that exceeded the maximum duration budget + grace period.
  * This ensures runs stranded due to network partitions, host restarts, or Inngest SDK disconnects
  * never remain permanently in an active state.
+ *
+ * Guaranteed properties:
+ * - Appropriate timeout & grace period: only targets runs older than max duration + gracePeriodMs
+ * - Idempotent terminal transitions: finalized via finalizeGenerationFailure
+ * - Non-blocking: individual failure to reconcile one run does not abort others
+ * - Observable: returns checked, reconciled, and failed counts
  */
 export async function reconcileStaleGenerationRuns(
   gracePeriodMs: number = 60 * 1000,
   limit: number = 50
-): Promise<{ reconciled: number }> {
+): Promise<StaleRunReconciliationResult> {
   const timeoutThreshold = new Date(
     Date.now() - (GENERATION_LIMITS.maxGenerationDurationMs + gracePeriodMs)
   );
@@ -243,6 +265,9 @@ export async function reconcileStaleGenerationRuns(
     });
 
     let reconciled = 0;
+    let failed = 0;
+    const runIds: string[] = [];
+
     for (const run of staleRuns) {
       try {
         await finalizeGenerationFailure({
@@ -253,18 +278,28 @@ export async function reconcileStaleGenerationRuns(
             "Generation exceeded maximum duration budget and was reconciled as timed out.",
         });
         reconciled++;
+        runIds.push(run.id);
       } catch (err) {
+        failed++;
         console.error(
           `[Outbox] Failed to reconcile stale GenerationRun ${run.id}:`,
-          err
+          err instanceof Error ? err.message : String(err)
         );
       }
     }
 
-    return { reconciled };
+    return {
+      checked: staleRuns.length,
+      reconciled,
+      failed,
+      runIds,
+    };
   } catch (error) {
-    console.error("[Outbox] Error finding stale generation runs:", error instanceof Error ? error.message : String(error));
-    return { reconciled: 0 };
+    console.error(
+      "[Outbox] Error finding stale generation runs:",
+      error instanceof Error ? error.message : String(error)
+    );
+    return { checked: 0, reconciled: 0, failed: 0, runIds: [] };
   }
 }
 

@@ -311,4 +311,95 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
       inngest.send = originalInngestSend;
     }
   });
+
+  it("exercises the actual scheduled outbox-recovery function executing both outbox recovery and stale run watchdog", async () => {
+    const originalQueryRaw = prisma.$queryRawUnsafe;
+    const originalFindMany = prisma.generationRun.findMany;
+
+    const executedSteps: string[] = [];
+    const mockStep = {
+      run: async (name: string, callback: () => Promise<any>) => {
+        executedSteps.push(name);
+        return callback();
+      },
+    };
+
+    prisma.$queryRawUnsafe = (async () => []) as any;
+    prisma.generationRun.findMany = (async () => []) as any;
+
+    try {
+      // In Inngest function definitions, the user handler is stored in .fn
+      const fn = (outboxRecoveryFunction as any).fn;
+      assert.equal(typeof fn, "function", "outboxRecoveryFunction must expose executable handler");
+
+      const result = await fn({ step: mockStep });
+
+      assert.deepEqual(executedSteps, ["recover-stale-events", "reconcile-stale-runs"]);
+      assert.deepEqual(result.outbox, { total: 0, recovered: 0, failed: 0 });
+      assert.deepEqual(result.staleRuns, { checked: 0, reconciled: 0, failed: 0, runIds: [] });
+    } finally {
+      prisma.$queryRawUnsafe = originalQueryRaw;
+      prisma.generationRun.findMany = originalFindMany;
+    }
+  });
+
+  it("fencing verification: outdated worker with superseded claim token cannot finalize GenerationRun on terminal failure", async () => {
+    const originalQueryRaw = prisma.$queryRawUnsafe;
+    const originalInngestSend = inngest.send;
+    const originalTx = prisma.$transaction;
+
+    let finalizationCalled = false;
+    prisma.$transaction = (async () => {
+      finalizationCalled = true;
+      return {};
+    }) as any;
+
+    // Simulate Worker A attempting dispatch on an event that has reached max attempts
+    const mockEventA = {
+      id: "evt-fenced-stale",
+      eventName: "code-agent/run",
+      payload: {
+        runId: "run-protected",
+        projectId: "proj-protected",
+        prompt: "Build banking app",
+        baseRevisionId: null,
+      },
+      status: OutboxStatus.PROCESSING,
+      attempts: MAX_OUTBOX_ATTEMPTS, // Terminal exhaustion attempt
+      claimToken: "tok-worker-A-stale",
+    };
+
+    // Inngest send fails
+    inngest.send = (async () => {
+      throw new Error("Worker A network disconnect");
+    }) as any;
+
+    // Database simulation: Worker B already stole the lease and changed the claimToken to 'tok-worker-B'
+    // Therefore, Worker A's update WHERE claimToken = 'tok-worker-A-stale' matches 0 rows!
+    prisma.$queryRawUnsafe = (async (query: string) => {
+      if (query.includes("status = 'FAILED'")) {
+        // Return empty array to represent 0 rows affected
+        return [];
+      }
+      return [];
+    }) as any;
+
+    try {
+      const { executeClaimedEvent } = await import("../src/server/orchestration/outbox");
+      const result = await executeClaimedEvent(mockEventA as any);
+
+      assert.equal(result.success, false);
+      assert.match(result.error || "", /Worker A network disconnect/);
+
+      // CRITICAL ASSERTION:
+      // Even though attempts reached MAX_OUTBOX_ATTEMPTS, finalizeGenerationFailure was NOT called
+      // because Worker A's claim token was superseded!
+      assert.equal(finalizationCalled, false, "Superseded worker must NEVER finalize GenerationRun");
+    } finally {
+      prisma.$queryRawUnsafe = originalQueryRaw;
+      inngest.send = originalInngestSend;
+      prisma.$transaction = originalTx;
+    }
+  });
 });
+
