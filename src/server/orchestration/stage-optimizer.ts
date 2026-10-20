@@ -10,6 +10,9 @@ export interface GenerationLimits {
   maxGenerationDurationMs: number;
   maxConcurrentRunsPerUser: number;
   maxInputFilesForContext: number;
+  maxCodingIterations?: number;
+  maxRepairIterations?: number;
+  maxRunTokenBudget?: number;
 }
 
 export const GENERATION_LIMITS: GenerationLimits = {
@@ -17,7 +20,38 @@ export const GENERATION_LIMITS: GenerationLimits = {
   maxGenerationDurationMs: Math.max(30000, parseInt(process.env.MAX_GENERATION_DURATION_MS || "300000", 10)), // 5 mins
   maxConcurrentRunsPerUser: Math.max(1, parseInt(process.env.MAX_CONCURRENT_RUNS_PER_USER || "3", 10)),
   maxInputFilesForContext: Math.max(5, parseInt(process.env.MAX_INPUT_FILES_FOR_CONTEXT || "30", 10)),
+  maxCodingIterations: Math.max(1, parseInt(process.env.MAX_CODING_ITERATIONS || "4", 10)),
+  maxRepairIterations: Math.max(1, parseInt(process.env.MAX_REPAIR_ITERATIONS || "2", 10)),
+  maxRunTokenBudget: Math.max(10000, parseInt(process.env.MAX_RUN_TOKEN_BUDGET || "150000", 10)),
 };
+
+export class RunAbortedError extends Error {
+  constructor(message: string, public readonly status?: string) {
+    super(message);
+    this.name = "RunAbortedError";
+  }
+}
+
+export class TokenBudgetExceededError extends Error {
+  constructor(message: string, public readonly tokensUsed?: number, public readonly tokenBudget?: number) {
+    super(message);
+    this.name = "TokenBudgetExceededError";
+  }
+}
+
+export class NoProgressError extends Error {
+  constructor(message: string, public readonly consecutiveTurns?: number) {
+    super(message);
+    this.name = "NoProgressError";
+  }
+}
+
+export class IterationLimitExceededError extends Error {
+  constructor(message: string, public readonly iterations?: number, public readonly maxIterations?: number) {
+    super(message);
+    this.name = "IterationLimitExceededError";
+  }
+}
 
 export interface SelectModelOptions {
   isComplexFullstack?: boolean;

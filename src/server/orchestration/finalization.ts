@@ -292,6 +292,42 @@ export async function finalizeGenerationFailure(
       };
     }
 
+    // Check if the project actually has a working revision pointer or existing revisions
+    const project = tx.project
+      ? await tx.project.findUnique({
+          where: { id: projectId },
+          select: { currentRevisionId: true },
+        })
+      : null;
+    const revisionCount = tx.projectRevision
+      ? await tx.projectRevision.count({
+          where: { projectId },
+        })
+      : 0;
+    const hasPriorRevision = revisionCount > 0 && Boolean(project?.currentRevisionId);
+    const revisionNote = hasPriorRevision
+      ? "Your prior working revision is preserved."
+      : "No prior revisions exist for this project yet.";
+    const runEventRevisionNote = hasPriorRevision
+      ? "Prior working revision preserved."
+      : "No prior working revision exists.";
+
+    const formatFailurePrefix = (code: string): string => {
+      if (code === "GENERATION_TIMEOUT" || code === "WORKFLOW_TIMED_OUT") {
+        return "Generation timed out:";
+      }
+      if (code.startsWith("QA_") || code === "QA_CHECK_FAILED" || code === "QA_REPAIR_EXHAUSTED" || code === "QA_VERIFICATION_FAILED") {
+        return "Quality Assurance failed:";
+      }
+      if (code === "NO_PROGRESS_LIMIT" || code === "ITERATION_LIMIT_EXCEEDED" || code === "TOKEN_BUDGET_EXCEEDED") {
+        return "Generation stopped:";
+      }
+      return "Generation failed:";
+    };
+
+    const prefix = formatFailurePrefix(errorCode);
+    const failureContent = `${prefix} ${errorMessage} ${revisionNote}`;
+
     // 3. Repeated failure delivery (idempotent replay):
     // If run is already FAILED, return existing messageId associated with this exact generationRunId
     if (currentRun.status === GenerationRunStatus.FAILED) {
@@ -311,7 +347,7 @@ export async function finalizeGenerationFailure(
         data: {
           projectId,
           generationRunId,
-          content: `Quality Assurance failed: ${errorMessage} Your prior working revision is preserved.`,
+          content: failureContent,
           role: MessageRole.ASSISTANT,
           type: MessageType.ERROR,
         },
@@ -366,7 +402,7 @@ export async function finalizeGenerationFailure(
         runId: generationRunId,
         stage: "FAILED",
         agentRole: "System",
-        message: `Run marked failed (${errorCode}): ${errorMessage}. Prior working revision preserved.`,
+        message: `Run marked failed (${errorCode}): ${errorMessage}. ${runEventRevisionNote}`,
       },
     });
 
@@ -380,7 +416,7 @@ export async function finalizeGenerationFailure(
         data: {
           projectId,
           generationRunId,
-          content: `Quality Assurance failed: ${errorMessage} Your prior working revision is preserved.`,
+          content: failureContent,
           role: MessageRole.ASSISTANT,
           type: MessageType.ERROR,
         },
@@ -389,4 +425,22 @@ export async function finalizeGenerationFailure(
 
     return { messageId: message.id, isIdempotentReplay: false };
   });
+}
+
+/**
+ * Fast status checker to determine if a GenerationRun is still active in database.
+ * Returns false if the run reached a terminal state (FAILED, COMPLETED, CANCELLED).
+ */
+export async function isRunActiveInDb(generationRunId?: string): Promise<boolean> {
+  if (!generationRunId) return true;
+  try {
+    const run = await prisma.generationRun.findUnique({
+      where: { id: generationRunId },
+      select: { status: true },
+    });
+    if (!run) return false;
+    return run.status === GenerationRunStatus.RUNNING || run.status === GenerationRunStatus.VALIDATING;
+  } catch {
+    return true;
+  }
 }

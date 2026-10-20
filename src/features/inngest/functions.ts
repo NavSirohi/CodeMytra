@@ -22,6 +22,7 @@ import {
   finalizeGenerationSuccess,
   finalizeGenerationFailure,
   FinalizeGenerationSuccessResult,
+  isRunActiveInDb,
 } from "@/server/orchestration/finalization";
 import { runPlannerAgent, saveProjectPRD } from "@/server/agents/planner";
 import { runDesignAgent, saveDesignSpec } from "@/server/agents/designer";
@@ -46,6 +47,10 @@ import {
   filterRelevantFiles,
   selectModelForStage,
   GenerationTimeoutError,
+  RunAbortedError,
+  TokenBudgetExceededError,
+  NoProgressError,
+  IterationLimitExceededError,
   establishRunDeadline,
   getRemainingTimeMs,
   isPastDeadline,
@@ -179,6 +184,26 @@ export const codeAgentFunction = inngest.createFunction(
             ? error.message.slice(0, 500)
             : "Generation failed after workflow retries.";
 
+        const isAborted =
+          error instanceof RunAbortedError ||
+          (error instanceof Error && error.name === "RunAbortedError") ||
+          (typeof error?.message === "string" && error.message.includes("RunAbortedError"));
+
+        const isTokenBudget =
+          error instanceof TokenBudgetExceededError ||
+          (error instanceof Error && error.name === "TokenBudgetExceededError") ||
+          (typeof error?.message === "string" && error.message.includes("TokenBudgetExceededError"));
+
+        const isNoProgress =
+          error instanceof NoProgressError ||
+          (error instanceof Error && error.name === "NoProgressError") ||
+          (typeof error?.message === "string" && error.message.includes("NoProgressError"));
+
+        const isIterationLimit =
+          error instanceof IterationLimitExceededError ||
+          (error instanceof Error && error.name === "IterationLimitExceededError") ||
+          (typeof error?.message === "string" && error.message.includes("IterationLimitExceededError"));
+
         const isTimeout =
           error instanceof GenerationTimeoutError ||
           (typeof error?.message === "string" &&
@@ -186,7 +211,26 @@ export const codeAgentFunction = inngest.createFunction(
              error.message.includes("GenerationTimeoutError"))) ||
           (error instanceof Error && error.name === "GenerationTimeoutError");
         const isProviderConfigError = isOpenAIPermanentError(error);
-        const errorCode = isTimeout
+
+        // If aborted because run was already marked terminal in DB (e.g. by watchdog or user cancellation),
+        // verify active status. If already terminal, do not overwrite terminal state or emit duplicate messages.
+        if (isAborted) {
+          const stillActive = await isRunActiveInDb(runId);
+          if (!stillActive) {
+            console.log(`[Generation onFailure] Run ${runId} is already terminal in DB. Skipping failure finalization.`);
+            return;
+          }
+        }
+
+        const errorCode = isAborted
+          ? "RUN_ABORTED"
+          : isTokenBudget
+          ? "TOKEN_BUDGET_EXCEEDED"
+          : isNoProgress
+          ? "NO_PROGRESS_LIMIT"
+          : isIterationLimit
+          ? "ITERATION_LIMIT_EXCEEDED"
+          : isTimeout
           ? "GENERATION_TIMEOUT"
           : isProviderConfigError
           ? "PROVIDER_CONFIGURATION_ERROR"
@@ -568,6 +612,19 @@ export const codeAgentFunction = inngest.createFunction(
     // STAGE 5: IMPLEMENTATION (Authoritative Coding Agent Engine)
     // ─────────────────────────────────────────────────────────────────────────
     checkGenerationDeadline(deadlineMs, "coding");
+
+    const isCodingActive = await isRunActiveInDb(runId);
+    if (!isCodingActive) {
+      throw new RunAbortedError(`Generation run ${runId} is no longer active in database`);
+    }
+
+    await recordRunEvent(
+      runId,
+      "CODING",
+      "Code Agent",
+      "Beginning code generation with authoritative AgentKit coder"
+    );
+
     const effectiveBaseFiles = Object.keys(baseFiles).length === 0
       ? getBaseProjectFiles({
           projectName: prd.projectName,
@@ -595,7 +652,16 @@ export const codeAgentFunction = inngest.createFunction(
       step,
       stepPrefix: "initial-coding",
       model: coderModel,
+      generationRunId: runId,
+      deadlineMs,
+      maxIterations: GENERATION_LIMITS.maxCodingIterations,
+      tokenBudget: GENERATION_LIMITS.maxRunTokenBudget,
     });
+
+    const isPostCodingActive = await isRunActiveInDb(runId);
+    if (!isPostCodingActive) {
+      throw new RunAbortedError(`Generation run ${runId} was marked terminal during coding stage`);
+    }
 
     await recordStageMetric({
       runId,
@@ -760,6 +826,10 @@ Conclude with an updated <task_summary>...</task_summary>.
             step,
             stepPrefix: "qa-repair-1",
             model: repairModel,
+            generationRunId: runId,
+            deadlineMs,
+            maxIterations: GENERATION_LIMITS.maxRepairIterations,
+            tokenBudget: GENERATION_LIMITS.maxRunTokenBudget,
           });
           currentFiles = repairResult.files;
           currentSummary = repairResult.summary;
@@ -780,7 +850,11 @@ Conclude with an updated <task_summary>...</task_summary>.
             capabilities: prd.capabilities,
           });
         } catch (repairErr) {
-          if (repairErr instanceof GenerationTimeoutError) {
+          if (
+            repairErr instanceof GenerationTimeoutError ||
+            repairErr instanceof RunAbortedError ||
+            repairErr instanceof TokenBudgetExceededError
+          ) {
             throw repairErr;
           }
           console.error("[QA Repair] Repair loop execution failed:", repairErr);
