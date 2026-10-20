@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { runWithoutStepContext } from "../src/server/orchestration/async-context";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { getStepTools, createAgent } from "@inngest/agent-kit";
 
 describe("P1: Inngest Step Isolation & Planner Orchestration", () => {
   it("isolates ambient Inngest execution context to prevent NESTING_STEPS", async () => {
@@ -180,5 +181,114 @@ describe("P1: Inngest Step Isolation & Planner Orchestration", () => {
     assert.equal(workflowStatus, "FAILED", "Workflow must transition to FAILED on error");
     assert.equal(failureFinalized, true, "Failure must be finalized immediately");
     assert.equal(errorCode, "WORKFLOW_EXECUTION_FAILED");
+  });
+
+  it("verifies installed AgentKit SDK getStepTools resolves undefined inside runWithoutStepContext", async () => {
+    const g = globalThis as any;
+    const alsSymbol = Symbol.for("inngest:als");
+    const als = g[alsSymbol]?.resolved || new AsyncLocalStorage<any>();
+
+    g[alsSymbol] = {
+      resolved: als,
+      promise: Promise.resolve(als),
+      isFallback: false,
+    };
+
+    let stepAiInferCalled = false;
+    const mockStepTools = {
+      run: async (_id: string, fn: () => any) => fn(),
+      ai: {
+        infer: async () => {
+          stepAiInferCalled = true;
+          return { output: [{ type: "text", content: "nested step output" }] };
+        },
+      },
+    };
+
+    const mockFunctionContext = {
+      app: {},
+      ctx: {
+        step: mockStepTools,
+      },
+      execution: {
+        ctx: {
+          step: mockStepTools,
+        },
+        executingStep: {
+          id: "planner-spec",
+        },
+      },
+    };
+
+    await als.run(mockFunctionContext, async () => {
+      // 1. Without isolation, AgentKit SDK getStepTools discovers ambient step tool
+      const detectedStepOuter = await getStepTools();
+      assert.equal(detectedStepOuter, mockStepTools);
+
+      // 2. Inside runWithoutStepContext, AgentKit SDK getStepTools resolves to undefined
+      const detectedStepInner = await runWithoutStepContext(async () => {
+        return getStepTools();
+      });
+      assert.equal(
+        detectedStepInner,
+        undefined,
+        "AgentKit getStepTools() must resolve undefined inside runWithoutStepContext"
+      );
+
+      // 3. Verify real AgentKit agent execution with gemini adapter
+      // Mock global fetch to return valid Gemini REST candidate
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  role: "model",
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        projectName: "Verified Invoice App",
+                        pages: ["/dashboard"],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      };
+
+      try {
+        const geminiAdapter = {
+          format: "gemini",
+          model: "gemini-2.5-pro",
+          url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+          authKey: "synthetic-key",
+        };
+
+        const agent = createAgent({
+          name: "planner-agent-sdk-verified",
+          system: "Generate PRD",
+          model: geminiAdapter as any,
+        });
+
+        // Run agent inside runWithoutStepContext
+        const agentResult = await runWithoutStepContext(async () => {
+          return agent.run("Plan an invoice application");
+        });
+
+        assert.ok(agentResult, "Agent must return result");
+        assert.equal(
+          stepAiInferCalled,
+          false,
+          "AgentKit must NOT call step.ai.infer() inside runWithoutStepContext"
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 });

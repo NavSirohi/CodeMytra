@@ -68,14 +68,21 @@ Follow-up requests that only modify surface-level styling or component layout do
 - **Mandatory Rejection of Non-Cosmetic Requests**: Any prompt involving databases, CRUD operations, deletions, customer records, order-processing, business rules, authentication, authorization, permissions, roles, payments, or API endpoints immediately takes the full planning path.
 - **Safety Gate**: Source validation, sandbox Next.js build verification, database checks, and revision persistence are **never bypassed**.
 
-### 3.3 Configurable Generation Limits (`src/server/orchestration/stage-optimizer.ts`)
-Synchronized with actual runtime defaults:
 | Parameter | Default | Environment Override | Purpose |
 |---|---|---|---|
 | `MAX_REPAIR_ATTEMPTS` | 2 | `MAX_REPAIR_ATTEMPTS` | Caps self-healing retry iterations during QA |
-| `MAX_GENERATION_DURATION_MS` | 300,000 (5 min) | `MAX_GENERATION_DURATION_MS` | Hard timeout for total generation workflow |
+| `MAX_GENERATION_DURATION_MS` | 300,000 (5 min) | `MAX_GENERATION_DURATION_MS` | Cooperative deadline budget for overall generation workflow |
 | `MAX_CONCURRENT_RUNS_PER_USER` | 3 | `MAX_CONCURRENT_RUNS_PER_USER` | Enforces concurrency fairness across users |
 | `MAX_INPUT_FILES_FOR_CONTEXT` | 30 | `MAX_INPUT_FILES_FOR_CONTEXT` | Prevents prompt token bloat on large projects |
+
+### 3.4 Cooperative vs Preemptive Timeout Mechanics
+- **Out-of-Process Execution**: External AI providers (e.g. Google Gemini REST/SDK inference) and sandbox executions (e.g. Next.js compiler or build commands inside E2B containers) execute out-of-process. Standard cloud runtimes and HTTP clients cannot be preemptively interrupted mid-flight without aborting sockets or killing entire containers.
+- **Cooperative Deadlines**: The configured `MAX_GENERATION_DURATION_MS` (default 300,000 ms / 5 minutes) acts as a **cooperative deadline budget**, not a preemptive OS-level thread-kill or guaranteed hard wall-clock interruption.
+- **Enforcement Architecture**:
+  1. **Persisted Anchor**: Run start time (`startedAt`) is persisted in PostgreSQL so Inngest workflow retries derive an unchanged deadline rather than resetting the budget.
+  2. **Stage Boundaries**: Before entering each pipeline stage (`planning`, `design`, `architecture`, `coding`, `qa-and-repair`), `checkGenerationDeadline()` verifies that the remaining time is positive and halts generation immediately if expired.
+  3. **Operation Bounding**: Subprocess commands inside the sandbox are bounded via `boundOperationTimeout()`, preventing any task from requesting more time than remaining before the deadline, and aborting if below a 5-second minimum execution floor.
+  4. **Preservation of Assets**: When a timeout occurs, `finalizeGenerationFailure` transitions the run to `FAILED` with `errorCode: "GENERATION_TIMEOUT"` and strictly preserves prior working project revisions.
 
 ---
 
