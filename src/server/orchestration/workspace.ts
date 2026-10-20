@@ -61,6 +61,9 @@ export async function initializeSandboxWorkspace(sandbox: Sandbox): Promise<void
         cp "/home/user/$f" "${PROJECT_WORKSPACE_DIR}/$f"
       fi
     done
+    if [ -f "${PROJECT_WORKSPACE_DIR}/next.config.mjs" ]; then
+      rm -f "${PROJECT_WORKSPACE_DIR}/next.config.ts" "${PROJECT_WORKSPACE_DIR}/next.config.js"
+    fi
   `;
 
   const res = await sandbox.commands.run(initScript, { timeoutMs: 15000 });
@@ -109,15 +112,16 @@ export interface PreviewSandboxRunner {
  * and responsive to HTTP requests before returning the public preview URL to the user.
  * 
  * 1. Proactively clears any stale or conflicting processes on port 3000.
- * 2. Starts the development server directly within PROJECT_WORKSPACE_DIR (/home/user/workspace).
- * 3. Uses bounded independent HTTP polling to verify responsiveness without SDK-level timeout hangs.
- * 4. Extracts server logs and throws PreviewReadinessError if the server fails to become ready.
+ * 2. Prepares canonical workspace: links dependencies and cleans duplicate config.
+ * 3. Starts the development server directly within PROJECT_WORKSPACE_DIR (/home/user/workspace).
+ * 4. Uses bounded independent HTTP polling to verify responsiveness without SDK-level timeout hangs.
+ * 5. Extracts server logs and throws PreviewReadinessError if the server fails to become ready.
  */
 export async function ensureSandboxPreviewServer(
   sandbox: Sandbox | PreviewSandboxRunner,
   options?: PreviewServerOptions
 ): Promise<void> {
-  const maxAttempts = options?.maxAttempts ?? 12;
+  const maxAttempts = options?.maxAttempts ?? 15;
   const pollIntervalMs = options?.pollIntervalMs ?? 1000;
 
   // 1. Check if port 3000 is already active and serving our application
@@ -144,8 +148,11 @@ export async function ensureSandboxPreviewServer(
     // Non-fatal cleanup attempt
   }
 
-  // 3. Start dev server in the canonical workspace in the background
-  const startCmd = `cd "${PROJECT_WORKSPACE_DIR}" && (command -v bun >/dev/null 2>&1 && nohup bun run dev --port 3000 > /tmp/preview.log 2>&1 & || nohup npm run dev -- --port 3000 > /tmp/preview.log 2>&1 &)`;
+  // 3. Start dev server in canonical workspace in the background
+  const startCmd = `cd "${PROJECT_WORKSPACE_DIR}" && ` +
+    `( [ -e node_modules ] || ( [ -d /home/user/node_modules ] && ln -s /home/user/node_modules node_modules ) || true ) && ` +
+    `( [ -f next.config.mjs ] && rm -f next.config.ts next.config.js || true ) && ` +
+    `(command -v bun >/dev/null 2>&1 && nohup bun run dev -- -H 0.0.0.0 -p 3000 > /tmp/preview.log 2>&1 & || nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/preview.log 2>&1 &)`;
   await sandbox.commands.run(startCmd, { timeoutMs: 6000 });
 
   // 4. Bounded independent polling

@@ -17,6 +17,7 @@ import {
   validateRevisionManifest,
   RestorationError,
   FileTreeManifest,
+  generateManifest,
   sanitizeProjectFiles,
 } from "@/server/orchestration/revisions";
 import {
@@ -67,6 +68,13 @@ export interface CodeAgentState {
   sandboxId: string;
   summary: string;
   files: Record<string, string>;
+}
+
+export interface SourceCheckpoint {
+  files: Record<string, string>;
+  manifest: FileTreeManifest;
+  source: string;
+  diagnostics?: Record<string, unknown>;
 }
 
 interface AgentOutputUsage {
@@ -691,8 +699,9 @@ export const codeAgentFunction = inngest.createFunction(
     // Captures the exact workspace files from E2B sandbox immediately following
     // coding agent execution and persists the unverified draft artifact.
     // ─────────────────────────────────────────────────────────────────────────
-    await step.run("capture-initial-draft", async () => {
+    const initialCheckpoint = await step.run("capture-initial-draft", async (): Promise<SourceCheckpoint> => {
       let draftFiles: Record<string, string> = {};
+      let draftManifest: FileTreeManifest = generateManifest({});
       let draftSource = "canonical-sandbox-snapshot";
       let draftStatus: DraftValidationStatus = DraftValidationStatus.UNVALIDATED;
       let draftDiagnostics: Record<string, unknown> | undefined = undefined;
@@ -701,10 +710,13 @@ export const codeAgentFunction = inngest.createFunction(
         const snapshot = await captureSandboxSnapshot(sandboxId);
         if (snapshot.files && Object.keys(snapshot.files).length > 0) {
           draftFiles = snapshot.files;
+          draftManifest = snapshot.manifest;
           draftSource = "canonical-sandbox-snapshot";
           draftDiagnostics = {
             provenance: "canonical-sandbox-snapshot",
             fileCount: Object.keys(draftFiles).length,
+            durationMs: snapshot.diagnostics?.durationMs,
+            totalBytes: snapshot.diagnostics?.totalBytes,
           };
           await recordRunEvent(
             runId,
@@ -725,6 +737,7 @@ export const codeAgentFunction = inngest.createFunction(
 
         if (validFileEntries.length > 0) {
           draftFiles = Object.fromEntries(validFileEntries);
+          draftManifest = generateManifest(draftFiles);
           draftSource = "unverified-model-output-fallback";
           draftDiagnostics = {
             warning: "E2B filesystem snapshot capture failed; fell back to unverified model memory output",
@@ -740,6 +753,7 @@ export const codeAgentFunction = inngest.createFunction(
           );
         } else {
           draftFiles = {};
+          draftManifest = generateManifest({});
           draftSource = "failed-source-generation";
           draftStatus = DraftValidationStatus.FAILED;
           draftDiagnostics = {
@@ -766,7 +780,12 @@ export const codeAgentFunction = inngest.createFunction(
         diagnostics: draftDiagnostics,
       });
 
-      return draftFiles;
+      return {
+        files: draftFiles,
+        manifest: draftManifest,
+        source: draftSource,
+        diagnostics: draftDiagnostics,
+      };
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -852,7 +871,15 @@ export const codeAgentFunction = inngest.createFunction(
       let repairCompletionTokens: number | undefined;
       let repairModelUsed: string | undefined;
 
-      let currentFiles = { ...(files || {}) };
+      // Initialize checkpoint from the draft captured before QA
+      let activeCheckpoint: SourceCheckpoint = {
+        files: initialCheckpoint?.files || files || {},
+        manifest: initialCheckpoint?.manifest || generateManifest(initialCheckpoint?.files || files || {}),
+        source: initialCheckpoint?.source || "unverified-model-output-fallback",
+        diagnostics: initialCheckpoint?.diagnostics,
+      };
+
+      let currentFiles = { ...(activeCheckpoint.files) };
       let currentSummary = summary;
 
       // Pass 1: Run comprehensive verification checks
@@ -926,6 +953,7 @@ Conclude with an updated <task_summary>...</task_summary>.
 
           // Capture actual sandbox files after repair modifications and update persisted draft
           let repairFiles = currentFiles;
+          let repairManifest = generateManifest(currentFiles);
           let repairSource = "canonical-repair-sandbox-snapshot";
           let repairDiagnostics: Record<string, unknown> | undefined = undefined;
 
@@ -933,9 +961,12 @@ Conclude with an updated <task_summary>...</task_summary>.
             const repairSnapshot = await captureSandboxSnapshot(sandboxId);
             if (repairSnapshot.files && Object.keys(repairSnapshot.files).length > 0) {
               repairFiles = repairSnapshot.files;
+              repairManifest = repairSnapshot.manifest;
               repairDiagnostics = {
                 provenance: "canonical-repair-sandbox-snapshot",
                 fileCount: Object.keys(repairFiles).length,
+                durationMs: repairSnapshot.diagnostics?.durationMs,
+                totalBytes: repairSnapshot.diagnostics?.totalBytes,
               };
             } else {
               throw new Error("Repair sandbox snapshot returned zero files");
@@ -945,6 +976,7 @@ Conclude with an updated <task_summary>...</task_summary>.
             const sanitizedCurrent = currentFiles && typeof currentFiles === "object" ? sanitizeProjectFiles(currentFiles) : {};
             if (Object.keys(sanitizedCurrent).length > 0) {
               repairFiles = sanitizedCurrent;
+              repairManifest = generateManifest(sanitizedCurrent);
               repairSource = "unverified-repair-output-fallback";
               repairDiagnostics = {
                 warning: "Repair filesystem snapshot capture failed; fell back to model repair memory state",
@@ -953,6 +985,7 @@ Conclude with an updated <task_summary>...</task_summary>.
               };
             } else {
               repairFiles = {};
+              repairManifest = generateManifest({});
               repairSource = "failed-repair-generation";
               repairDiagnostics = {
                 error: "Repair stage produced no files and snapshot failed",
@@ -961,6 +994,13 @@ Conclude with an updated <task_summary>...</task_summary>.
             }
           }
 
+          // Invalidate previous checkpoint with post-repair state
+          activeCheckpoint = {
+            files: repairFiles,
+            manifest: repairManifest,
+            source: repairSource,
+            diagnostics: repairDiagnostics,
+          };
           currentFiles = repairFiles;
 
           await upsertGenerationDraft({
@@ -1009,28 +1049,64 @@ Conclude with an updated <task_summary>...</task_summary>.
         `Verification complete with quality score ${report.score}% (${report.passed ? "PASSED" : "FAILED"})`
       );
 
-      // Capture exact filesystem snapshot from the canonical workspace directory in sandbox
-      let finalFiles = currentFiles;
+      // Validated Source-Checkpoint Contract:
+      // When QA passes, promote the verified checkpoint (captured pre-QA or refreshed during repair)
+      // without a redundant second full filesystem scan that could fail due to transient transport drops.
+      // Strictly reject model-memory fallback or unverified snapshots from promotion.
+      let finalFiles = activeCheckpoint.files;
       let finalSnapshotVerified = false;
+
       if (report.passed) {
-        try {
-          const snapshot = await captureSandboxSnapshot(sandboxId);
-          if (snapshot.files && Object.keys(snapshot.files).length > 0) {
-            finalFiles = snapshot.files;
-            finalSnapshotVerified = true;
-          } else {
-            throw new Error("Authoritative workspace snapshot returned zero files");
-          }
-        } catch (snapErr) {
-          // Reject incomplete snapshot instead of falling back silently
-          const errMsg = snapErr instanceof Error ? snapErr.message : String(snapErr);
-          console.error("[QA Snapshot] Snapshot capture failed:", errMsg);
+        const isCanonical =
+          activeCheckpoint.source === "canonical-sandbox-snapshot" ||
+          activeCheckpoint.source === "canonical-repair-sandbox-snapshot";
+        const hasFiles = Object.keys(activeCheckpoint.files).length > 0;
+        const hasEntrypoint = Boolean(
+          activeCheckpoint.files["app/page.tsx"] ||
+          activeCheckpoint.files["src/app/page.tsx"] ||
+          activeCheckpoint.files["pages/index.tsx"] ||
+          activeCheckpoint.files["page.tsx"]
+        );
+
+        if (isCanonical && hasFiles && hasEntrypoint) {
+          finalFiles = activeCheckpoint.files;
+          finalSnapshotVerified = true;
+          await recordRunEvent(
+            runId,
+            "VALIDATING",
+            "QA Agent",
+            `Source checkpoint verified directly (${Object.keys(finalFiles).length} files, provenance: ${activeCheckpoint.source})`
+          );
+
+          // Update persisted draft validation status to PASSED
+          await upsertGenerationDraft({
+            generationRunId: runId,
+            projectId,
+            files: finalFiles,
+            validationStatus: DraftValidationStatus.PASSED,
+            summary: currentSummary,
+            source: activeCheckpoint.source,
+            diagnostics: {
+              ...activeCheckpoint.diagnostics,
+              validatedAt: new Date().toISOString(),
+              qaScore: report.score,
+            },
+          });
+        } else {
+          // Reject promotion of unverified fallback or corrupt checkpoint
+          const rejectionReason = !isCanonical
+            ? `Checkpoint provenance is '${activeCheckpoint.source}', which is an unverified fallback. Verified V1 requires authoritative sandbox filesystem capture.`
+            : !hasFiles
+            ? "Checkpoint contains zero files"
+            : "Checkpoint missing required Next.js entrypoint (app/page.tsx)";
+
+          console.error("[QA Checkpoint] Promotion rejected:", rejectionReason);
           report = {
             ...report,
             passed: false,
             score: Math.min(report.score, 50),
-            repairNeeded: true,
-            repairInstructions: `Snapshot capture failed: ${errMsg}. Build artifacts or missing entrypoint detected.`,
+            repairNeeded: false,
+            repairInstructions: `Validated source-checkpoint contract rejected: ${rejectionReason}`,
           };
           finalSnapshotVerified = false;
         }

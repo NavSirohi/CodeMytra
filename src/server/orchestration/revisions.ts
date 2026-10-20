@@ -77,6 +77,14 @@ export function sanitizeProjectFiles(files: Record<string, string>): Record<stri
     sanitized[normalized] = content;
   }
 
+  // Disambiguate duplicate Next.js config files (prefer canonical foundation next.config.mjs)
+  if (sanitized["next.config.mjs"] && (sanitized["next.config.ts"] || sanitized["next.config.js"])) {
+    delete sanitized["next.config.ts"];
+    delete sanitized["next.config.js"];
+  } else if (sanitized["next.config.ts"] && sanitized["next.config.js"]) {
+    delete sanitized["next.config.js"];
+  }
+
   return sanitized;
 }
 
