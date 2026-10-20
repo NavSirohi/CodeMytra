@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { getBaseProjectFiles, isDatabaseRequired } from "@/server/templates/foundation";
+import { getBaseProjectFiles, isDatabaseRequired, synthesizeComponentsBarrel } from "@/server/templates/foundation";
 import {
   runQAInspector,
   hasValidRouteHandlerExport,
@@ -713,4 +713,119 @@ export async function POST(req: Request) {
       assert.equal(dbCheck.status, "PASS");
     });
   });
+
+  // =========================================================================
+  // ISSUE 1: Barrel Imports and Component Resolution
+  // =========================================================================
+  describe("Issue 1: Barrel Imports and Component Resolution", () => {
+    it("synthesizes components/index.ts when components exist and barrel is absent", () => {
+      const files: Record<string, string> = {
+        "components/Header.tsx": "export default function Header() { return <header>Header</header>; }",
+        "components/Footer.tsx": "export function Footer() { return <footer>Footer</footer>; }",
+        "components/CartDrawer.tsx": "export default function CartDrawer() {}; export const CART_LIMIT = 10;",
+      };
+
+      const synthesized = synthesizeComponentsBarrel(files);
+      assert.ok(synthesized["components/index.ts"], "components/index.ts must be synthesized");
+      const barrelContent = synthesized["components/index.ts"];
+
+      // Verify Header default export re-exported under named identifier
+      assert.match(barrelContent, /export \{ default as Header \} from "\.\/Header";/);
+
+      // Verify Footer named export re-exported
+      assert.match(barrelContent, /export \* from "\.\/Footer";/);
+
+      // Verify CartDrawer with both default and named exports
+      assert.match(barrelContent, /export \* from "\.\/CartDrawer";/);
+      assert.match(barrelContent, /export \{ default as CartDrawer \} from "\.\/CartDrawer";/);
+    });
+
+    it("does not overwrite an existing components/index.ts", () => {
+      const customBarrel = "// User custom barrel\nexport { Custom } from './Custom';\n";
+      const files: Record<string, string> = {
+        "components/Header.tsx": "export default function Header() {}",
+        "components/index.ts": customBarrel,
+      };
+
+      const result = synthesizeComponentsBarrel(files);
+      assert.equal(result["components/index.ts"], customBarrel);
+    });
+
+    it("returns unchanged files if no components/ files exist", () => {
+      const files: Record<string, string> = {
+        "app/page.tsx": "export default function Page() {}",
+      };
+
+      const result = synthesizeComponentsBarrel(files);
+      assert.equal(result["components/index.ts"], undefined);
+    });
+
+    it("QA inspector validates and passes when app/page.tsx imports from @/components with synthesized barrel", async () => {
+      const baseFiles = getBaseProjectFiles({ projectName: "barrel-app", requiresDatabase: false });
+      const projectFiles: Record<string, string> = {
+        ...baseFiles,
+        "components/Header.tsx": "export function Header() { return <header>Header</header>; }",
+        "components/Footer.tsx": "export function Footer() { return <footer>Footer</footer>; }",
+        "app/page.tsx": `
+"use client";
+import React from "react";
+import { Header, Footer } from "@/components";
+
+export default function Page() {
+  return (
+    <main>
+      <Header />
+      <p>Content</p>
+      <Footer />
+    </main>
+  );
+}
+`,
+      };
+
+      const report = await runQAInspector({
+        files: projectFiles,
+        summary: "Implemented page using @/components barrel import.",
+        sandboxId: "",
+        runSandboxCommands: false,
+      });
+
+      assert.equal(report.passed, true);
+      assert.equal(report.score, 100);
+      assert.equal(report.repairNeeded, false);
+
+      const importCheck = report.checks.find((c) => c.name === "import-integrity");
+      assert.ok(importCheck);
+      assert.equal(importCheck.status, "PASS");
+    });
+
+    it("QA inspector flags dangling @/ import when target module does not exist", async () => {
+      const baseFiles = getBaseProjectFiles({ projectName: "dangling-app", requiresDatabase: false });
+      const projectFiles: Record<string, string> = {
+        ...baseFiles,
+        "app/page.tsx": `
+"use client";
+import { NonExistent } from "@/components/NonExistent";
+
+export default function Page() {
+  return <main><NonExistent /></main>;
+}
+`,
+      };
+
+      const report = await runQAInspector({
+        files: projectFiles,
+        summary: "Implemented page with dangling import.",
+        sandboxId: "",
+        runSandboxCommands: false,
+      });
+
+      assert.equal(report.passed, false);
+      const importCheck = report.checks.find((c) => c.name === "import-integrity");
+      assert.ok(importCheck);
+      assert.equal(importCheck.status, "FAIL");
+      assert.match(importCheck.details || "", /@\/components\/NonExistent/);
+    });
+  });
 });
+

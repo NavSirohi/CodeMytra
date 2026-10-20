@@ -10,6 +10,7 @@ import fs from "fs";
 import crypto from "crypto";
 import { Sandbox } from "@e2b/code-interpreter";
 import { PROJECT_WORKSPACE_DIR } from "@/server/orchestration/workspace";
+import { synthesizeComponentsBarrel } from "@/server/templates/foundation";
 
 export interface QACommandExecutor {
   run(command: string, options?: { timeoutMs?: number }): Promise<{ exitCode: number; stdout: string; stderr: string }>;
@@ -843,7 +844,9 @@ export interface ValidateProjectOptions {
  * sandbox connection, TypeScript compilation, and production build verification.
  */
 export async function runQAInspector(options: ValidateProjectOptions): Promise<QAReport> {
-  const { files, summary, sandboxId, runSandboxCommands, archSpec, capabilities } = options;
+  const rawFiles = options.files || {};
+  const files = synthesizeComponentsBarrel(rawFiles);
+  const { summary, sandboxId, runSandboxCommands, archSpec, capabilities } = options;
   const checks: QAReport["checks"] = [];
   const errors: string[] = [];
 
@@ -927,6 +930,22 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
     if (!exists) {
       missingImports++;
       missingImportList.push(importPath);
+    }
+  }
+
+  // Check aliased @/ imports in pageContent
+  const aliasedMatches = pageContent.matchAll(/from\s+["'](@\/[^"']+)["']/g);
+  const candidateAliasExtensions = ["", ".tsx", ".ts", ".jsx", ".js", ".json", ".mjs", "/index.tsx", "/index.ts"];
+  for (const match of aliasedMatches) {
+    const aliasPath = match[1];
+    if (aliasPath === "@/lib/utils" || aliasPath === "@/lib/db") {
+      continue;
+    }
+    const relFromRoot = aliasPath.slice(2);
+    const exists = candidateAliasExtensions.some((ext) => files[relFromRoot + ext] !== undefined);
+    if (!exists) {
+      missingImports++;
+      missingImportList.push(aliasPath);
     }
   }
 

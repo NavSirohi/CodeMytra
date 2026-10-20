@@ -1,3 +1,4 @@
+import path from "path";
 import { ApplicationCapability } from "@/server/agent-contracts/schemas";
 
 /**
@@ -407,4 +408,69 @@ if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = db;
   }
 
   return baseFiles;
+}
+
+/**
+ * Automatically synthesizes a components/index.ts barrel file if components exist
+ * and no barrel file is already present. This ensures that imports like
+ * `import { Header, Footer } from "@/components"` resolve cleanly without failing
+ * TypeScript typechecking or Next.js production builds.
+ */
+export function synthesizeComponentsBarrel(files: Record<string, string>): Record<string, string> {
+  // If components/index.ts or components/index.tsx already exists, preserve it
+  if (files["components/index.ts"] || files["components/index.tsx"]) {
+    return files;
+  }
+
+  // Find all component files in components/ (not index, test files, or non-ts/tsx)
+  const componentPaths = Object.keys(files).filter((p) => {
+    return (
+      p.startsWith("components/") &&
+      (p.endsWith(".tsx") || p.endsWith(".ts")) &&
+      !p.endsWith("/index.ts") &&
+      !p.endsWith("/index.tsx") &&
+      !p.endsWith(".test.tsx") &&
+      !p.endsWith(".test.ts")
+    );
+  });
+
+  if (componentPaths.length === 0) {
+    return files;
+  }
+
+  const exportStatements: string[] = [
+    "// Auto-generated CodeMytra component barrel export",
+  ];
+
+  for (const compPath of componentPaths) {
+    // Relative path from components/ to the file without extension
+    const relFromComponents = compPath.slice("components/".length);
+    const withoutExt = relFromComponents.replace(/\.(tsx|ts)$/, "");
+    const importTarget = `./${withoutExt}`;
+    const componentName = path.basename(withoutExt);
+    const content = files[compPath] || "";
+
+    const hasDefaultExport = /export\s+default\s+/m.test(content);
+    const hasNamedExport =
+      /export\s+(async\s+)?(function|const|let|var|class|interface|type)\s+/m.test(content) ||
+      /export\s+\{/m.test(content);
+
+    // Re-export named exports if any exist
+    if (hasNamedExport) {
+      exportStatements.push(`export * from "${importTarget}";`);
+    }
+
+    // If there is a default export, re-export it under the component filename
+    // e.g. export { default as Header } from "./Header";
+    if (hasDefaultExport && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(componentName)) {
+      exportStatements.push(`export { default as ${componentName} } from "${importTarget}";`);
+    } else if (!hasNamedExport) {
+      exportStatements.push(`export * from "${importTarget}";`);
+    }
+  }
+
+  return {
+    ...files,
+    "components/index.ts": exportStatements.join("\n") + "\n",
+  };
 }

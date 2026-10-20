@@ -40,8 +40,13 @@ import {
   resolveWorkspacePath,
   PROJECT_WORKSPACE_DIR,
   ensureSandboxPreviewServer,
+  writeWorkspaceFiles,
 } from "@/server/orchestration/workspace";
-import { getBaseProjectFiles, MissingDatabaseModelsError } from "@/server/templates/foundation";
+import {
+  getBaseProjectFiles,
+  MissingDatabaseModelsError,
+  synthesizeComponentsBarrel,
+} from "@/server/templates/foundation";
 import {
   recordStageMetric,
   aggregateAndPersistRunMetrics,
@@ -705,6 +710,22 @@ export const codeAgentFunction = inngest.createFunction(
       return { active: true };
     });
 
+    await step.run("ensure-components-barrel", async () => {
+      const filesWithBarrel = synthesizeComponentsBarrel(files || {});
+      if (filesWithBarrel["components/index.ts"] && !files?.["components/index.ts"]) {
+        try {
+          const sandbox = await Sandbox.connect(sandboxId);
+          await writeWorkspaceFiles(sandbox, {
+            "components/index.ts": filesWithBarrel["components/index.ts"],
+          });
+          files["components/index.ts"] = filesWithBarrel["components/index.ts"];
+        } catch (err) {
+          console.warn("[ensure-components-barrel] Non-fatal barrel sync warning:", err);
+        }
+      }
+      return { barrelEnsured: true };
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     // DRAFT PERSISTENCE: CAPTURE AND PERSIST INITIAL DRAFT BEFORE QA
     // Architectural Note: Source code must never be lost if QA times out or fails.
@@ -965,6 +986,19 @@ CRITICAL REPAIR DIRECTIVES:
           });
           currentFiles = repairResult.files;
           currentSummary = repairResult.summary;
+
+          const repairWithBarrel = synthesizeComponentsBarrel(currentFiles || {});
+          if (repairWithBarrel["components/index.ts"] && !currentFiles?.["components/index.ts"]) {
+            try {
+              const sandbox = await Sandbox.connect(sandboxId);
+              await writeWorkspaceFiles(sandbox, {
+                "components/index.ts": repairWithBarrel["components/index.ts"],
+              });
+              currentFiles["components/index.ts"] = repairWithBarrel["components/index.ts"];
+            } catch {
+              // Non-fatal
+            }
+          }
 
           // Capture actual sandbox files after repair modifications and update persisted draft
           let repairFiles = currentFiles;

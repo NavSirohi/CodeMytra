@@ -536,6 +536,13 @@ Do NOT attempt to write or overwrite:
 2. NO EXPLORATORY ACTIONS: Do NOT call "readFiles" or "terminal" for preliminary reconnaissance. The foundation files (package.json, layout.tsx, Tailwind CSS, Lucide icons, lib/utils.ts) are already established in the workspace (${PROJECT_WORKSPACE_DIR}).
 3. NO MANUAL BUILD/TEST LOOPS: Do NOT execute "bun build", "next build", or "npm test" in the terminal. An isolated, automated QA pipeline verifies the build after you conclude.
 4. IMMEDIATE COMPLETION: As soon as you write your files, conclude your response with a concise summary enclosed in <task_summary>...</task_summary> and finish.
+4b. NO BARREL IMPORTS: There is NO "components/index.ts" barrel file. NEVER write:
+   - import { Header, Footer } from "@/components"       ← FORBIDDEN (no barrel exists)
+   - import { Nav } from "@/components/index"            ← FORBIDDEN
+   ALWAYS import directly from the specific component file where it is defined:
+   - import Header from "@/components/Header"            ← CORRECT
+   - import { Footer } from "@/components/Footer"        ← CORRECT
+   If you create "components/Header.tsx", import it as "@/components/Header" (not "@/components").
 
 5. IF requiresDb IS TRUE (Full-Stack Application):
    - ACCESS DATABASE VIA: import { db } from "@/lib/db";
