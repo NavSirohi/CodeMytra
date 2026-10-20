@@ -1,8 +1,8 @@
 # CodeMytra — Performance, Observability & Interview Demonstrations
 
-**Document Version:** 1.1.0  
+**Document Version:** 1.2.0  
 **Scope:** Generic Full-Stack AI Application Generation, Lifecycle Observability, Cost & Performance Controls  
-**Target Architecture:** Next.js 16 (App Router), Prisma 7 (SQLite local adapter), Inngest Multi-Agent Workflow, E2B Secure Sandboxes
+**Target Architecture:** Next.js 16 (App Router), Neon PostgreSQL (Prisma 7 with @prisma/adapter-pg), Inngest Multi-Agent Workflow, E2B Secure Sandboxes
 
 ---
 
@@ -84,6 +84,19 @@ Follow-up requests that only modify surface-level styling or component layout do
   3. **Operation Bounding**: Subprocess commands inside the sandbox are bounded via `boundOperationTimeout()`, preventing any task from requesting more time than remaining before the deadline, and aborting if below a 5-second minimum execution floor.
   4. **Preservation of Assets**: When a timeout occurs, `finalizeGenerationFailure` transitions the run to `FAILED` with `errorCode: "GENERATION_TIMEOUT"` and strictly preserves prior working project revisions.
 
+### 3.5 Planner & AgentKit SDK Isolation Architecture
+- **Inngest Ambient Context Detection**: Inngest functions manage execution context via Node.js `AsyncLocalStorage` stored in `globalThis[Symbol.for("inngest:als")]`. When `@inngest/agent-kit` agents run inside an Inngest function, AgentKit’s internal `getStepTools()` detects this ambient context and automatically delegates inference to `step.ai.infer()`.
+- **The Problem**: When specialized single-turn agents (Planner, Designer, Architect) execute inside an outer `step.run()` callback (e.g. `step.run("planner-spec", ...)`), this automatic delegation produces an illegal nested step (`NESTING_STEPS`), duplicate step identifiers, and infinite replay loops.
+- **Isolation Solution (`runWithoutStepContext`)**:
+  CodeMytra wraps single-turn agent calls with `runWithoutStepContext()`, which temporarily unbinds the Inngest ALS store (`als.run(undefined, fn)`).
+- **Internal SDK Compatibility Assumption**:
+  1. AgentKit evaluates `await getStepTools()`.
+  2. When the ALS store is unbound, `getStepTools()` returns `undefined`.
+  3. When `step` is `undefined`, AgentKit takes its native direct provider branch: it executes a direct HTTPS/REST request to the provider model (e.g. Google Gemini API) rather than delegating to `step.ai.infer()`.
+  4. The outer Inngest step (`step.run("planner-spec")`) preserves its durable step identity, cleanly memoizes the returned specification into Inngest's execution ledger, and guarantees deterministic replay safety and idempotency.
+- **Supported Alternative**:
+  If a future minor update of Inngest or AgentKit alters this ambient ALS symbol lookup, CodeMytra supports replacing `@inngest/agent-kit` single-turn calls with direct Google Gemini SDK invocations (`getGeminiModel().generateContent()` or native HTTPS `fetch()`). Direct provider invocation operates completely outside Inngest's internal `AsyncLocalStorage` symbol, providing an architectural alternative with zero ambient context dependencies.
+
 ---
 
 ## 4. Three Interview-Ready Demonstrations
@@ -122,22 +135,22 @@ Follow-up requests that only modify surface-level styling or component layout do
 ### Demo 2: Working Database-Backed Full-Stack Application
 *Prompt:* `"Create an internal IT Asset & Hardware Inventory Tracker with asset tags, serial numbers, assignment status (Available, Assigned, Maintenance), employee assignee, and check-in/check-out history."*
 
-- **Type**: Generic Full-Stack Application (Next.js 16 + Prisma 7 SQLite)
+- **Type**: Generic Full-Stack Application (Next.js 16 + Generated Relational Database in Sandbox)
 - **Stage Progression**:
   1. `planning` (Identifies relational schema requirements and user workflows)
   2. `design` (Tabular layout, status badge tokens, action drawers)
-  3. `architecture` (Data model: `Asset`, `Employee`, `AuditLog`; Prisma SQLite schema; Next.js Server Actions)
+  3. `architecture` (Data model: `Asset`, `Employee`, `AuditLog`; relational schema; Next.js Server Actions)
   4. `sandbox-init` (E2B sandbox provisioning & workspace setup)
   5. `coding` (Generates Prisma schema, migration setup, server actions, and UI)
-  6. `qa-and-repair` (Sandbox validation: disposable SQLite database creation, schema push, real CRUD verification)
-  7. `save-result` (Snapshot Revision V1)
+  6. `qa-and-repair` (Sandbox validation: disposable sandbox database creation, schema push, real CRUD verification)
+  7. `save-result` (Snapshot Revision V1 persisted to CodeMytra Neon PostgreSQL)
 - **Illustrative Benchmark Metrics**:
   - **Total Duration**: ~54.2 seconds (illustrative)
   - **Tokens**: ~22,600 prompt tokens, ~6,800 completion tokens (illustrative)
   - **Model Mix**: `gemini-2.5-flash` for planning/UI, `gemini-2.5-pro` for relational architecture
   - **Estimated Cost**: ~$0.0128 USD (indicative estimate)
   - **Sandbox Setup Time**: ~2.1 seconds (illustrative)
-  - **QA Result**: Passed (`database-connectivity` verified, `model-crud-verification` verified on disposable SQLite instance)
+  - **QA Result**: Passed (`database-connectivity` verified, `model-crud-verification` verified on disposable sandbox instance)
 - **Key Artifacts Created**:
   - `prisma/schema.prisma` (relational models with foreign keys)
   - `src/app/actions/assets.ts` (type-safe database queries via Prisma client)
@@ -157,7 +170,7 @@ Follow-up requests that only modify surface-level styling or component layout do
   2. `filterRelevantFiles()` isolates target files (`src/app/page.tsx`, `src/components/AssetTable.tsx`), filtering out Prisma migrations and server configs from context.
   3. `coder` receives previous specs + focused file context and applies targeted diff.
   4. `qa-and-repair` executes mandatory sandbox build verification and database connectivity check.
-  5. `save-result` commits atomic `ProjectRevision` V2.
+  5. `save-result` commits atomic `ProjectRevision` V2 to Neon PostgreSQL.
 - **Illustrative Benchmark Metrics**:
   - **Total Duration**: ~16.8 seconds (illustrative, ~69% latency reduction vs greenfield)
   - **Tokens**: ~5,200 prompt tokens, ~1,400 completion tokens (illustrative, ~76% token reduction)
@@ -170,6 +183,9 @@ Follow-up requests that only modify surface-level styling or component layout do
 ## 5. Known Limitations & Explicit Boundaries
 
 1. **Deployment Excluded**: CodeMytra does not deploy customer applications to external clouds (e.g. Vercel, AWS, Fly.io). Users export standard, standalone ZIP archives with bundled `package.json`, `.env.example`, and migration scripts to run anywhere.
-2. **Database Architecture**: Full-stack applications use portable SQLite driver adapters compatible with Next.js and Prisma 7 for instant local and sandbox execution. Migration to remote multi-tenant PostgreSQL (e.g. Supabase, Neon) can be achieved by changing the Prisma datasource provider.
+2. **Database Architecture & Persistence Separation**:
+   - **CodeMytra Platform Persistence**: The core CodeMytra platform is strictly configured with **Neon PostgreSQL** as its primary persistence backend, driven by Prisma 7 and the `@prisma/adapter-pg` driver adapter. PostgreSQL concurrency controls—including `FOR UPDATE SKIP LOCKED`, atomic row-level locks, transactional outbox leases with fencing tokens, and atomic Compare-And-Swap (CAS) revision promotions—govern all platform operations.
+   - **Isolated Test Adapters**: Dedicated automated unit tests execute with mock engines or isolated adapters (e.g. `@prisma/adapter-better-sqlite3`) to enable rapid offline test verification without requiring a live remote PostgreSQL network connection.
+   - **Generated Applications**: Generated full-stack customer projects inside E2B sandboxes default to lightweight portable databases (e.g. SQLite via driver adapter) for instant containerized execution and standalone ZIP export, but can be switched to remote PostgreSQL by updating their generated Prisma configuration.
 3. **Sandbox Offline Restrictions**: In strictly isolated or offline CI/CD runner environments, outbound package downloads to public registries (`npmjs.org`) may be restricted. CodeMytra accounts for this by verifying build readiness against bundled dependencies and isolating test executions.
 4. **Scope of Application Support & External Integrations**: While CodeMytra supports generic multi-tier full-stack architectures, it does not guarantee that every conceivable third-party integration (e.g. proprietary payment gateways without test credentials, external enterprise OAuth providers requiring manual app registrations, physical hardware drivers, or specialized proprietary cloud APIs) can be automatically completed without external API credentials or specialized environments.

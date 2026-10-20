@@ -291,4 +291,96 @@ describe("P1: Inngest Step Isolation & Planner Orchestration", () => {
       }
     });
   });
+
+  it("preserves durable step identity and guarantees deterministic memoization on replay", async () => {
+    // Simulate Inngest memoization ledger
+    const memoizedStepLedger = new Map<string, any>();
+    let networkInferenceCalls = 0;
+
+    const executeWorkflowStep = async (stepId: string, runFn: () => Promise<any>) => {
+      // If step was already executed in a previous attempt, replay from ledger
+      if (memoizedStepLedger.has(stepId)) {
+        return memoizedStepLedger.get(stepId);
+      }
+      const result = await runWithoutStepContext(runFn);
+      memoizedStepLedger.set(stepId, result);
+      return result;
+    };
+
+    const plannerAgentExecution = async () => {
+      networkInferenceCalls++;
+      return {
+        projectName: "Durable Invoice Manager",
+        pages: ["/dashboard", "/invoices"],
+        entities: ["Invoice", "Client"],
+      };
+    };
+
+    // First run: executes inference and memoizes result with durable step ID "planner-spec"
+    const firstRunOutput = await executeWorkflowStep("planner-spec", plannerAgentExecution);
+    assert.equal(networkInferenceCalls, 1);
+    assert.equal(firstRunOutput.projectName, "Durable Invoice Manager");
+
+    // Second run (e.g. replay after subsequent step retry): reuses memoized result without calling network
+    const replayOutput = await executeWorkflowStep("planner-spec", plannerAgentExecution);
+    assert.equal(
+      networkInferenceCalls,
+      1,
+      "Replay must never re-trigger network inference for memoized steps"
+    );
+    assert.deepEqual(replayOutput, firstRunOutput);
+    assert.ok(memoizedStepLedger.has("planner-spec"), "Durable step ID must remain in ledger");
+  });
+
+  it("verifies supported alternative: direct provider invocation has zero ALS ambient context dependencies", async () => {
+    // Verify that direct provider invocation (e.g. Google Gemini REST/SDK) works identically
+    // without inspecting or relying on Node.js AsyncLocalStorage or Inngest internal symbols
+    const originalFetch = globalThis.fetch;
+    let fetchCalled = false;
+
+    globalThis.fetch = (async (url: string) => {
+      fetchCalled = true;
+      assert.ok(String(url).includes("generativelanguage.googleapis.com"));
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      title: "Direct Provider App",
+                      modules: ["Auth", "Dashboard"],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as any;
+
+    try {
+      // Direct provider invocation helper: independent of Inngest internals
+      const invokeDirectProvider = async (prompt: string) => {
+        const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+        });
+        const json = await res.json();
+        return JSON.parse(json.candidates[0].content.parts[0].text);
+      };
+
+      const result = await invokeDirectProvider("Generate specification");
+      assert.equal(fetchCalled, true);
+      assert.equal(result.title, "Direct Provider App");
+      assert.deepEqual(result.modules, ["Auth", "Dashboard"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

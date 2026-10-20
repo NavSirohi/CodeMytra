@@ -1,6 +1,8 @@
 import { prisma } from "@/lib/db";
 import { inngest } from "@/features/inngest/client";
-import { OutboxStatus, OutboxEvent } from "@/generated/prisma/client";
+import { OutboxStatus, OutboxEvent, GenerationRunStatus } from "@/generated/prisma/client";
+import { finalizeGenerationFailure } from "./finalization";
+import { GENERATION_LIMITS } from "./stage-optimizer";
 
 export interface GenerationEventPayload {
   runId: string;
@@ -144,6 +146,32 @@ WHERE id = $1 AND status = 'PROCESSING' AND ($4::text IS NULL OR "claimToken" = 
       claimToken
     );
 
+    // Terminal Outbox Exhaustion: Reconcile with GenerationRun so customer generation never
+    // remains indefinitely in a QUEUED or RUNNING state.
+    if (isExhausted) {
+      try {
+        const payload = (
+          typeof event.payload === "string"
+            ? JSON.parse(event.payload)
+            : event.payload
+        ) as GenerationEventPayload;
+
+        if (payload?.runId && payload?.projectId) {
+          await finalizeGenerationFailure({
+            projectId: payload.projectId,
+            generationRunId: payload.runId,
+            errorCode: "OUTBOX_DELIVERY_EXHAUSTED",
+            errorMessage: `Outbox event delivery failed permanently after ${MAX_OUTBOX_ATTEMPTS} attempts: ${errorMessage}`,
+          });
+        }
+      } catch (reconcileErr) {
+        console.error(
+          `[Outbox] Failed to reconcile exhausted GenerationRun for event ${event.id}:`,
+          reconcileErr
+        );
+      }
+    }
+
     console.error(`[Outbox] Dispatch failed for event ${event.id}:`, errorMessage);
     return { success: false, error: errorMessage };
   }
@@ -178,9 +206,72 @@ export async function dispatchOutboxEvent(eventId: string) {
   return { dispatched: result.success, error: result.error };
 }
 
+const ACTIVE_GENERATION_STATUSES: GenerationRunStatus[] = [
+  GenerationRunStatus.QUEUED,
+  GenerationRunStatus.PLANNING,
+  GenerationRunStatus.AWAITING_APPROVAL,
+  GenerationRunStatus.DESIGNING,
+  GenerationRunStatus.ARCHITECTING,
+  GenerationRunStatus.RUNNING,
+  GenerationRunStatus.VALIDATING,
+];
+
+/**
+ * Reconciles abandoned active generation runs that exceeded the maximum duration budget + grace period.
+ * This ensures runs stranded due to network partitions, host restarts, or Inngest SDK disconnects
+ * never remain permanently in an active state.
+ */
+export async function reconcileStaleGenerationRuns(
+  gracePeriodMs: number = 60 * 1000,
+  limit: number = 50
+): Promise<{ reconciled: number }> {
+  const timeoutThreshold = new Date(
+    Date.now() - (GENERATION_LIMITS.maxGenerationDurationMs + gracePeriodMs)
+  );
+
+  try {
+    const staleRuns = await prisma.generationRun.findMany({
+      where: {
+        status: { in: ACTIVE_GENERATION_STATUSES },
+        createdAt: { lt: timeoutThreshold },
+      },
+      take: limit,
+      select: {
+        id: true,
+        projectId: true,
+      },
+    });
+
+    let reconciled = 0;
+    for (const run of staleRuns) {
+      try {
+        await finalizeGenerationFailure({
+          projectId: run.projectId,
+          generationRunId: run.id,
+          errorCode: "WORKFLOW_TIMED_OUT",
+          errorMessage:
+            "Generation exceeded maximum duration budget and was reconciled as timed out.",
+        });
+        reconciled++;
+      } catch (err) {
+        console.error(
+          `[Outbox] Failed to reconcile stale GenerationRun ${run.id}:`,
+          err
+        );
+      }
+    }
+
+    return { reconciled };
+  } catch (error) {
+    console.error("[Outbox] Error finding stale generation runs:", error instanceof Error ? error.message : String(error));
+    return { reconciled: 0 };
+  }
+}
+
 /**
  * Scheduled recovery worker: Atomically claims a batch of ready/abandoned events
  * and executes dispatch with exponential backoff and fencing tokens.
+ * Failure of one event does NOT block processing of other eligible events.
  */
 export async function recoverStaleOutboxEvents(
   leaseDurationMs: number = OUTBOX_LEASE_DURATION_MS,
@@ -195,13 +286,22 @@ export async function recoverStaleOutboxEvents(
   let failed = 0;
 
   for (const event of claimedEvents) {
-    const result = await executeClaimedEvent(event);
-    if (result.success) {
-      recovered++;
-    } else {
+    try {
+      const result = await executeClaimedEvent(event);
+      if (result.success) {
+        recovered++;
+      } else {
+        failed++;
+      }
+    } catch (unhandledErr) {
+      console.error(
+        `[Outbox] Unhandled error while executing event ${event.id}:`,
+        unhandledErr
+      );
       failed++;
     }
   }
 
   return { total: claimedEvents.length, recovered, failed };
 }
+

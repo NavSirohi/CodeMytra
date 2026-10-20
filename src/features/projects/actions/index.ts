@@ -6,6 +6,8 @@ import { generateSlug } from "random-word-slugs";
 import { prisma } from "@/lib/db";
 import { dispatchOutboxEvent } from "@/server/orchestration/outbox";
 import { restoreHistoricalRevision } from "@/server/orchestration/revisions";
+import { finalizeGenerationFailure } from "@/server/orchestration/finalization";
+import { GENERATION_LIMITS } from "@/server/orchestration/stage-optimizer";
 import {
   ModelPreference,
   isValidModelPreference,
@@ -351,7 +353,7 @@ export const getActiveGenerationRun = async (projectId: string) => {
     return null;
   }
 
-  return prisma.generationRun.findFirst({
+  const run = await prisma.generationRun.findFirst({
     where: {
       projectId,
       userId: user.id,
@@ -365,6 +367,55 @@ export const getActiveGenerationRun = async (projectId: string) => {
       },
     },
   });
+
+  if (!run) {
+    return null;
+  }
+
+  // Active status set
+  const activeStatuses: GenerationRunStatus[] = [
+    GenerationRunStatus.QUEUED,
+    GenerationRunStatus.PLANNING,
+    GenerationRunStatus.AWAITING_APPROVAL,
+    GenerationRunStatus.DESIGNING,
+    GenerationRunStatus.ARCHITECTING,
+    GenerationRunStatus.RUNNING,
+    GenerationRunStatus.VALIDATING,
+  ];
+
+  // If a run is in an active status but has exceeded the maximum duration budget + grace period,
+  // it has been abandoned by an unrecoverable failure (e.g., worker crash, network partition).
+  // Automatically reconcile the run to FAILED so no project remains permanently RUNNING.
+  const STALE_RUN_GRACE_PERIOD_MS = 60 * 1000;
+  const isStale =
+    activeStatuses.includes(run.status) &&
+    Date.now() - run.createdAt.getTime() >
+      GENERATION_LIMITS.maxGenerationDurationMs + STALE_RUN_GRACE_PERIOD_MS;
+
+  if (isStale) {
+    try {
+      await finalizeGenerationFailure({
+        projectId,
+        generationRunId: run.id,
+        errorCode: "WORKFLOW_TIMED_OUT",
+        errorMessage:
+          "Generation exceeded maximum duration and was reconciled to failed. Prior working revisions preserved.",
+      });
+
+      return await prisma.generationRun.findUnique({
+        where: { id: run.id },
+        include: {
+          events: {
+            orderBy: { createdAt: "asc" },
+          },
+        },
+      });
+    } catch (reconcileErr) {
+      console.error("[getActiveGenerationRun] Failed to reconcile stale run:", reconcileErr);
+    }
+  }
+
+  return run;
 };
 
 /**

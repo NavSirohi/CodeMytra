@@ -193,8 +193,16 @@ export const codeAgentFunction = inngest.createFunction(
           errorMessage: safeErrorMessage,
         });
 
-        // Keep incomplete-run metrics available when generation fails
-        await aggregateAndPersistRunMetrics(runId, projectId, "FAILED");
+        // Keep incomplete-run metrics available when generation fails.
+        // Metrics persistence failure must NEVER undo or obscure successful failure finalization.
+        try {
+          await aggregateAndPersistRunMetrics(runId, projectId, "FAILED");
+        } catch (metricsErr) {
+          console.error(
+            "[Generation] Metrics persistence failed on failure finalization (non-blocking):",
+            metricsErr instanceof Error ? metricsErr.message : String(metricsErr)
+          );
+        }
       } catch (err) {
         console.error(
           "[Generation] Failure finalization failed:",
