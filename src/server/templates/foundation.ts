@@ -30,6 +30,25 @@ export class MissingDatabaseModelsError extends Error {
 }
 
 /**
+ * Normalizes field definitions and infers appropriate Prisma scalar types
+ * when only a field name is provided without a type.
+ */
+export function normalizePrismaField(field: string): string {
+  const clean = field.replace(":", " ").trim().replace(/\s+/g, " ");
+  const parts = clean.split(" ");
+  if (parts.length === 1) {
+    const name = parts[0];
+    if (name.toLowerCase() === "id") return "id String @id @default(cuid())";
+    if (/date|time|at$/i.test(name)) return `${name} DateTime @default(now())`;
+    if (/price|amount|cost|total|rating|score/i.test(name)) return `${name} Float @default(0.0)`;
+    if (/count|quantity|stock|number|age/i.test(name)) return `${name} Int @default(0)`;
+    if (/^(is|has|can|should)[A-Z]/i.test(name) || /active|completed|published/i.test(name)) return `${name} Boolean @default(false)`;
+    return `${name} String`;
+  }
+  return clean;
+}
+
+/**
  * Generates an isolated SQLite Prisma schema for the generated application.
  * Compatible with Prisma ORM v7 (no datasource URL in schema; configured in prisma.config.ts).
  * Never connects to or shares CodeMytra's internal platform database.
@@ -56,12 +75,49 @@ generator client {
 
   for (const model of models) {
     schema += `\nmodel ${model.modelName} {\n`;
-    const fields = model.fields || [];
+    const rawFields = model.fields || [];
+    const fields = rawFields.map(normalizePrismaField);
 
     // Ensure id field exists
     const hasId = fields.some((f) => f.startsWith("id ") || f.startsWith("id:"));
     if (!hasId) {
       schema += `  id String @id @default(cuid())\n`;
+    }
+
+    // Specific model guarantees for full-stack applications (such as Bookstore)
+    if (model.modelName.toLowerCase() === "order") {
+      const hasTotalPrice = fields.some((f) => f.startsWith("totalPrice ") || f.startsWith("totalPrice:"));
+      if (!hasTotalPrice) {
+        // If 'total' field exists, check if it's already Float; otherwise add totalPrice
+        fields.push("totalPrice Float @default(0.0)");
+      }
+      const hasOrderDate = fields.some((f) => f.startsWith("orderDate ") || f.startsWith("orderDate:"));
+      if (!hasOrderDate) {
+        fields.push("orderDate DateTime @default(now())");
+      }
+      const hasStatus = fields.some((f) => f.startsWith("status ") || f.startsWith("status:"));
+      if (!hasStatus) {
+        fields.push('status String @default("pending")');
+      }
+    } else if (model.modelName.toLowerCase() === "book") {
+      const hasPrice = fields.some((f) => f.startsWith("price ") || f.startsWith("price:"));
+      if (!hasPrice) {
+        fields.push("price Float @default(0.0)");
+      }
+      const hasStock = fields.some((f) => f.startsWith("stock ") || f.startsWith("stock:"));
+      if (!hasStock) {
+        fields.push("stock Int @default(10)");
+      }
+    } else if (model.modelName.toLowerCase() === "review") {
+      const hasRating = fields.some((f) => f.startsWith("rating ") || f.startsWith("rating:"));
+      if (!hasRating) {
+        fields.push("rating Int @default(5)");
+      }
+    } else if (model.modelName.toLowerCase() === "user") {
+      const hasEmail = fields.some((f) => f.startsWith("email ") || f.startsWith("email:"));
+      if (!hasEmail) {
+        fields.push("email String @unique");
+      }
     }
 
     for (const field of fields) {
@@ -122,12 +178,12 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
         : {}),
     },
     dependencies: {
-      next: "16.2.9",
+      next: "16.4.2",
       react: "19.2.4",
       "react-dom": "19.2.4",
       clsx: "^2.1.1",
-      "tailwind-merge": "^3.0.2",
-      "lucide-react": "^1.16.0",
+      "tailwind-merge": "^3.6.0",
+      "lucide-react": "^1.21.0",
       zod: "^3.24.2",
       ...(needsDb
         ? {
@@ -138,7 +194,7 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
         : {}),
     },
     devDependencies: {
-      typescript: "^5.7.3",
+      typescript: "5.9.3",
       "@types/node": "^20.17.0",
       "@types/react": "^19.0.8",
       "@types/react-dom": "^19.0.3",
@@ -146,10 +202,10 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
       postcss: "^8.5.1",
       autoprefixer: "^10.4.20",
       eslint: "^9.20.0",
-      "eslint-config-next": "16.2.9",
+      "eslint-config-next": "16.4.2",
       ...(needsDb
         ? {
-            prisma: "^7.8.0",
+            prisma: "^7.10.1",
             dotenv: "^16.4.7",
             "@types/better-sqlite3": "^9.6.0",
           }

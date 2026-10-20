@@ -64,6 +64,9 @@ export async function initializeSandboxWorkspace(sandbox: Sandbox): Promise<void
     if [ -f "${PROJECT_WORKSPACE_DIR}/next.config.mjs" ]; then
       rm -f "${PROJECT_WORKSPACE_DIR}/next.config.ts" "${PROJECT_WORKSPACE_DIR}/next.config.js"
     fi
+    if [ -f "${PROJECT_WORKSPACE_DIR}/prisma/schema.prisma" ]; then
+      cd "${PROJECT_WORKSPACE_DIR}" && (bunx --bun prisma generate || npx prisma generate) 2>/dev/null || true
+    fi
   `;
 
   const res = await sandbox.commands.run(initScript, { timeoutMs: 15000 });

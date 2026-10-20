@@ -586,6 +586,18 @@ export const codeAgentFunction = inngest.createFunction(
             throw new RestorationError(`Completeness check failed: File ${filePath} could not be read from workspace`);
           }
         }
+
+        // 4. Generate Prisma Client immediately if database schema was established
+        if (workspaceInitialFiles["prisma/schema.prisma"]) {
+          try {
+            await sandbox.commands.run(
+              `cd "${PROJECT_WORKSPACE_DIR}" && (bunx --bun prisma generate || npx prisma generate)`,
+              { timeoutMs: 20000 }
+            );
+          } catch (prismaGenErr) {
+            console.warn("[sandbox-init] Non-fatal prisma generate warning:", prismaGenErr);
+          }
+        }
       }
 
       await recordStageMetric({
@@ -922,9 +934,12 @@ export const codeAgentFunction = inngest.createFunction(
 Your previous code implementation failed quality and build verification checks:
 ${report.repairInstructions}
 
-Please inspect and fix the errors in the sandbox files using createOrUpdateFiles or terminal.
-Ensure all TypeScript and Next.js compiler errors are resolved.
-Conclude with an updated <task_summary>...</task_summary>.
+CRITICAL REPAIR DIRECTIVES:
+1. Targeted File Modifications: Modify ONLY the specific files reported with compiler errors. Do NOT rewrite unrelated code.
+2. Foundation Ownership Protection: Do NOT attempt to modify or overwrite foundation files (package.json, tsconfig.json, next.config.mjs, tailwind.config.ts, postcss.config.mjs, lib/db.ts, prisma/schema.prisma). They are deterministically owned and protected.
+3. Client Component Type Safety: If TypeScript failed due to 'useState([])' inferring 'never[]' (e.g. in app/profile/page.tsx or app/orders/page.tsx), explicitly supply the model interface generic, e.g. 'useState<Order[]>([])', and ensure all accessed properties ('id', 'totalPrice', 'orderDate', 'status') match the interface.
+4. Missing API Route Handlers: Ensure every API route exports standard HTTP methods (export async function GET/POST) and handles inputs/errors with proper HTTP status codes (200, 201, 400).
+5. Conclude your response with an updated <task_summary>...</task_summary>.
 `;
         try {
           const repairBaseFiles = filterRelevantFiles(currentFiles, repairPrompt);

@@ -129,6 +129,34 @@ export function isSensitiveFilePath(relPath: string): boolean {
   return SENSITIVE_FILE_PATTERNS.some((p) => p.test(base));
 }
 
+/**
+ * Authoritative set of foundation-owned files.
+ * The deterministic CodeMytra foundation owns package dependencies, tsconfig, Next config,
+ * Tailwind configuration, Prisma configuration, and database client setup.
+ * The AI coder and repair agent must never overwrite these files.
+ */
+export const PROTECTED_FOUNDATION_FILES = new Set([
+  "package.json",
+  "tsconfig.json",
+  "next.config.mjs",
+  "next.config.ts",
+  "next.config.js",
+  "tailwind.config.ts",
+  "tailwind.config.js",
+  "postcss.config.mjs",
+  "postcss.config.js",
+  "prisma/schema.prisma",
+  "prisma.config.ts",
+  "lib/db.ts",
+  "lib/utils.ts",
+  ".env.example",
+]);
+
+export function isProtectedFoundationFile(relPath: string): boolean {
+  const normalizedRel = path.normalize(relPath).replace(/^(\.\/|\/)/, "");
+  return PROTECTED_FOUNDATION_FILES.has(normalizedRel);
+}
+
 export interface BatchFileWriteTarget {
   path: string;
   content: string;
@@ -155,11 +183,27 @@ export interface BatchFileWriteResult {
 /**
  * Executes a batch file write against sandbox files with pre-validation,
  * pre-write state snapshotting, sequential writes, and automated rollback upon write failure.
+ * Automatically preserves and protects foundation-owned files from AI overwrites.
  */
 export async function executeBatchFileWrites(
   filesClient: SandboxFilesClient,
-  files: BatchFileWriteTarget[]
+  files: BatchFileWriteTarget[],
+  options?: { allowFoundationFiles?: boolean }
 ): Promise<BatchFileWriteResult> {
+  // Filter out protected foundation files to enforce single authoritative ownership
+  const eligibleFiles = options?.allowFoundationFiles
+    ? files
+    : files.filter((f) => !isProtectedFoundationFile(f.path));
+
+  if (eligibleFiles.length === 0) {
+    return {
+      success: true,
+      filesWritten: [],
+      count: 0,
+      updatedMap: {},
+    };
+  }
+
   // STEP 1: Pre-validation of incoming paths, duplicates, and file sizes
   const seenNormalizedPaths = new Set<string>();
   const validatedFiles: Array<{
@@ -168,7 +212,7 @@ export async function executeBatchFileWrites(
     content: string;
   }> = [];
 
-  for (const file of files) {
+  for (const file of eligibleFiles) {
     const normalizedRel = path.normalize(file.path).replace(/^(\.\/|\/)/, "");
     if (seenNormalizedPaths.has(normalizedRel)) {
       return {
@@ -365,6 +409,63 @@ export class CodingAgentError extends Error {
 }
 
 /**
+ * Generates TypeScript interface definitions from architecture database models
+ * to provide the AI coder with explicit, compiler-verified type contracts.
+ */
+export function formatModelInterfacesForPrompt(
+  models?: Array<{ modelName: string; fields: string[]; relations?: string[] }>
+): string {
+  if (!models || models.length === 0) return "";
+  return models
+    .map((m) => {
+      const rawFields = m.fields || [];
+      const lines: string[] = [];
+      const seenFields = new Set<string>();
+
+      for (const f of rawFields) {
+        const clean = f.replace(":", " ").trim().replace(/\s+/g, " ");
+        const parts = clean.split(" ");
+        const name = parts[0];
+        if (name === "id" || seenFields.has(name)) continue;
+        seenFields.add(name);
+
+        const type = parts[1] || "String";
+        let tsType = "string";
+        if (
+          /Int|Float|Decimal|Number/i.test(type) ||
+          /price|amount|cost|total|rating|score|count|quantity|stock/i.test(name)
+        ) {
+          tsType = "number";
+        } else if (/Boolean/i.test(type) || /^(is|has|can)[A-Z]/i.test(name)) {
+          tsType = "boolean";
+        } else if (/DateTime|Date/i.test(type) || /date|time|at$/i.test(name)) {
+          tsType = "Date | string";
+        }
+        const isOptional = type.includes("?") || name.endsWith("Id");
+        lines.push(`  ${name}${isOptional ? "?" : ""}: ${tsType};`);
+      }
+
+      // Guarantee essential business properties on common models
+      const lowerName = m.modelName.toLowerCase();
+      if (lowerName === "order") {
+        if (!seenFields.has("totalPrice")) lines.push("  totalPrice: number;");
+        if (!seenFields.has("orderDate")) lines.push("  orderDate: Date | string;");
+        if (!seenFields.has("status")) lines.push("  status: string;");
+      } else if (lowerName === "book") {
+        if (!seenFields.has("price")) lines.push("  price: number;");
+        if (!seenFields.has("stock")) lines.push("  stock: number;");
+      } else if (lowerName === "review") {
+        if (!seenFields.has("rating")) lines.push("  rating: number;");
+      } else if (lowerName === "user") {
+        if (!seenFields.has("email")) lines.push("  email: string;");
+      }
+
+      return `export interface ${m.modelName} {\n  id: string;\n${lines.join("\n")}\n  createdAt?: Date | string;\n  updatedAt?: Date | string;\n}`;
+    })
+    .join("\n\n");
+}
+
+/**
  * Builds the authoritative context prompt for the Implementation Agent,
  * embedding PRD, DesignSpec, ArchitectureSpec, and project rules.
  */
@@ -374,6 +475,7 @@ export function buildContextEnhancedPrompt(
   archSpec: ArchitectureSpec
 ): string {
   const requiresDb = archSpec.requiresDatabase;
+  const modelInterfaces = formatModelInterfacesForPrompt(archSpec.databaseModels);
 
   return `
 You are the Lead Full-Stack Code Implementation Agent for CodeMytra.
@@ -421,20 +523,59 @@ File Boundaries:
 - Backend: ${archSpec.fileOwnership?.backend?.length ? archSpec.fileOwnership.backend.join(", ") : "None required for static app"}
 - Database: ${requiresDb && archSpec.fileOwnership?.database ? archSpec.fileOwnership.database.join(", ") : "None required for static app"}
 
+=== FOUNDATION OWNERSHIP & INFRASTRUCTURE BOUNDARIES ===
+The deterministic CodeMytra Foundation authoritatively owns package dependencies, tsconfig, Next config, Tailwind configuration, and database client setup.
+Do NOT attempt to write or overwrite:
+- "package.json", "tsconfig.json", "next.config.mjs"
+- "tailwind.config.ts", "postcss.config.mjs"
+- "lib/utils.ts" (already exports the canonical 'cn' function)
+- "lib/db.ts", "prisma.config.ts", "prisma/schema.prisma" (already generated and configured)
+
 === CRITICAL EXECUTION DIRECTIVES: DIRECT, FAST DELIVERY ===
 1. IMMEDIATE BATCH WRITE: On your VERY FIRST action, call the "createOrUpdateFiles" tool to write ALL required components and pages (including "app/page.tsx", any sub-components, and styling updates) in a SINGLE complete batch.
-2. NO EXPLORATORY ACTIONS: Do NOT call "readFiles" or "terminal" for preliminary reconnaissance. The foundation files (package.json, layout.tsx, Tailwind CSS, Lucide icons) are already established in the workspace (${PROJECT_WORKSPACE_DIR}).
+2. NO EXPLORATORY ACTIONS: Do NOT call "readFiles" or "terminal" for preliminary reconnaissance. The foundation files (package.json, layout.tsx, Tailwind CSS, Lucide icons, lib/utils.ts) are already established in the workspace (${PROJECT_WORKSPACE_DIR}).
 3. NO MANUAL BUILD/TEST LOOPS: Do NOT execute "bun build", "next build", or "npm test" in the terminal. An isolated, automated QA pipeline verifies the build after you conclude.
 4. IMMEDIATE COMPLETION: As soon as you write your files, conclude your response with a concise summary enclosed in <task_summary>...</task_summary> and finish.
-5. If requiresDb is TRUE:
-   - Provide "prisma/schema.prisma" with provider = "sqlite" and url = "file:./dev.db".
-   - Provide "lib/db.ts" exporting an isolated SQLite PrismaClient instance.
-   - Implement route handlers in app/api/**/route.ts with server-side validation.
-   - Return appropriate HTTP status codes: 200/201 on success, 400 on validation errors, 404 on missing records, 409 on business conflicts.
-   - Provide initial realistic seed data so preview works immediately.
-6. If requiresDb is FALSE (static application / landing page):
-   - Keep the app lean and fast. Do NOT generate unnecessary prisma schema, broken sqlite config, or backend database files.
-   - Implement all rich interactive features (e.g. menus, product carts, interactive filters, contact forms) using React client state in "app/page.tsx" or modular components.
+
+5. IF requiresDb IS TRUE (Full-Stack Application):
+   - ACCESS DATABASE VIA: import { db } from "@/lib/db";
+   - EXPECTED MODEL TYPES (Use these TypeScript contracts across pages and API routes):
+${modelInterfaces}
+
+   - API ROUTE IMPLEMENTATION REQUIREMENTS (app/api/**/route.ts):
+     Every API route file must export standard Next.js App Router HTTP handlers:
+     export async function GET(request: Request) { ... }
+     export async function POST(request: Request) { ... }
+     - app/api/books/route.ts:
+       - GET: query db.book.findMany(), support query filtering, return NextResponse.json(books, { status: 200 })
+       - POST: validate body { title, author, price }, return 400 if invalid, create record, return 201
+     - app/api/reviews/route.ts:
+       - GET: query db.review.findMany(), filter by bookId if present, return 200
+       - POST: validate body { rating, comment, bookId }, return 400 if invalid, create record, return 201
+     - app/api/users/route.ts:
+       - GET: query db.user.findMany(), return 200
+       - POST: validate body { email, name }, return 400 if invalid, create record, return 201
+     - app/api/orders/route.ts:
+       - GET: query db.order.findMany({ orderBy: { createdAt: "desc" } }), return 200
+       - POST: validate body { totalPrice, items }, return 400 if invalid, create record with orderDate and status, return 201
+     - If database tables are initially empty, seed realistic default items in GET handlers before returning so frontend preview renders populated content immediately.
+
+   - CLIENT COMPONENT TYPE SAFETY RULES (e.g. app/profile/page.tsx, app/orders/page.tsx):
+     - When using useState in client components ("use client"), NEVER leave useState([]) untyped because TypeScript infers never[]!
+       ALWAYS explicitly provide the generic type parameter:
+       const [orders, setOrders] = useState<Order[]>([]);
+       const [books, setBooks] = useState<Book[]>([]);
+       const [reviews, setReviews] = useState<Review[]>([]);
+       const [user, setUser] = useState<User | null>(null);
+     - Ensure all property accesses match the model interface: order.id, order.totalPrice, order.orderDate, order.status.
+     - Handle dates safely: typeof order.orderDate === "string" ? new Date(order.orderDate).toLocaleDateString() : order.orderDate?.toLocaleDateString()
+
+6. IF requiresDb IS FALSE (Static Application / Landing Page / Fixture A):
+   - Keep the app lean, fast, and 100% self-contained.
+   - Do NOT generate any prisma schema, dev.db, sqlite configuration, or backend database files.
+   - Implement rich interactive features (menus, shopping cart simulation, filters, search, contact/newsletter forms, booking inquiries) using React client state in "app/page.tsx" or modular components.
+   - Put "use client"; on line 1 of interactive components.
+
 7. Put the primary landing content and user interface in app/page.tsx. ALWAYS put "use client"; on line 1 of any interactive component or page using useState, useEffect, onClick, or browser events.
 8. Use standard, verified Lucide React icons (e.g., ShoppingBag, Coffee, Clock, MapPin, Phone, Mail, Star, Check, ChevronRight, Menu, X, Search, Heart, ArrowRight, User, Settings, Info, AlertCircle). NEVER invent or hallucinate icon names.
 9. Do NOT import non-existent external npm packages. Use only standard React, Next.js, and Lucide icons.

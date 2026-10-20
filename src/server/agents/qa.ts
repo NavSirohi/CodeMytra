@@ -117,6 +117,34 @@ export function formatRepairInstructions(
   return sections.join("\n\n");
 }
 
+/**
+ * Accurately determines if an API route source file exports valid Next.js App Router HTTP handlers.
+ * Supports:
+ * - export async function GET(request: Request)
+ * - export function POST(request: Request)
+ * - export const GET = async (...) =>
+ * - export let POST = ...
+ * - export { GET, POST }
+ */
+export function hasValidRouteHandlerExport(
+  content: string,
+  httpMethods: string[] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+): boolean {
+  for (const m of httpMethods) {
+    if (new RegExp(`export\\s+(async\\s+)?function\\s+${m}\\b`).test(content)) return true;
+    if (new RegExp(`export\\s+(const|let|var)\\s+${m}\\s*=`).test(content)) return true;
+    const namedExports = content.match(/export\s*\{([^}]+)\}/g);
+    if (namedExports) {
+      for (const ne of namedExports) {
+        const inner = ne.replace(/export\s*\{/, "").replace(/\}/, "");
+        const identifiers = inner.split(",").map((s) => s.trim().split(/\s+as\s+/).pop()?.trim());
+        if (identifiers.includes(m)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 export interface DatabaseVerificationPipelineOptions {
   workspaceDir: string;
   models?: Array<{ modelName: string; fields?: string[]; relations?: string[] }>;
@@ -941,6 +969,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
   const requiresDb = Boolean(
     archSpec?.requiresDatabase ||
     capabilities?.includes("data-persistence") ||
+    capabilities?.includes("crud-operations") ||
     (files["prisma/schema.prisma"] && !archSpec)
   );
 
@@ -1041,10 +1070,7 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
 
       for (const routeFile of apiRouteFiles) {
         const content = files[routeFile] || "";
-        const exportsMethod = httpMethods.some((m) =>
-          new RegExp(`export\\s+(async\\s+)?function\\s+${m}\\b`).test(content) ||
-          new RegExp(`export\\s+const\\s+${m}\\b`).test(content)
-        );
+        const exportsMethod = hasValidRouteHandlerExport(content, httpMethods);
         if (!exportsMethod) {
           routesValid = false;
           invalidRoutes.push(routeFile);
@@ -1271,6 +1297,14 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
             details: "Application requires data persistence but prisma/schema.prisma is missing",
           });
           errors.push("Missing prisma/schema.prisma for database verification");
+        } else if (files["prisma/schema.prisma"]) {
+          // If schema is present, ensure Prisma Client is generated before TypeScript typecheck
+          try {
+            const prismaCmd = runner === "bun" ? "bunx prisma" : "npx prisma";
+            await executor.run(`cd "${targetWorkspaceDir}" && ${prismaCmd} generate`, { timeoutMs: 20000 });
+          } catch {
+            // Non-fatal fallback
+          }
         }
 
         // Dynamic budget enforcement: Minimum floor for TypeScript validation is 20s
