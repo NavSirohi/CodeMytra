@@ -17,6 +17,7 @@ import {
   validateRevisionManifest,
   RestorationError,
   FileTreeManifest,
+  sanitizeProjectFiles,
 } from "@/server/orchestration/revisions";
 import {
   finalizeGenerationSuccess,
@@ -688,31 +689,79 @@ export const codeAgentFunction = inngest.createFunction(
     // coding agent execution and persists the unverified draft artifact.
     // ─────────────────────────────────────────────────────────────────────────
     await step.run("capture-initial-draft", async () => {
-      let draftFiles = files || {};
+      let draftFiles: Record<string, string> = {};
+      let draftSource = "canonical-sandbox-snapshot";
+      let draftStatus: DraftValidationStatus = DraftValidationStatus.UNVALIDATED;
+      let draftDiagnostics: Record<string, unknown> | undefined = undefined;
+
       try {
         const snapshot = await captureSandboxSnapshot(sandboxId);
         if (snapshot.files && Object.keys(snapshot.files).length > 0) {
           draftFiles = snapshot.files;
+          draftSource = "canonical-sandbox-snapshot";
+          draftDiagnostics = {
+            provenance: "canonical-sandbox-snapshot",
+            fileCount: Object.keys(draftFiles).length,
+          };
+          await recordRunEvent(
+            runId,
+            "CODING",
+            "Integration Agent",
+            `Persisted canonical sandbox filesystem snapshot (${Object.keys(draftFiles).length} files) to draft artifact`
+          );
+        } else {
+          throw new Error("Authoritative workspace snapshot returned zero files");
         }
       } catch (snapErr) {
-        console.warn(`[Draft] Sandbox snapshot capture had warning, falling back to coder output: ${String(snapErr)}`);
+        const snapErrMsg = snapErr instanceof Error ? snapErr.message : String(snapErr);
+        // Distinguish genuine snapshot failure with valid model-output fallback vs empty/failed source generation
+        const coderFiles = files && typeof files === "object" ? sanitizeProjectFiles(files) : {};
+        const validFileEntries = Object.entries(coderFiles).filter(
+          ([k, v]) => typeof k === "string" && k.trim().length > 0 && typeof v === "string" && v.length > 0
+        );
+
+        if (validFileEntries.length > 0) {
+          draftFiles = Object.fromEntries(validFileEntries);
+          draftSource = "unverified-model-output-fallback";
+          draftDiagnostics = {
+            warning: "E2B filesystem snapshot capture failed; fell back to unverified model memory output",
+            snapshotError: snapErrMsg,
+            provenance: "unverified-model-output-fallback",
+            fileCount: validFileEntries.length,
+          };
+          await recordRunEvent(
+            runId,
+            "CODING",
+            "Integration Agent",
+            `WARNING: E2B filesystem snapshot failed (${snapErrMsg}). Persisted unverified model-output fallback (${validFileEntries.length} files) to draft. Verification required before promotion.`
+          );
+        } else {
+          draftFiles = {};
+          draftSource = "failed-source-generation";
+          draftStatus = DraftValidationStatus.FAILED;
+          draftDiagnostics = {
+            error: "No source files were generated or captured from sandbox",
+            snapshotError: snapErrMsg,
+            provenance: "failed-source-generation",
+          };
+          await recordRunEvent(
+            runId,
+            "CODING",
+            "Integration Agent",
+            `CRITICAL: Coding stage produced no valid source files and filesystem snapshot failed (${snapErrMsg}). Draft marked FAILED.`
+          );
+        }
       }
 
       await upsertGenerationDraft({
         generationRunId: runId,
         projectId,
         files: draftFiles,
-        validationStatus: DraftValidationStatus.UNVALIDATED,
+        validationStatus: draftStatus,
         summary,
-        source: "coding-agent",
+        source: draftSource,
+        diagnostics: draftDiagnostics,
       });
-
-      await recordRunEvent(
-        runId,
-        "CODING",
-        "Integration Agent",
-        `Persisted initial unverified draft (${Object.keys(draftFiles).length} files) to database`
-      );
 
       return draftFiles;
     });
@@ -875,14 +924,43 @@ Conclude with an updated <task_summary>...</task_summary>.
           currentSummary = repairResult.summary;
 
           // Capture actual sandbox files after repair modifications and update persisted draft
+          let repairFiles = currentFiles;
+          let repairSource = "canonical-repair-sandbox-snapshot";
+          let repairDiagnostics: Record<string, unknown> | undefined = undefined;
+
           try {
             const repairSnapshot = await captureSandboxSnapshot(sandboxId);
             if (repairSnapshot.files && Object.keys(repairSnapshot.files).length > 0) {
-              currentFiles = repairSnapshot.files;
+              repairFiles = repairSnapshot.files;
+              repairDiagnostics = {
+                provenance: "canonical-repair-sandbox-snapshot",
+                fileCount: Object.keys(repairFiles).length,
+              };
+            } else {
+              throw new Error("Repair sandbox snapshot returned zero files");
             }
-          } catch {
-            // Keep repairResult.files
+          } catch (repairSnapErr) {
+            const snapErrMsg = repairSnapErr instanceof Error ? repairSnapErr.message : String(repairSnapErr);
+            const sanitizedCurrent = currentFiles && typeof currentFiles === "object" ? sanitizeProjectFiles(currentFiles) : {};
+            if (Object.keys(sanitizedCurrent).length > 0) {
+              repairFiles = sanitizedCurrent;
+              repairSource = "unverified-repair-output-fallback";
+              repairDiagnostics = {
+                warning: "Repair filesystem snapshot capture failed; fell back to model repair memory state",
+                snapshotError: snapErrMsg,
+                provenance: "unverified-repair-output-fallback",
+              };
+            } else {
+              repairFiles = {};
+              repairSource = "failed-repair-generation";
+              repairDiagnostics = {
+                error: "Repair stage produced no files and snapshot failed",
+                snapshotError: snapErrMsg,
+              };
+            }
           }
+
+          currentFiles = repairFiles;
 
           await upsertGenerationDraft({
             generationRunId: runId,
@@ -890,7 +968,8 @@ Conclude with an updated <task_summary>...</task_summary>.
             files: currentFiles,
             validationStatus: DraftValidationStatus.VALIDATING,
             summary: currentSummary,
-            source: "qa-repair-agent",
+            source: repairSource,
+            diagnostics: repairDiagnostics,
           });
 
           if (repairResult.usage) {
@@ -931,10 +1010,16 @@ Conclude with an updated <task_summary>...</task_summary>.
 
       // Capture exact filesystem snapshot from the canonical workspace directory in sandbox
       let finalFiles = currentFiles;
+      let finalSnapshotVerified = false;
       if (report.passed) {
         try {
           const snapshot = await captureSandboxSnapshot(sandboxId);
-          finalFiles = snapshot.files;
+          if (snapshot.files && Object.keys(snapshot.files).length > 0) {
+            finalFiles = snapshot.files;
+            finalSnapshotVerified = true;
+          } else {
+            throw new Error("Authoritative workspace snapshot returned zero files");
+          }
         } catch (snapErr) {
           // Reject incomplete snapshot instead of falling back silently
           const errMsg = snapErr instanceof Error ? snapErr.message : String(snapErr);
@@ -946,6 +1031,7 @@ Conclude with an updated <task_summary>...</task_summary>.
             repairNeeded: true,
             repairInstructions: `Snapshot capture failed: ${errMsg}. Build artifacts or missing entrypoint detected.`,
           };
+          finalSnapshotVerified = false;
         }
       }
 
@@ -966,16 +1052,18 @@ Conclude with an updated <task_summary>...</task_summary>.
         },
       });
 
-      return { report, finalFiles, finalSummary: currentSummary };
+      return { report, finalFiles, finalSummary: currentSummary, finalSnapshotVerified };
     });
 
-    const { report: qaReport, finalFiles, finalSummary } = qaResult;
+    const { report: qaReport, finalFiles, finalSummary, finalSnapshotVerified } = qaResult;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 8: PERSISTENCE & PREVIEW (Executed strictly when QA verification succeeds)
     // ─────────────────────────────────────────────────────────────────────────
-    if (!qaReport.passed || qaReport.verificationMode === "static-only") {
-      const failureReason = qaReport.verificationMode === "static-only"
+    if (!qaReport.passed || qaReport.verificationMode === "static-only" || !finalSnapshotVerified) {
+      const failureReason = !finalSnapshotVerified
+        ? (qaReport.repairInstructions || "Final verified filesystem snapshot could not be captured from live sandbox")
+        : qaReport.verificationMode === "static-only"
         ? "Static-only validation is not permitted for verified builds. Live sandbox verification required."
         : (qaReport.repairInstructions || "Validation checks failed");
 
