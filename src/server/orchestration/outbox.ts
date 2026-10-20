@@ -79,6 +79,12 @@ RETURNING *;`,
 export async function executeClaimedEvent(
   event: OutboxEvent
 ): Promise<{ success: boolean; error?: string }> {
+  // FENCING VERIFICATION: Require non-null claim token for fenced outbox updates
+  if (!event.claimToken || typeof event.claimToken !== "string" || event.claimToken.trim() === "") {
+    const errorMsg = `Fencing violation: event ${event.id} missing required non-null claimToken`;
+    console.error(`[Outbox] ${errorMsg}`);
+    return { success: false, error: errorMsg };
+  }
   const claimToken = event.claimToken;
 
   try {
@@ -105,8 +111,8 @@ export async function executeClaimedEvent(
       },
     });
 
-    // Fencing token check: only mark PROCESSED if our unique claimToken was not stolen/reclaimed
-    await prisma.$queryRawUnsafe(
+    // Fencing token check: verify the affected-row result of the successful PROCESSED transition
+    const processedRows = await prisma.$queryRawUnsafe<{ id: string }[]>(
       `UPDATE "OutboxEvent"
 SET 
   status = 'PROCESSED',
@@ -114,10 +120,22 @@ SET
   "claimedAt" = NULL,
   "claimToken" = NULL,
   "lastError" = NULL
-WHERE id = $1 AND status = 'PROCESSING' AND ($2::text IS NULL OR "claimToken" = $2);`,
+WHERE id = $1 AND status = 'PROCESSING' AND "claimToken" = $2
+RETURNING id;`,
       event.id,
       claimToken
     );
+
+    const processedApplied = Array.isArray(processedRows) && processedRows.length > 0;
+    if (!processedApplied) {
+      console.warn(
+        `[Outbox] Fencing check failed on PROCESSED update for event ${event.id}: claim token superseded or lease expired`
+      );
+      return {
+        success: false,
+        error: `Fencing token superseded for event ${event.id}`,
+      };
+    }
 
     return { success: true };
   } catch (error) {
@@ -139,7 +157,7 @@ SET
   "claimedAt" = NULL,
   "claimToken" = NULL,
   "lastError" = $3
-WHERE id = $1 AND status = 'PROCESSING' AND ($4::text IS NULL OR "claimToken" = $4)
+WHERE id = $1 AND status = 'PROCESSING' AND "claimToken" = $4
 RETURNING id;`,
       event.id,
       nextAttemptAt,
@@ -237,11 +255,12 @@ export interface StaleRunReconciliationResult {
  * This ensures runs stranded due to network partitions, host restarts, or Inngest SDK disconnects
  * never remain permanently in an active state.
  *
- * Guaranteed properties:
- * - Appropriate timeout & grace period: only targets runs older than max duration + gracePeriodMs
- * - Idempotent terminal transitions: finalized via finalizeGenerationFailure
- * - Non-blocking: individual failure to reconcile one run does not abort others
- * - Observable: returns checked, reconciled, and failed counts
+ * Guaranteed resilience properties:
+ * - Queue delay & retry protection: Never fails a run solely because createdAt is old if startedAt,
+ *   updatedAt, or recent RunEvents show legitimate active progression.
+ * - Concurrent completion protection: If completed concurrently, idempotent finalization preserves result.
+ * - Non-blocking: individual failure to reconcile one run does not abort others.
+ * - Observable: returns checked, reconciled, failed counts and reconciled runIds.
  */
 export async function reconcileStaleGenerationRuns(
   gracePeriodMs: number = 60 * 1000,
@@ -252,7 +271,7 @@ export async function reconcileStaleGenerationRuns(
   );
 
   try {
-    const staleRuns = await prisma.generationRun.findMany({
+    const candidateRuns = await prisma.generationRun.findMany({
       where: {
         status: { in: ACTIVE_GENERATION_STATUSES },
         createdAt: { lt: timeoutThreshold },
@@ -261,6 +280,15 @@ export async function reconcileStaleGenerationRuns(
       select: {
         id: true,
         projectId: true,
+        status: true,
+        createdAt: true,
+        startedAt: true,
+        updatedAt: true,
+        events: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          select: { createdAt: true },
+        },
       },
     });
 
@@ -268,17 +296,31 @@ export async function reconcileStaleGenerationRuns(
     let failed = 0;
     const runIds: string[] = [];
 
-    for (const run of staleRuns) {
+    for (const run of candidateRuns) {
+      // 1. Queue Delay, Retries & Progression Check:
+      // If the run started recently or recorded progression (updatedAt or RunEvent within timeout window),
+      // it is legitimately progressing despite an older createdAt. Never fail it!
+      const latestActivityTime = run.events[0]?.createdAt ?? run.updatedAt ?? run.startedAt ?? run.createdAt;
+      if (latestActivityTime >= timeoutThreshold) {
+        continue;
+      }
+
       try {
-        await finalizeGenerationFailure({
+        const finalResult = await finalizeGenerationFailure({
           projectId: run.projectId,
           generationRunId: run.id,
           errorCode: "WORKFLOW_TIMED_OUT",
           errorMessage:
             "Generation exceeded maximum duration budget and was reconciled as timed out.",
         });
-        reconciled++;
-        runIds.push(run.id);
+
+        // 2. Concurrent Completion Check:
+        // If another worker completed or failed the run concurrently, finalizeGenerationFailure
+        // idempotently preserves the completed state without incrementing reconciled count.
+        if (!finalResult.isIdempotentReplay) {
+          reconciled++;
+          runIds.push(run.id);
+        }
       } catch (err) {
         failed++;
         console.error(
@@ -289,7 +331,7 @@ export async function reconcileStaleGenerationRuns(
     }
 
     return {
-      checked: staleRuns.length,
+      checked: candidateRuns.length,
       reconciled,
       failed,
       runIds,

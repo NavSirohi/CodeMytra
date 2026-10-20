@@ -343,6 +343,43 @@ describe("Outbox Recovery Worker with Atomic Claiming", () => {
     }
   });
 
+  it("ensures failure of outbox recovery cannot indefinitely prevent scheduled stale-run reconciliation", async () => {
+    const executedSteps: string[] = [];
+    const mockStep = {
+      run: async (name: string, callback: () => Promise<any>) => {
+        executedSteps.push(name);
+        return callback();
+      },
+    };
+
+    const originalQueryRaw = prisma.$queryRawUnsafe;
+    const originalFindMany = prisma.generationRun.findMany;
+
+    // Simulate database error during outbox recovery query
+    prisma.$queryRawUnsafe = (async () => {
+      throw new Error("PostgreSQL connection refused during outbox claim");
+    }) as any;
+
+    // But generationRun query for watchdog succeeds (returns empty list)
+    prisma.generationRun.findMany = (async () => []) as any;
+
+    try {
+      const fn = (outboxRecoveryFunction as any).fn;
+      const result = await fn({ step: mockStep });
+
+      // Both steps MUST have been invoked!
+      assert.deepEqual(executedSteps, ["recover-stale-events", "reconcile-stale-runs"]);
+      // Outbox recovery recorded failure cleanly without throwing unhandled error
+      assert.equal(result.outbox.failed, 1);
+      assert.match(result.outbox.error, /connection refused/);
+      // Watchdog ran successfully and returned clean result
+      assert.deepEqual(result.staleRuns, { checked: 0, reconciled: 0, failed: 0, runIds: [] });
+    } finally {
+      prisma.$queryRawUnsafe = originalQueryRaw;
+      prisma.generationRun.findMany = originalFindMany;
+    }
+  });
+
   it("fencing verification: outdated worker with superseded claim token cannot finalize GenerationRun on terminal failure", async () => {
     const originalQueryRaw = prisma.$queryRawUnsafe;
     const originalInngestSend = inngest.send;

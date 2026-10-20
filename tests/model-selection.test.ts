@@ -133,7 +133,7 @@ describe("P0: Model Registry, Server Validation & Pipeline Propagation", () => {
 
       const originalQueryRawUnsafe = prisma.$queryRawUnsafe;
       (prisma as unknown as { $queryRawUnsafe: (sql: string, ...args: unknown[]) => Promise<unknown> }).$queryRawUnsafe = async () => {
-        return [];
+        return [{ id: "outbox-test-1" }];
       };
 
       try {

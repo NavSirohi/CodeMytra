@@ -419,6 +419,7 @@ describe("M1.5 Comprehensive Integration: Generation, Modifications, Restoration
         attempts: 2,
         lastError: null,
         createdAt: new Date(Date.now() - 360000),
+        claimToken: "tok-stale-01",
         processedAt: null,
       },
     ];

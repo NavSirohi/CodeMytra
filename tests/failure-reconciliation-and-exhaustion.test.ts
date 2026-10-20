@@ -609,13 +609,29 @@ describe("Priority 0: Outbox Terminal Exhaustion & Delivery Resilience", () => {
 
     const reconciledRunIds: string[] = [];
 
-    // Mock finding 2 stale active runs
+    // Mock finding 2 truly stale active runs
     prisma.generationRun.findMany = (async (args: any) => {
       assert.ok(args.where.status.in.includes(GenerationRunStatus.RUNNING));
       assert.ok(args.where.createdAt.lt instanceof Date);
       return [
-        { id: "stale-run-1", projectId: "proj-1" },
-        { id: "stale-run-2", projectId: "proj-2" },
+        {
+          id: "stale-run-1",
+          projectId: "proj-1",
+          status: GenerationRunStatus.RUNNING,
+          createdAt: new Date(Date.now() - 600000),
+          startedAt: new Date(Date.now() - 600000),
+          updatedAt: new Date(Date.now() - 600000),
+          events: [],
+        },
+        {
+          id: "stale-run-2",
+          projectId: "proj-2",
+          status: GenerationRunStatus.RUNNING,
+          createdAt: new Date(Date.now() - 600000),
+          startedAt: new Date(Date.now() - 600000),
+          updatedAt: new Date(Date.now() - 600000),
+          events: [],
+        },
       ];
     }) as any;
 
@@ -644,10 +660,148 @@ describe("Priority 0: Outbox Terminal Exhaustion & Delivery Resilience", () => {
     try {
       const result = await reconcileStaleGenerationRuns(0); // 0 grace period for test
       assert.equal(result.reconciled, 2);
+      assert.equal(result.checked, 2);
       assert.deepEqual(reconciledRunIds, ["stale-run-1", "stale-run-2"]);
     } finally {
       prisma.generationRun.findMany = originalFindMany;
       prisma.$transaction = originalTx;
+    }
+  });
+
+  it("stale-run watchdog does NOT incorrectly fail a progressing run with old createdAt due to queue delay or recent events", async () => {
+    const { reconcileStaleGenerationRuns } = await import("../src/server/orchestration/outbox");
+    const originalFindMany = prisma.generationRun.findMany;
+    const originalTx = prisma.$transaction;
+
+    let transactionCalled = false;
+    prisma.$transaction = (async () => {
+      transactionCalled = true;
+      return {};
+    }) as any;
+
+    const oldDate = new Date(Date.now() - 600000); // 10 minutes old
+    const recentDate = new Date(Date.now() - 10000); // 10 seconds ago
+
+    // Candidate runs returned from query:
+    // Run 1: sat in queue for 10 min, but started recently (startedAt 10s ago)
+    // Run 2: created 10 min ago, but has an active stage event recorded 10s ago
+    prisma.generationRun.findMany = (async () => [
+      {
+        id: "run-queued-long",
+        projectId: "proj-1",
+        status: GenerationRunStatus.RUNNING,
+        createdAt: oldDate,
+        startedAt: recentDate,
+        updatedAt: recentDate,
+        events: [],
+      },
+      {
+        id: "run-progressing-stage",
+        projectId: "proj-2",
+        status: GenerationRunStatus.VALIDATING,
+        createdAt: oldDate,
+        startedAt: oldDate,
+        updatedAt: recentDate,
+        events: [{ createdAt: recentDate }],
+      },
+    ]) as any;
+
+    try {
+      const result = await reconcileStaleGenerationRuns(60000);
+      assert.equal(result.checked, 2);
+      assert.equal(result.reconciled, 0, "Progressing runs must NOT be reconciled to failed");
+      assert.equal(transactionCalled, false, "No failure finalization must be performed on active runs");
+    } finally {
+      prisma.generationRun.findMany = originalFindMany;
+      prisma.$transaction = originalTx;
+    }
+  });
+
+  it("stale-run watchdog safely handles concurrent completion without corrupting completed revisions", async () => {
+    const { reconcileStaleGenerationRuns } = await import("../src/server/orchestration/outbox");
+    const originalFindMany = prisma.generationRun.findMany;
+    const originalTx = prisma.$transaction;
+
+    const oldDate = new Date(Date.now() - 600000);
+    prisma.generationRun.findMany = (async () => [
+      {
+        id: "run-concurrent-win",
+        projectId: "proj-concurrent",
+        status: GenerationRunStatus.RUNNING,
+        createdAt: oldDate,
+        startedAt: oldDate,
+        updatedAt: oldDate,
+        events: [{ createdAt: oldDate }],
+      },
+    ]) as any;
+
+    // Simulate concurrent worker having completed the run just as watchdog checks it
+    prisma.$transaction = (async (fn: any) => {
+      const mockTx = {
+        generationRun: {
+          findUnique: async () => ({
+            id: "run-concurrent-win",
+            projectId: "proj-concurrent",
+            status: GenerationRunStatus.COMPLETED, // Already completed by worker
+            resultRevisionId: "rev-winner-1",
+          }),
+        },
+      };
+      return fn(mockTx);
+    }) as any;
+
+    try {
+      const result = await reconcileStaleGenerationRuns(60000);
+      assert.equal(result.checked, 1);
+      assert.equal(result.reconciled, 0, "Concurrently completed run must not be counted as failed");
+    } finally {
+      prisma.generationRun.findMany = originalFindMany;
+      prisma.$transaction = originalTx;
+    }
+  });
+
+  it("executeClaimedEvent rejects events with missing or null claim tokens", async () => {
+    const { executeClaimedEvent } = await import("../src/server/orchestration/outbox");
+
+    const eventWithoutToken = {
+      id: "evt-no-token",
+      eventName: "code-agent/run",
+      payload: { runId: "r-1", projectId: "p-1" },
+      status: OutboxStatus.PROCESSING,
+      attempts: 1,
+      claimToken: null,
+    };
+
+    const result = await executeClaimedEvent(eventWithoutToken as any);
+    assert.equal(result.success, false);
+    assert.match(result.error || "", /missing required non-null claimToken/);
+  });
+
+  it("executeClaimedEvent fails safely if PROCESSED transition affects 0 rows due to lease expiration", async () => {
+    const { executeClaimedEvent } = await import("../src/server/orchestration/outbox");
+    const originalQueryRaw = prisma.$queryRawUnsafe;
+    const originalInngestSend = inngest.send;
+
+    inngest.send = (async () => ({ ids: ["msg-sent"] })) as any;
+    // Fenced PROCESSED update returns 0 affected rows
+    prisma.$queryRawUnsafe = (async () => []) as any;
+
+    try {
+      const event = {
+        id: "evt-stolen-lease",
+        eventName: "code-agent/run",
+        payload: { runId: "r-stolen", projectId: "p-stolen" },
+        status: OutboxStatus.PROCESSING,
+        attempts: 1,
+        claimToken: "tok-superseded",
+      };
+
+      const result = await executeClaimedEvent(event as any);
+      assert.equal(result.success, false);
+      assert.match(result.error || "", /Fencing token superseded/);
+    } finally {
+      prisma.$queryRawUnsafe = originalQueryRaw;
+      inngest.send = originalInngestSend;
     }
   });
 
