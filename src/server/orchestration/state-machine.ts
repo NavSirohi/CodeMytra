@@ -106,9 +106,9 @@ export async function transitionRun(
     status: targetStatus,
   };
 
-  if (targetStatus === GenerationRunStatus.RUNNING || targetStatus === GenerationRunStatus.PLANNING) {
-    updateData.startedAt = now;
-  } else if (isTerminalStatus(targetStatus)) {
+  // initializeRunStartTime() owns startedAt and uses an atomic set-if-null.
+  // A stage transition must not reset the persisted generation deadline.
+  if (isTerminalStatus(targetStatus)) {
     updateData.completedAt = now;
   }
 

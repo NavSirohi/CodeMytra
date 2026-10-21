@@ -426,7 +426,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
                           Preview Unavailable — Verification Incomplete
                         </p>
                         <p className="text-xs text-[#8a9a8e] leading-relaxed">
-                          {activeRun?.errorMessage || "Automated build and verification checks encountered errors or timed out. Live runtime preview is not available."}
+                          The generated application did not pass all verification checks. Live preview is unavailable until the issues are resolved.
                         </p>
                         <p className="text-xs text-amber-300/80">
                           All generated source code was preserved as an unverified draft artifact.
@@ -461,7 +461,7 @@ export function ProjectView({ projectId }: { projectId: string }) {
                         Generation Failed
                       </p>
                       <p className="text-xs max-w-sm text-[#8a9a8e] leading-relaxed">
-                        {activeRun?.errorMessage || "The agent generation run failed and could not produce a working preview. Check the prompt or retry with a refined request."}
+                        We couldn’t complete this generation. No verified preview is available. Please review the project and try again.
                       </p>
                     </div>
                   ) : (

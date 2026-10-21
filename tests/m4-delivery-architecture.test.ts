@@ -580,6 +580,62 @@ describe("M4 Source Delivery Architecture: Draft Preservation, QA Diagnostics & 
     assert.equal(successPreflight.timeout, false);
   });
 
+  // Regression: a newly admitted QUEUED run must reach the first durable step.
+  it("Scenario 7A: QUEUED run begins execution instead of being treated as terminal", async () => {
+    const runId = "run-queued-startup-regression";
+    const projectId = "project-queued-startup-regression";
+    const originalFindUnique = prisma.generationRun.findUnique;
+    const originalUpdateMany = prisma.generationRun.updateMany;
+    const originalEnvKey = process.env.OPENAI_API_KEY;
+    let startedAt: Date | null = null;
+    let firstStepReached = false;
+    const stopAtFirstStep = new Error("EXPECTED_FIRST_DURABLE_STEP");
+
+    try {
+      process.env.OPENAI_API_KEY = "mock-openai-key";
+      prisma.generationRun.findUnique = (async (args: any) => {
+        if (args.where?.id !== runId) return null;
+        return {
+          id: runId,
+          projectId,
+          status: GenerationRunStatus.QUEUED,
+          startedAt,
+          createdAt: new Date(),
+          errorMessage: null,
+        };
+      }) as any;
+      prisma.generationRun.updateMany = (async (args: any) => {
+        if (args.where?.id === runId && args.where.startedAt === null && !startedAt) {
+          startedAt = args.data.startedAt;
+          return { count: 1 };
+        }
+        return { count: 0 };
+      }) as any;
+
+      const handler = (codeAgentFunction as any).fn;
+      await assert.rejects(
+        handler({
+          event: { data: { projectId, runId, value: "Build a simple todo app" } },
+          step: {
+            run: async (stepId: string) => {
+              assert.equal(stepId, "resolve-base-files");
+              firstStepReached = true;
+              throw stopAtFirstStep;
+            },
+          },
+        }),
+        (error: unknown) => error === stopAtFirstStep,
+      );
+      assert.equal(firstStepReached, true, "A QUEUED run must enter its first durable step");
+      assert.ok(startedAt !== null && Number.isFinite(Number(startedAt)), "A QUEUED run must initialize persisted startedAt");
+    } finally {
+      prisma.generationRun.findUnique = originalFindUnique;
+      prisma.generationRun.updateMany = originalUpdateMany;
+      if (originalEnvKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalEnvKey;
+    }
+  });
+
   // =========================================================================
   // SCENARIO 7: Inngest Replay After save-result Finalization
   // =========================================================================

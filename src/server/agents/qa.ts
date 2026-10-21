@@ -1285,6 +1285,70 @@ export async function runQAInspector(options: ValidateProjectOptions): Promise<Q
         }
       }
 
+      // Synchronize the generated manifest, not merely the existence of node_modules.
+      // The base template can contain stale versions even when all package folders exist.
+      // npm is available in the verified Node 22 sandbox and runs native install scripts.
+      if (preflightPassed && !options.customExecutor) {
+        const dependencyStart = Date.now();
+        const installBudget = Math.min(120000, getRemainingBudgetMs() - 65000);
+        if (installBudget < 20000) {
+          isInfrastructureTimeout = true;
+          preflightPassed = false;
+          errors.push("Insufficient generation deadline budget to synchronize generated project dependencies");
+          checks.push({
+            name: "dependency-install",
+            category: "sandbox-connection",
+            status: "FAIL",
+            details: "Not enough time remaining to install dependencies and complete QA",
+            timeout: true,
+          });
+        } else {
+          // Unlink a legacy symlink only; never remove its shared target.
+          const installCmd = `cd "${targetWorkspaceDir}" && if [ -L node_modules ]; then unlink node_modules; fi && npm install --no-package-lock --ignore-scripts=false --no-audit --no-fund`;
+          try {
+            const installed = await executor.run(installCmd, { timeoutMs: installBudget });
+            let dependencyReady = installed.exitCode === 0;
+            let diagnostic = installed.stderr || installed.stdout || "unknown error";
+
+            if (dependencyReady) {
+              // Verify local CLI availability and actually load the native SQLite binding.
+              // A package folder alone does not prove a usable native addon.
+              const verifyCmd = `cd "${targetWorkspaceDir}" && node -e 'const fs=require("fs"),p=require("./package.json"); const deps={...p.dependencies,...p.devDependencies}; for(const n of Object.keys(deps)) { if(!fs.existsSync("node_modules/"+n+"/package.json")) throw Error("Missing installed dependency: "+n); } if(fs.existsSync("prisma/schema.prisma") && !fs.existsSync("node_modules/.bin/prisma")) throw Error("Local Prisma CLI missing"); if(deps["better-sqlite3"] || fs.existsSync("prisma/schema.prisma") && deps["@prisma/adapter-better-sqlite3"]) { const Database=require("better-sqlite3"); const db=new Database(":memory:"); try { if(db.prepare("SELECT 1 AS ok").get().ok!==1) throw Error("SQLite native query failed"); } finally { db.close(); } } console.log("DEPENDENCY_RUNTIME_PASS");'`;
+              try {
+                const verified = await executor.run(verifyCmd, { timeoutMs: 10000 });
+                dependencyReady = verified.exitCode === 0 && verified.stdout.includes("DEPENDENCY_RUNTIME_PASS");
+                if (!dependencyReady) diagnostic = verified.stderr || verified.stdout || "Installed dependency runtime verification failed";
+              } catch (verifyErr) {
+                dependencyReady = false;
+                diagnostic = String(verifyErr);
+                if (isTimeoutError(verifyErr)) isInfrastructureTimeout = true;
+              }
+            }
+
+            checks.push({
+              name: "dependency-install",
+              category: "sandbox-connection",
+              status: dependencyReady ? "PASS" : "FAIL",
+              details: dependencyReady
+                ? `Generated manifest synchronized and runtime dependencies verified (${Date.now() - dependencyStart}ms)`
+                : `Generated dependency synchronization/runtime verification failed: ${diagnostic.slice(0, 3000)}`,
+              exitCode: dependencyReady ? 0 : (installed.exitCode === 0 ? 1 : installed.exitCode),
+              stdout: installed.stdout,
+              stderr: installed.stderr,
+            });
+            if (!dependencyReady) {
+              preflightPassed = false;
+              errors.push(`Generated project dependency installation/verification failed: ${diagnostic.slice(0, 1000)}`);
+            }
+          } catch (err) {
+            preflightPassed = false;
+            if (isTimeoutError(err)) isInfrastructureTimeout = true;
+            errors.push(`Generated dependency installation failed: ${String(err)}`);
+            checks.push({ name: "dependency-install", category: "sandbox-connection", status: "FAIL", details: String(err), timeout: isTimeoutError(err) });
+          }
+        }
+      }
+
       if (!preflightPassed) {
         checks.push({
           name: "typescript-validation",

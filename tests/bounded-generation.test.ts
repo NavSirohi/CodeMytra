@@ -355,13 +355,13 @@ describe("P0: Bounded Generation, Fast-Path Delivery & Watchdog Reconciliation",
 
       const prompt = buildContextEnhancedPrompt(mockPrd, mockDesign, mockArch);
 
-      assert.ok(prompt.includes("CRITICAL EXECUTION DIRECTIVES: DIRECT, FAST DELIVERY"));
-      assert.ok(prompt.includes("IMMEDIATE BATCH WRITE"));
-      assert.ok(prompt.includes("createOrUpdateFiles"));
-      assert.ok(prompt.includes("NO EXPLORATORY ACTIONS"));
-      assert.ok(prompt.includes("NO MANUAL BUILD/TEST LOOPS"));
-      assert.ok(prompt.includes("IMMEDIATE COMPLETION"));
-      assert.ok(prompt.includes("<task_summary>"));
+      assert.ok(prompt.includes("CRITICAL EXECUTION DIRECTIVES: COMPLETE, CONSISTENT DELIVERY"));
+      assert.ok(prompt.includes("REQUIRED ROOT PAGE"));
+      assert.ok(prompt.includes("app/page.tsx"));
+      assert.ok(prompt.includes("PLAN FILES BEFORE WRITING"));
+      assert.ok(prompt.includes("COMPLETE FILE WRITES"));
+      assert.ok(prompt.includes("IMPORT RULE"));
+      assert.ok(prompt.includes("FINAL VERIFICATION"));
     });
   });
 

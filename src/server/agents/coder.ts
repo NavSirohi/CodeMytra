@@ -531,18 +531,15 @@ Do NOT attempt to write or overwrite:
 - "lib/utils.ts" (already exports the canonical 'cn' function)
 - "lib/db.ts", "prisma.config.ts", "prisma/schema.prisma" (already generated and configured)
 
-=== CRITICAL EXECUTION DIRECTIVES: DIRECT, FAST DELIVERY ===
-1. IMMEDIATE BATCH WRITE: On your VERY FIRST action, call the "createOrUpdateFiles" tool to write ALL required components and pages (including "app/page.tsx", any sub-components, and styling updates) in a SINGLE complete batch.
-2. NO EXPLORATORY ACTIONS: Do NOT call "readFiles" or "terminal" for preliminary reconnaissance. The foundation files (package.json, layout.tsx, Tailwind CSS, Lucide icons, lib/utils.ts) are already established in the workspace (${PROJECT_WORKSPACE_DIR}).
-3. NO MANUAL BUILD/TEST LOOPS: Do NOT execute "bun build", "next build", or "npm test" in the terminal. An isolated, automated QA pipeline verifies the build after you conclude.
-4. IMMEDIATE COMPLETION: As soon as you write your files, conclude your response with a concise summary enclosed in <task_summary>...</task_summary> and finish.
-4b. NO BARREL IMPORTS: There is NO "components/index.ts" barrel file. NEVER write:
-   - import { Header, Footer } from "@/components"       ← FORBIDDEN (no barrel exists)
-   - import { Nav } from "@/components/index"            ← FORBIDDEN
-   ALWAYS import directly from the specific component file where it is defined:
-   - import Header from "@/components/Header"            ← CORRECT
-   - import { Footer } from "@/components/Footer"        ← CORRECT
-   If you create "components/Header.tsx", import it as "@/components/Header" (not "@/components").
+=== CRITICAL EXECUTION DIRECTIVES: COMPLETE, CONSISTENT DELIVERY ===
+1. REQUIRED ROOT PAGE: You MUST create app/page.tsx in EVERY initial generation (also when the requested website primarily uses other routes). Export a valid default React component with meaningful content and navigation. Do not merely describe the home page in the summary.
+2. PLAN FILES BEFORE WRITING: Build a dependency graph of every page, component, hook, type, utility and API route you intend to import. Every local import MUST correspond to a real generated file or an existing foundation file. Inspect the existing project with readFiles when needed, especially during repair/follow-ups.
+3. COMPLETE FILE WRITES: Write all mutually dependent files, including app/page.tsx, in coherent batches. If you hit a tool or output limit, continue in subsequent batches. Never terminate with promised files unwritten. Before concluding, use readFiles to verify app/page.tsx and any shared utility/type modules referenced by generated code exist.
+4. IMPORT RULE: Prefer explicit imports such as @/components/Header. Do not import @/components unless components/index.ts exists and actually exports every imported symbol. A type imported from @/lib/types requires a real lib/types.ts; do not invent paths.
+5. TYPESCRIPT: Use explicit types for arrays, keyed records, form state, component props, API payloads and timer data. Never suppress errors with @ts-ignore or ts-nocheck. Avoid placeholder interfaces and dead buttons; implement requested behavior.
+6. DEPENDENCIES: Use dependencies declared by the foundation manifest. Do not import new npm libraries without a supported manifest reconciliation path; prefer available platform dependencies. Do not change foundation-owned configuration files.
+7. DB/SECURITY: Use foundation Prisma models exactly as specified; never store plain-text passwords or expose user records through unauthenticated GET endpoints. If secure authentication cannot be completed with the available contract, report that limitation instead of claiming it works.
+8. FINAL VERIFICATION: Finish only after all required files have been written. QA owns build execution; your summary must accurately identify implemented and omitted functionality. In QA repair, address every supplied diagnostic with actual file changes, not a textual explanation.
 
 5. IF requiresDb IS TRUE (Full-Stack Application):
    - ACCESS DATABASE VIA: import { db } from "@/lib/db";

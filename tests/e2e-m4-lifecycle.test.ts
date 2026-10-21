@@ -112,8 +112,8 @@ describe("CodeMytra M4 End-to-End Reliability & Lifecycle Suite", () => {
     const generatedPrompt = buildContextEnhancedPrompt(parsedPrd, parsedDesign, parsedArch);
 
     // Verify critical prompt directives
-    assert.match(generatedPrompt, /CRITICAL EXECUTION DIRECTIVES: DIRECT, FAST DELIVERY/);
-    assert.match(generatedPrompt, /IMMEDIATE BATCH WRITE/);
+    assert.match(generatedPrompt, /CRITICAL EXECUTION DIRECTIVES: COMPLETE, CONSISTENT DELIVERY/);
+    assert.match(generatedPrompt, /COMPLETE FILE WRITES/);
     assert.match(generatedPrompt, /"use client"; on line 1/i);
     assert.match(generatedPrompt, /ShoppingBag, Coffee, Clock, MapPin/);
     assert.match(generatedPrompt, /Requires Persistence: NO/);

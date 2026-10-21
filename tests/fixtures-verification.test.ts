@@ -422,10 +422,10 @@ export default function BakeryPage() {
 
       // 3. Package dependencies include Prisma ORM and SQLite adapter
       const pkg = JSON.parse(baseFiles["package.json"]);
-      assert.equal(pkg.dependencies["@prisma/client"], "^7.8.0");
-      assert.equal(pkg.dependencies["@prisma/adapter-better-sqlite3"], "^7.10.1");
+      assert.equal(pkg.dependencies["@prisma/client"], "7.10.1");
+      assert.equal(pkg.dependencies["@prisma/adapter-better-sqlite3"], "7.10.1");
       assert.equal(pkg.dependencies["better-sqlite3"], "^13.0.3");
-      assert.equal(pkg.devDependencies["prisma"], "^7.10.1");
+      assert.equal(pkg.devDependencies["prisma"], "7.10.1");
     });
 
     it("verifies model interfaces formatter generates correct TypeScript types for the coder prompt", () => {

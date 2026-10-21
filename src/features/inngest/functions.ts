@@ -229,14 +229,12 @@ export const codeAgentFunction = inngest.createFunction(
           (error instanceof Error && error.name === "GenerationTimeoutError");
         const isProviderConfigError = isOpenAIPermanentError(error);
 
-        // If aborted because run was already marked terminal in DB (e.g. by watchdog or user cancellation),
-        // verify active status. If already terminal, do not overwrite terminal state or emit duplicate messages.
-        if (isAborted) {
-          const stillActive = await isRunActiveInDb(runId);
-          if (!stillActive) {
-            console.log(`[Generation onFailure] Run ${runId} is already terminal in DB. Skipping failure finalization.`);
-            return;
-          }
+        // Any terminal state is authoritative, regardless of the error type. A delayed
+        // retry must never overwrite the watchdog's or another worker's failure reason.
+        const stillActive = await isRunActiveInDb(runId);
+        if (!stillActive) {
+          console.log(`[Generation onFailure] Run ${runId} is already terminal in DB. Skipping failure finalization.`);
+          return;
         }
 
         const errorCode = isAborted
@@ -296,6 +294,41 @@ export const codeAgentFunction = inngest.createFunction(
       throw new NonRetriableError(
         "OPENAI_API_KEY is not configured. Add your OpenAI API key to environment variables."
       );
+    }
+
+    // A durable Inngest replay can re-enter this handler after save-result has
+    // already finalized the DB run. Reuse the memoized final step rather than
+    // restarting generation or incorrectly treating the replay as a new failure.
+    const terminalRun = await prisma.generationRun.findUnique({
+      where: { id: runId },
+      select: { status: true, errorMessage: true },
+    });
+    // QUEUED is a legitimate first execution state. Only terminal or missing
+    // runs are forbidden from starting/restarting the generation pipeline.
+    if (!terminalRun || ([
+      GenerationRunStatus.FAILED,
+      GenerationRunStatus.COMPLETED,
+      GenerationRunStatus.CANCELLED,
+    ] as GenerationRunStatus[]).includes(terminalRun.status)) {
+      if (terminalRun?.status === GenerationRunStatus.FAILED) {
+        const saved = await step.run("save-result", async (): Promise<{ messageId: string; error?: string }> => {
+          // Missing memoization means the run was finalized by another actor,
+          // not by this workflow's save-result step. Never replay finalization.
+          throw new RunAbortedError(`Generation run ${runId} already failed; no saved result to replay`);
+        });
+        if (saved && typeof saved.messageId === "string") {
+          return {
+            status: "FAILED" as const,
+            error: terminalRun.errorMessage || saved.error || "Generation failed",
+            priorRevisionPreserved: true,
+            messageId: saved.messageId,
+          };
+        }
+        throw new RunAbortedError(`Generation run ${runId} has an invalid saved failure result`);
+      }
+      // Cancellation, completion without a memoized result, and missing runs
+      // remain terminal. Do not run planner/coder steps against them.
+      throw new RunAbortedError(`Generation run ${runId} is no longer active; refusing workflow restart`);
     }
 
     // Concurrency-safe persisted start-time initialization
@@ -592,17 +625,6 @@ export const codeAgentFunction = inngest.createFunction(
           }
         }
 
-        // 4. Generate Prisma Client immediately if database schema was established
-        if (workspaceInitialFiles["prisma/schema.prisma"]) {
-          try {
-            await sandbox.commands.run(
-              `cd "${PROJECT_WORKSPACE_DIR}" && (bunx --bun prisma generate || npx prisma generate)`,
-              { timeoutMs: 20000 }
-            );
-          } catch (prismaGenErr) {
-            console.warn("[sandbox-init] Non-fatal prisma generate warning:", prismaGenErr);
-          }
-        }
       }
 
       await recordStageMetric({

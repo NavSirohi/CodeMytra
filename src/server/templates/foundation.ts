@@ -188,8 +188,8 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
       zod: "^3.24.2",
       ...(needsDb
         ? {
-            "@prisma/client": "^7.8.0",
-            "@prisma/adapter-better-sqlite3": "^7.10.1",
+            "@prisma/client": "7.10.1",
+            "@prisma/adapter-better-sqlite3": "7.10.1",
             "better-sqlite3": "^13.0.3",
           }
         : {}),
@@ -206,7 +206,7 @@ export function getBaseProjectFiles(options: BaseProjectOptions = {}): Record<st
       "eslint-config-next": "16.4.2",
       ...(needsDb
         ? {
-            prisma: "^7.10.1",
+            prisma: "7.10.1",
             dotenv: "^16.4.7",
             "@types/better-sqlite3": "^9.6.0",
           }
