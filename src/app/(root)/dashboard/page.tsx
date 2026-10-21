@@ -20,7 +20,7 @@ export default function Home() {
       <main className="flex flex-1 flex-col items-center px-4 pb-16 pt-28">
         <div className="flex w-full max-w-3xl flex-col items-center gap-8 text-center">
           <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
-            What do you want to create?
+            What do you want to build?
           </h1>
           <PromptInput />
         </div>

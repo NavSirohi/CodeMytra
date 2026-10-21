@@ -3,12 +3,32 @@
 import "dotenv/config";
 import { defineConfig } from "prisma/config";
 
+/**
+ * Prisma configuration for CodeMytra.
+ *
+ * Uses TWO database connection strings for Neon PostgreSQL:
+ *
+ * DATABASE_URL        — Pooled connection (PgBouncer) for normal app queries.
+ *                       Used at runtime by the Next.js app (Prisma Client).
+ *
+ * DATABASE_URL_DIRECT — Direct (non-pooled) connection for schema migrations.
+ *                       Required because PgBouncer does not support all commands
+ *                       that Prisma migrate needs (e.g. CREATE TYPE, advisory locks).
+ *                       Only used during `prisma migrate dev/deploy`.
+ *
+ * Both values must be set in your local .env (never committed to git).
+ * See .env.example for the required format.
+ */
 export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: {
     path: "prisma/migrations",
   },
   datasource: {
-    url: process.env["DATABASE_URL"],
+    // Migrations use the DIRECT url to avoid PgBouncer limitations.
+    url:
+      process.env["DATABASE_URL_DIRECT"] ??
+      process.env["DIRECT_URL"] ??
+      process.env["DATABASE_URL"],
   },
 });

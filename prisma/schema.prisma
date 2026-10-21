@@ -1,8 +1,6 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -29,14 +27,24 @@ model User {
 }
 
 model Project {
-  id        String   @id @default(uuid())
-  name      String
-  userId    String
-  user      User     @relation(fields: [userId], references: [id])
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                String            @id @default(uuid())
+  name              String
+  userId            String
+  user              User              @relation(fields: [userId], references: [id])
+  currentRevisionId String?
+  currentRevision   ProjectRevision?  @relation("ProjectCurrentRevision", fields: [currentRevisionId], references: [id], onDelete: SetNull)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
 
-  messages Message[]
+  messages       Message[]
+  revisions      ProjectRevision[] @relation("ProjectRevisions")
+  drafts         GenerationDraft[]
+  generationRuns GenerationRun[]
+  specification  ProjectSpecification?
+  idempotencyKey String?
+
+  @@index([userId, createdAt])
+  @@unique([userId, idempotencyKey])
 }
 
 enum MessageRole {
@@ -61,7 +69,12 @@ model Message {
   projectId String
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
+  generationRunId String?        @unique
+  generationRun   GenerationRun? @relation(fields: [generationRunId], references: [id], onDelete: SetNull)
+
   fragments Fragment?
+
+  @@index([projectId, createdAt])
 }
 
 model Fragment {
@@ -75,4 +88,197 @@ model Fragment {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+enum GenerationRunStatus {
+  QUEUED
+  PLANNING
+  AWAITING_APPROVAL
+  DESIGNING
+  ARCHITECTING
+  RUNNING
+  VALIDATING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model GenerationRun {
+  id               String              @id @default(cuid())
+  projectId        String
+  project          Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId           String
+  prompt           String
+  status           GenerationRunStatus @default(QUEUED)
+  baseRevisionId   String?
+  resultRevisionId String?
+  errorCode        String?
+  errorMessage     String?
+  attemptCount     Int                 @default(0)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  revisions ProjectRevision[]
+  draft     GenerationDraft?
+  tasks     AgentTask[]
+  events    RunEvent[]
+  message   Message?
+
+  @@index([projectId, createdAt])
+  @@index([status, createdAt])
+}
+
+model ProjectRevision {
+  id              String         @id @default(cuid())
+  projectId       String
+  project         Project        @relation("ProjectRevisions", fields: [projectId], references: [id], onDelete: Cascade)
+  generationRunId String?
+  generationRun   GenerationRun? @relation(fields: [generationRunId], references: [id], onDelete: SetNull)
+  parentRevisionId String?
+  parentRevision  ProjectRevision? @relation("RevisionHistory", fields: [parentRevisionId], references: [id], onDelete: SetNull)
+  childRevisions  ProjectRevision[] @relation("RevisionHistory")
+  revisionNumber  Int
+  title           String         @default("Initial revision")
+  summary         String?
+  files           Json           // Complete immutable file tree snapshot: { [filePath]: fileContent }
+  manifest        Json?          // File metadata: file count, size, sha hashes
+  storageKey      String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  currentForProjects Project[] @relation("ProjectCurrentRevision")
+
+  @@unique([projectId, revisionNumber])
+  @@index([projectId, createdAt])
+}
+
+enum SpecStatus {
+  DRAFT
+  AWAITING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+model ProjectSpecification {
+  id               String     @id @default(cuid())
+  projectId        String     @unique
+  project          Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  prd              Json?      // ProductRequirementsDocument
+  designSpec       Json?      // DesignSpecification
+  architectureSpec Json?      // ArchitectureSpecification
+  status           SpecStatus @default(DRAFT)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  @@index([projectId, status])
+}
+
+enum TaskStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model AgentTask {
+  id         String        @id @default(cuid())
+  runId      String
+  run        GenerationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  role       String        // planner | designer | architect | frontend | backend | database | integration | qa
+  status     TaskStatus    @default(PENDING)
+  attempt    Int           @default(0)
+  startedAt  DateTime?
+  finishedAt DateTime?
+  output     Json?
+  errorMsg   String?
+  createdAt  DateTime      @default(now())
+
+  @@index([runId, role])
+}
+
+model RunEvent {
+  id        String        @id @default(cuid())
+  runId     String
+  run       GenerationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stage     String
+  agentRole String?
+  message   String
+  payload   Json?
+  metricKey String?       @unique
+  createdAt DateTime      @default(now())
+
+  @@index([runId, createdAt])
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+model OutboxEvent {
+  id            String       @id @default(cuid())
+  eventName     String
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  lastError     String?
+  claimedAt     DateTime?
+  nextAttemptAt DateTime?
+  claimToken    String?
+  createdAt     DateTime     @default(now())
+  processedAt   DateTime?
+
+  @@index([status, createdAt])
+  @@index([status, nextAttemptAt])
+  @@index([status, claimedAt])
+  @@index([claimToken])
+}
+
+model ContactSubmission {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  subject   String
+  message   String
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+}
+
+model RateLimitRecord {
+  id        String   @id @default(cuid())
+  keyHash   String
+  createdAt DateTime @default(now())
+
+  @@index([keyHash, createdAt])
+}
+
+enum DraftValidationStatus {
+  UNVALIDATED
+  VALIDATING
+  PASSED
+  FAILED
+}
+
+model GenerationDraft {
+  id               String                @id @default(cuid())
+  generationRunId  String                @unique
+  generationRun    GenerationRun         @relation(fields: [generationRunId], references: [id], onDelete: Cascade)
+  projectId        String
+  project          Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  files            Json                  // Actual generated source files snapshot: { [filePath]: fileContent }
+  manifest         Json?                 // Sanitized file metadata: count, size, sha hashes
+  validationStatus DraftValidationStatus @default(UNVALIDATED)
+  diagnostics      Json?                 // Validation errors, compiler diagnostics, failure details
+  summary          String?
+  source           String                @default("coding-agent") // "coding-agent" | "qa-repair"
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  @@index([projectId, createdAt])
+  @@index([generationRunId])
 }

@@ -1,66 +1,63 @@
 import { cn } from "@/lib/utils";
 
 /**
- * Props for {@link Chai0Logo}.
+ * Props for {@link CodeMytraLogo}.
  *
  * @property className - Extra classes applied to the wrapper.
- * @property showWordmark - Whether to render the "chai0" text next to the mark.
+ * @property showWordmark - Whether to render the "CodeMytra" text next to the mark.
  */
-type Chai0LogoProps = {
+type CodeMytraLogoProps = {
   className?: string;
   showWordmark?: boolean;
 };
 
 /**
- * The standalone chai0 glyph (SVG mark) without the wordmark.
+ * The standalone CodeMytra glyph (SVG mark) without the wordmark.
  *
  * Inherits color via `currentColor` so it adapts to the surrounding text color.
+ * Originally from the teacher's Chai0 project; retained and rebranded for CodeMytra.
  *
  * @param className - Extra classes applied to the `<svg>` element.
  */
-function Chai0Mark({ className }: { className?: string }) {
+function CodeMytraMark({ className }: { className?: string }) {
   return (
-    <svg
-      viewBox="0 0 44 48"
-      fill="none"
-      aria-hidden
-      className={cn("shrink-0", className)}
+    <span
+      className={cn(
+        "w-7 h-7 inline-grid place-items-center bg-[#284938] text-white rounded-[9px] font-serif font-semibold text-base leading-none select-none shrink-0 -rotate-6 shadow-xs",
+        className
+      )}
+      aria-hidden="true"
     >
-      <rect
-        x="8.5"
-        y="4"
-        width="27"
-        height="40"
-        rx="13.5"
-        stroke="currentColor"
-        strokeWidth="5"
-        fill="none"
-      />
-      <path
-        fill="currentColor"
-        d="M10.8 38.2C10.8 32.5 13.8 26.5 19.5 24.8C16.2 29.2 13.2 34.2 10.8 38.2Z"
-      />
-    </svg>
+      म
+    </span>
   );
 }
 
 /**
- * The chai0 brand logo: the glyph mark plus an optional "chai0" wordmark.
+ * The CodeMytra brand logo: the glyph mark plus an optional "CodeMytra" wordmark.
  *
- * @param props - See {@link Chai0LogoProps}.
+ * @param props - See {@link CodeMytraLogoProps}.
  */
-export function Chai0Logo({
+export function CodeMytraLogo({
   className,
   showWordmark = true,
-}: Chai0LogoProps) {
+}: CodeMytraLogoProps) {
   return (
-    <span className={cn("inline-flex items-center gap-2.5 text-foreground", className)}>
-      <Chai0Mark className="h-7 w-auto" />
+    <span className={cn("inline-flex items-center gap-2 text-foreground font-sans", className)}>
+      <CodeMytraMark className="h-7 w-7" />
       {showWordmark ? (
-        <span className="text-base font-semibold tracking-tight">chai0</span>
+        <span className="text-base font-bold tracking-tight">
+          Code<em className="text-[#c75c35] not-italic">Mytra</em>
+        </span>
       ) : null}
     </span>
   );
 }
 
-export { Chai0Mark };
+// Backward-compatible exports so existing imports keep working during the rename transition.
+// Remove these aliases once all references are updated.
+export { CodeMytraMark };
+/** @deprecated Use `CodeMytraMark` instead */
+export const Chai0Mark = CodeMytraMark;
+/** @deprecated Use `CodeMytraLogo` instead */
+export const Chai0Logo = CodeMytraLogo;
